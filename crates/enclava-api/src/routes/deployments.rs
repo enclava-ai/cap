@@ -68,8 +68,9 @@ pub struct DeployResources {
 
 #[derive(Debug, Serialize)]
 pub struct DeploymentResponse {
-    pub id: Uuid,
+    pub deployment_id: Uuid,
     pub app_id: Uuid,
+    pub app_domain: String,
     pub trigger: String,
     pub status: String,
     pub image_digest: Option<String>,
@@ -79,11 +80,13 @@ pub struct DeploymentResponse {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-impl From<Deployment> for DeploymentResponse {
-    fn from(d: Deployment) -> Self {
+impl DeploymentResponse {
+    fn from_deployment(d: Deployment, app: &App) -> Self {
+        let app_domain = app.custom_domain.clone().unwrap_or_else(|| app.domain.clone());
         Self {
-            id: d.id,
+            deployment_id: d.id,
             app_id: d.app_id,
+            app_domain,
             trigger: format!("{:?}", d.trigger).to_lowercase(),
             status: format!("{:?}", d.status).to_lowercase(),
             image_digest: d.image_digest,
@@ -319,7 +322,10 @@ pub async fn deploy(
             )
         })?;
 
-    Ok((StatusCode::CREATED, Json(deployment.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(DeploymentResponse::from_deployment(deployment, &app)),
+    ))
 }
 
 /// GET /apps/{name}/deployments -- deployment history.
@@ -357,7 +363,12 @@ pub async fn deployment_history(
         )
     })?;
 
-    Ok(Json(deployments.into_iter().map(Into::into).collect()))
+    Ok(Json(
+        deployments
+            .into_iter()
+            .map(|d| DeploymentResponse::from_deployment(d, &app))
+            .collect(),
+    ))
 }
 
 /// POST /apps/{name}/rollback -- rollback to a previous deployment.
@@ -442,5 +453,8 @@ pub async fn rollback(
             )
         })?;
 
-    Ok((StatusCode::CREATED, Json(deployment.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(DeploymentResponse::from_deployment(deployment, &app)),
+    ))
 }
