@@ -1,0 +1,55 @@
+use enclava_engine::manifest::service::generate_service;
+use enclava_engine::testutil::sample_app;
+
+#[test]
+fn service_name_and_namespace() {
+    let app = sample_app();
+    let svc = generate_service(&app);
+    assert_eq!(svc.metadata.name.as_deref(), Some("test-app"));
+    assert_eq!(
+        svc.metadata.namespace.as_deref(),
+        Some("cap-test-org-test-app")
+    );
+}
+
+#[test]
+fn service_has_https_port() {
+    let app = sample_app();
+    let svc = generate_service(&app);
+    let ports = svc.spec.as_ref().unwrap().ports.as_ref().unwrap();
+    let https = ports
+        .iter()
+        .find(|p| p.name.as_deref() == Some("https"))
+        .unwrap();
+    assert_eq!(https.port, 443);
+}
+
+#[test]
+fn service_has_attestation_port() {
+    let app = sample_app();
+    let svc = generate_service(&app);
+    let ports = svc.spec.as_ref().unwrap().ports.as_ref().unwrap();
+    let att = ports
+        .iter()
+        .find(|p| p.name.as_deref() == Some("attestation"))
+        .unwrap();
+    assert_eq!(att.port, 8081);
+}
+
+#[test]
+fn service_selector_matches_app() {
+    let app = sample_app();
+    let svc = generate_service(&app);
+    let selector = svc.spec.as_ref().unwrap().selector.as_ref().unwrap();
+    assert_eq!(selector.get("app"), Some(&"test-app".to_string()));
+}
+
+#[test]
+fn service_serializes_to_yaml() {
+    let app = sample_app();
+    let svc = generate_service(&app);
+    let yaml = serde_yaml::to_string(&svc).unwrap();
+    assert!(yaml.contains("443"));
+    assert!(yaml.contains("8081"));
+    assert!(yaml.contains("test-app"));
+}

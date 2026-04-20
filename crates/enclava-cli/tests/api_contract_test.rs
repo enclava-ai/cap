@@ -1,0 +1,93 @@
+//! Wire-contract tests pinning CLI types against the actual shapes
+//! produced by the Platform API. Every assertion here corresponds to a
+//! real bug caught in manual E2E testing on 2026-04-18.
+
+use enclava_cli::api_types::*;
+
+#[test]
+fn signup_request_includes_provider() {
+    let req = SignupRequest {
+        provider: "email".to_string(),
+        email: Some("a@b.com".to_string()),
+        password: Some("hunter2".to_string()),
+        npub: None,
+        display_name: None,
+    };
+    let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+    assert_eq!(v["provider"], "email");
+}
+
+#[test]
+fn login_request_uses_nostr_event_field_name() {
+    let req = LoginRequest {
+        provider: "nostr".to_string(),
+        email: None,
+        password: None,
+        npub: None,
+        nostr_event: Some(r#"{"id":"x"}"#.to_string()),
+    };
+    let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+    assert!(v.get("nostr_event").is_some());
+    assert!(v.get("signed_event").is_none());
+}
+
+#[test]
+fn auth_response_matches_server_shape() {
+    // Exact server payload from crates/enclava-api/src/routes/auth.rs AuthResponse.
+    let body = serde_json::json!({
+        "user_id": "c5277e9d-c1bc-4daa-bbb4-43a625952eec",
+        "org_id":  "d28131d5-f605-46e9-9b5a-6ee26a2d31dd",
+        "org_name": "personal-cli",
+        "token": "jwt.jwt.jwt"
+    });
+    let resp: AuthResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(resp.token, "jwt.jwt.jwt");
+    assert_eq!(resp.org_name, "personal-cli");
+}
+
+#[test]
+fn list_orgs_deserializes_bare_array() {
+    let body = serde_json::json!([
+        { "id": "3bd1e7b1", "name": "testco", "display_name": null, "tier": "free", "is_personal": false }
+    ]);
+    let orgs: Vec<OrgResponse> = serde_json::from_value(body).unwrap();
+    assert_eq!(orgs.len(), 1);
+    assert_eq!(orgs[0].name, "testco");
+}
+
+#[test]
+fn list_members_deserializes_bare_array() {
+    let body = serde_json::json!([
+        { "user_id": "c97a082c", "display_name": "CLI", "role": "owner" }
+    ]);
+    let members: Vec<MemberResponse> = serde_json::from_value(body).unwrap();
+    assert_eq!(members[0].role, "owner");
+}
+
+#[test]
+fn list_apps_deserializes_bare_array() {
+    let body = serde_json::json!([
+        {
+            "id": "8d1e6166", "name": "testapp", "namespace": "cap-x-y",
+            "instance_id": "cli-x-y", "domain": "testapp.enclava.local",
+            "custom_domain": null, "unlock_mode": "auto",
+            "status": "creating", "created_at": "2026-04-18T14:14:35Z"
+        }
+    ]);
+    let apps: Vec<AppResponse> = serde_json::from_value(body).unwrap();
+    assert_eq!(apps[0].name, "testapp");
+}
+
+#[test]
+fn billing_status_uses_period_end() {
+    // Real server response: {"tier":"free","status":"active","period_end":null,"grace_period_ends":null}
+    let body = serde_json::json!({
+        "tier": "free",
+        "status": "active",
+        "period_end": null,
+        "grace_period_ends": null
+    });
+    let status: BillingStatus = serde_json::from_value(body).unwrap();
+    assert_eq!(status.tier, "free");
+    assert!(status.period_end.is_none());
+}

@@ -1,0 +1,446 @@
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::auth::middleware::AuthContext;
+use crate::models::{App, Deployment};
+use crate::state::AppState;
+
+/// Parse memory string like "1Gi", "8Gi" to f64 in GiB with validation.
+fn parse_memory_gi(s: &str) -> Result<f64, String> {
+    if s.is_empty() {
+        return Err("memory value cannot be empty".to_string());
+    }
+
+    let (value_str, unit) = if let Some(stripped) = s.strip_suffix("Gi") {
+        (stripped, "Gi")
+    } else if let Some(stripped) = s.strip_suffix("Mi") {
+        (stripped, "Mi")
+    } else if let Some(stripped) = s.strip_suffix("GiB") {
+        (stripped, "GiB")
+    } else if let Some(stripped) = s.strip_suffix("MiB") {
+        (stripped, "MiB")
+    } else {
+        // No unit suffix, assume GiB
+        (s, "GiB")
+    };
+
+    // Parse numeric value
+    let value: f64 = value_str
+        .parse()
+        .map_err(|_| format!("invalid memory value: {}", value_str))?;
+
+    // Validate range: must be positive and reasonable
+    if value <= 0.0 {
+        return Err("memory value must be positive".to_string());
+    }
+    if value > 1024.0 {
+        return Err("memory value too large (max 1024Gi)".to_string());
+    }
+
+    // Convert to GiB
+    match unit {
+        "Gi" | "GiB" => Ok(value),
+        "Mi" | "MiB" => Ok(value / 1024.0),
+        _ => Err(format!("unsupported memory unit: {}", unit)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeployRequest {
+    pub image: String,
+    #[serde(default)]
+    pub container_name: Option<String>,
+    #[serde(default)]
+    pub resources: Option<DeployResources>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DeployResources {
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    pub storage: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeploymentResponse {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub trigger: String,
+    pub status: String,
+    pub image_digest: Option<String>,
+    pub cosign_verified: bool,
+    pub error_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<Deployment> for DeploymentResponse {
+    fn from(d: Deployment) -> Self {
+        Self {
+            id: d.id,
+            app_id: d.app_id,
+            trigger: format!("{:?}", d.trigger).to_lowercase(),
+            status: format!("{:?}", d.status).to_lowercase(),
+            image_digest: d.image_digest,
+            cosign_verified: d.cosign_verified,
+            error_message: d.error_message,
+            created_at: d.created_at,
+            completed_at: d.completed_at,
+        }
+    }
+}
+
+/// POST /apps/{name}/deploy -- deploy or update an app.
+pub async fn deploy(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+    Json(body): Json<DeployRequest>,
+) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(auth.org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+
+    // Resolve image tag to digest
+    let image_ref = enclava_common::image::ImageRef::parse(&body.image).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+
+    let image_digest = if image_ref.has_digest() {
+        image_ref.digest().to_string()
+    } else {
+        crate::registry::resolve_image_digest(&state.http_client, &image_ref)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({"error": format!("failed to resolve image tag: {}", e)}),
+                    ),
+                )
+            })?
+    };
+
+    // Verify cosign signature exists for this image digest
+    crate::cosign::verify_image(&state.http_client, &body.image, &image_digest)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("cosign verification failed: {}", e)})),
+            )
+        })?;
+
+    // Enforce tier resource limits (API-18)
+    if let Some(ref resources) = body.resources {
+        let org: crate::models::Organization =
+            sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+                .bind(auth.org_id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "database error"})),
+                    )
+                })?;
+
+        let tier_str = format!("{:?}", org.tier).to_lowercase();
+        let limits = crate::routes::billing::tier_limits(&tier_str).ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "unknown tier"})),
+        ))?;
+
+        if let Some(ref cpu) = resources.cpu {
+            let requested: f64 = cpu.parse().unwrap_or(0.0);
+            let allowed: f64 = limits.max_cpu.parse().unwrap_or(0.0);
+            if requested > allowed {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(
+                        serde_json::json!({"error": format!("tier '{}' allows max {} CPU, requested {}", tier_str, limits.max_cpu, cpu)}),
+                    ),
+                ));
+            }
+        }
+
+        if let Some(ref memory) = resources.memory {
+            let requested = parse_memory_gi(memory).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e})),
+                )
+            })?;
+            let allowed = parse_memory_gi(&limits.max_memory).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "invalid tier memory limit"})),
+                )
+            })?;
+            if requested > allowed {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(
+                        serde_json::json!({"error": format!("tier '{}' allows max {} memory, requested {}", tier_str, limits.max_memory, memory)}),
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Fetch provenance attestation and SBOM if available (non-fatal if missing)
+    let (provenance, sbom) =
+        crate::cosign::fetch_attestations(&state.http_client, &body.image, &image_digest)
+            .await
+            .unwrap_or((None, None));
+
+    // Update container image in DB
+    let container_name = body.container_name.as_deref().unwrap_or("web");
+    let container_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM app_containers WHERE app_id = $1 AND name = $2)",
+    )
+    .bind(app.id)
+    .bind(container_name)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    if container_exists {
+        sqlx::query(
+            "UPDATE app_containers SET image_ref = $1, image_digest = $2 WHERE app_id = $3 AND name = $4",
+        )
+        .bind(&body.image)
+        .bind(Some(&image_digest))
+        .bind(app.id)
+        .bind(container_name)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+    } else {
+        sqlx::query(
+            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, is_primary)
+             VALUES ($1, $2, $3, $4, $5, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.id)
+        .bind(container_name)
+        .bind(&body.image)
+        .bind(Some(&image_digest))
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+    }
+
+    // Build spec snapshot
+    let spec_snapshot = serde_json::json!({
+        "app_name": app.name,
+        "namespace": app.namespace,
+        "instance_id": app.instance_id,
+        "image": body.image,
+        "image_digest": &image_digest,
+        "resources": body.resources,
+    });
+
+    // Create deployment record
+    let deploy_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom)
+         VALUES ($1, $2, 'api', $3, $4, true, $5, $6)",
+    )
+    .bind(deploy_id)
+    .bind(app.id)
+    .bind(&spec_snapshot)
+    .bind(Some(&image_digest))
+    .bind(&provenance)
+    .bind(&sbom)
+    .execute(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    // Audit
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.deploy', $4)",
+    )
+    .bind(auth.org_id)
+    .bind(app.id)
+    .bind(auth.user_id)
+    .bind(serde_json::json!({"image": &body.image, "deployment_id": deploy_id}))
+    .execute(&state.db)
+    .await;
+
+    let deployment: Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = $1")
+        .bind(deploy_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+
+    Ok((StatusCode::CREATED, Json(deployment.into())))
+}
+
+/// GET /apps/{name}/deployments -- deployment history.
+pub async fn deployment_history(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+) -> Result<Json<Vec<DeploymentResponse>>, (StatusCode, Json<serde_json::Value>)> {
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(auth.org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+
+    let deployments: Vec<Deployment> = sqlx::query_as(
+        "SELECT * FROM deployments WHERE app_id = $1 ORDER BY created_at DESC LIMIT 50",
+    )
+    .bind(app.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    Ok(Json(deployments.into_iter().map(Into::into).collect()))
+}
+
+/// POST /apps/{name}/rollback -- rollback to a previous deployment.
+pub async fn rollback(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(auth.org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+
+    let prev: Deployment = sqlx::query_as(
+        "SELECT * FROM deployments
+         WHERE app_id = $1 AND status = 'healthy'
+         ORDER BY created_at DESC
+         OFFSET 1 LIMIT 1",
+    )
+    .bind(app.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?
+    .ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "no previous deployment to rollback to"})),
+    ))?;
+
+    let deploy_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest)
+         VALUES ($1, $2, 'rollback', $3, $4)",
+    )
+    .bind(deploy_id)
+    .bind(app.id)
+    .bind(&prev.spec_snapshot)
+    .bind(&prev.image_digest)
+    .execute(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    // Audit
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.rollback', $4)",
+    )
+    .bind(auth.org_id)
+    .bind(app.id)
+    .bind(auth.user_id)
+    .bind(serde_json::json!({"rollback_to": prev.id, "deployment_id": deploy_id}))
+    .execute(&state.db)
+    .await;
+
+    let deployment: Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = $1")
+        .bind(deploy_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+
+    Ok((StatusCode::CREATED, Json(deployment.into())))
+}

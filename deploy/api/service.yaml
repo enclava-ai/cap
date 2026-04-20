@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: enclava-api
+  namespace: enclava-platform
+spec:
+  type: ClusterIP
+  selector:
+    app: enclava-api
+  ports:
+  - port: 80
+    targetPort: 3000
+    protocol: TCP
+    name: http

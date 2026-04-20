@@ -1,0 +1,102 @@
+use std::fs;
+
+#[test]
+fn cli_paths_from_explicit_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".enclava");
+    let paths = enclava_cli::config::CliPaths::from_root(root.clone()).unwrap();
+    assert_eq!(paths.root, root);
+    assert_eq!(paths.config, root.join("config.toml"));
+    assert_eq!(paths.credentials, root.join("credentials.toml"));
+    assert_eq!(paths.keys_dir, root.join("keys"));
+}
+
+#[test]
+fn ensure_dirs_creates_structure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".enclava");
+    let paths = enclava_cli::config::CliPaths::from_root(root.clone()).unwrap();
+    paths.ensure_dirs().unwrap();
+    assert!(root.exists());
+    assert!(paths.keys_dir.exists());
+    assert!(paths.sessions_dir.exists());
+}
+
+#[test]
+fn load_missing_config_returns_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = enclava_cli::config::CliPaths::from_root(tmp.path().join(".enclava")).unwrap();
+    let config = enclava_cli::config::load_config(&paths).unwrap();
+    assert_eq!(config.api_url, "https://api.enclava.dev");
+    assert!(config.org.is_none());
+}
+
+#[test]
+fn save_and_load_config_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = enclava_cli::config::CliPaths::from_root(tmp.path().join(".enclava")).unwrap();
+    let config = enclava_cli::config::CliConfig {
+        api_url: "https://custom.api.dev".to_string(),
+        org: Some("my-team".to_string()),
+    };
+    enclava_cli::config::save_config(&paths, &config).unwrap();
+    let loaded = enclava_cli::config::load_config(&paths).unwrap();
+    assert_eq!(loaded.api_url, "https://custom.api.dev");
+    assert_eq!(loaded.org.as_deref(), Some("my-team"));
+}
+
+#[test]
+fn save_and_load_credentials_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = enclava_cli::config::CliPaths::from_root(tmp.path().join(".enclava")).unwrap();
+    let creds = enclava_cli::config::Credentials {
+        session_token: Some("jwt-abc".to_string()),
+        api_key: None,
+    };
+    enclava_cli::config::save_credentials(&paths, &creds).unwrap();
+    let loaded = enclava_cli::config::load_credentials(&paths).unwrap();
+    assert_eq!(loaded.session_token.as_deref(), Some("jwt-abc"));
+    assert!(loaded.api_key.is_none());
+}
+
+#[test]
+fn auth_token_prefers_session_over_api_key() {
+    let creds = enclava_cli::config::Credentials {
+        session_token: Some("session".to_string()),
+        api_key: Some("key".to_string()),
+    };
+    assert_eq!(creds.auth_token(), Some("session"));
+}
+
+#[test]
+fn auth_token_falls_back_to_api_key() {
+    let creds = enclava_cli::config::Credentials {
+        session_token: None,
+        api_key: Some("key".to_string()),
+    };
+    assert_eq!(creds.auth_token(), Some("key"));
+}
+
+#[test]
+fn bootstrap_key_path_is_org_scoped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = enclava_cli::config::CliPaths::from_root(tmp.path().join(".enclava")).unwrap();
+    let key_path = paths.bootstrap_key_path("acme", "my-app");
+    assert!(key_path.to_string_lossy().contains("keys/acme/my-app.key"));
+}
+
+#[cfg(unix)]
+#[test]
+fn credentials_file_has_restricted_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = enclava_cli::config::CliPaths::from_root(tmp.path().join(".enclava")).unwrap();
+    let creds = enclava_cli::config::Credentials {
+        session_token: Some("secret".to_string()),
+        api_key: None,
+    };
+    enclava_cli::config::save_credentials(&paths, &creds).unwrap();
+    let meta = fs::metadata(&paths.credentials).unwrap();
+    let mode = meta.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "credentials file should be 0600, got {mode:o}");
+}

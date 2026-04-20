@@ -1,0 +1,25 @@
+use k8s_openapi::api::core::v1::ServiceAccount;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use std::collections::BTreeMap;
+
+use crate::types::ConfidentialApp;
+
+/// Generate a ServiceAccount for the app.
+pub fn generate_service_account(app: &ConfidentialApp) -> ServiceAccount {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        "enclava-platform".to_string(),
+    );
+    labels.insert("app".to_string(), app.name.clone());
+
+    ServiceAccount {
+        metadata: ObjectMeta {
+            name: Some(app.service_account.clone()),
+            namespace: Some(app.namespace.clone()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}

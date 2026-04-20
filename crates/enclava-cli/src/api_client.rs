@@ -1,0 +1,417 @@
+use crate::api_types::*;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+/// Typed HTTP client for the Enclava Platform API.
+pub struct ApiClient {
+    base_url: String,
+    http: reqwest::Client,
+    auth_token: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("API error ({status}): {message}")]
+    Api { status: u16, message: String },
+    #[error("not authenticated -- run `enclava login` first")]
+    NotAuthenticated,
+}
+
+impl ApiClient {
+    /// Create a new API client.
+    pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("failed to build HTTP client");
+
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            http,
+            auth_token,
+        }
+    }
+
+    /// Create a client from CLI config and credentials.
+    pub fn from_config(
+        config: &crate::config::CliConfig,
+        creds: &crate::config::Credentials,
+    ) -> Self {
+        Self::new(&config.api_url, creds.auth_token().map(|s| s.to_string()))
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    fn auth_headers(&self) -> Result<HeaderMap, ApiError> {
+        let token = self.auth_token.as_ref().ok_or(ApiError::NotAuthenticated)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| ApiError::Api {
+                status: 0,
+                message: format!("invalid auth token: {e}"),
+            })?,
+        );
+        Ok(headers)
+    }
+
+    async fn check_response(&self, resp: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+        let status = resp.status();
+        if status.is_success() {
+            Ok(resp)
+        } else {
+            let status_code = status.as_u16();
+            let message = match resp.json::<ApiErrorBody>().await {
+                Ok(body) => {
+                    if let Some(detail) = body.detail {
+                        format!("{}: {}", body.error, detail)
+                    } else {
+                        body.error
+                    }
+                }
+                Err(_) => format!("HTTP {status_code}"),
+            };
+            Err(ApiError::Api {
+                status: status_code,
+                message,
+            })
+        }
+    }
+
+    // --- Auth ---
+
+    pub async fn signup(&self, req: &SignupRequest) -> Result<AuthResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/auth/signup"))
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn login(&self, req: &LoginRequest) -> Result<AuthResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/auth/login"))
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    // --- Apps ---
+
+    pub async fn create_app(&self, req: &CreateAppRequest) -> Result<AppResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/apps"))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_apps(&self) -> Result<Vec<AppResponse>, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/apps"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_app(&self, name: &str) -> Result<AppResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{name}")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn delete_app(&self, name: &str) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/apps/{name}")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
+    // --- Deployments ---
+
+    pub async fn deploy(
+        &self,
+        app_name: &str,
+        req: &DeployRequest,
+    ) -> Result<DeployResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/deploy")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentEntry>, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/deployments")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn rollback(
+        &self,
+        app_name: &str,
+        req: &RollbackRequest,
+    ) -> Result<RollbackResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/rollback")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    // --- Status ---
+
+    pub async fn get_status(&self, app_name: &str) -> Result<AppStatus, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/status")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_logs(
+        &self,
+        app_name: &str,
+        follow: bool,
+    ) -> Result<reqwest::Response, ApiError> {
+        let mut url = self.url(&format!("/apps/{app_name}/logs"));
+        if follow {
+            url.push_str("?follow=true");
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp)
+    }
+
+    // --- Config ---
+
+    pub async fn get_config_token(&self, app_name: &str) -> Result<ConfigTokenResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/config-token")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_config_keys(&self, app_name: &str) -> Result<ConfigKeysResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/config")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn delete_config_meta(&self, app_name: &str, key: &str) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/apps/{app_name}/config/{key}/meta")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
+    // --- Domains ---
+
+    pub async fn set_domain(
+        &self,
+        app_name: &str,
+        req: &SetDomainRequest,
+    ) -> Result<DomainResponse, ApiError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/apps/{app_name}/domain")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_domain(&self, app_name: &str) -> Result<DomainResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/domain")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn delete_domain(&self, app_name: &str) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/apps/{app_name}/domain")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
+    // --- Unlock ---
+
+    pub async fn get_unlock_endpoint(
+        &self,
+        app_name: &str,
+    ) -> Result<UnlockEndpointResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/unlock/endpoint")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    // --- Billing ---
+
+    pub async fn get_tiers(&self) -> Result<Vec<TierInfo>, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/billing/tiers"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn upgrade_tier(&self, tier: &str) -> Result<InvoiceResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/billing/upgrade"))
+            .headers(self.auth_headers()?)
+            .json(&serde_json::json!({ "tier": tier }))
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_billing_status(&self) -> Result<BillingStatus, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/billing/status"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn renew(&self) -> Result<InvoiceResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/billing/renew"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    // --- Orgs ---
+
+    pub async fn create_org(&self, req: &CreateOrgRequest) -> Result<OrgResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/orgs"))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_orgs(&self) -> Result<Vec<OrgResponse>, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/orgs"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn invite_member(&self, org_name: &str, req: &InviteRequest) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/orgs/{org_name}/invite")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
+    pub async fn list_members(&self, org_name: &str) -> Result<Vec<MemberResponse>, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/orgs/{org_name}/members")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+}

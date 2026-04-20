@@ -1,0 +1,34 @@
+# Development-only compose file.
+# Credentials below are placeholders — do not use in any deployed environment.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: enclava
+      POSTGRES_PASSWORD: enclava
+      POSTGRES_DB: enclava
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: crates/enclava-api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://enclava:enclava@postgres:5432/enclava
+      API_URL: http://localhost:3000
+      PLATFORM_DOMAIN: enclava.local
+      BTCPAY_URL: http://localhost:23001
+      BTCPAY_API_KEY: test-key
+      BTCPAY_WEBHOOK_SECRET: test-secret
+      ALLOW_EPHEMERAL_KEYS: "1"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy

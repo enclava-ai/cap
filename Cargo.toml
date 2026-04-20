@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/enclava-common",
+    "crates/enclava-engine",
+    "crates/enclava-api",
+    "crates/enclava-cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+k8s-openapi = { version = "0.27", features = ["v1_35"] }
+kube = { version = "3.1", features = ["runtime", "client", "derive", "rustls-tls", "aws-lc-rs"] }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+tracing = "0.1"
+serde_yaml = "0.9"
+base64 = "0.22"
+flate2 = "1.0"
+axum = { version = "0.8", features = ["macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+argon2 = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+tower = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+nostr = "0.37"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dialoguer = "0.11"
+indicatif = "0.17"
+dirs = "6"
+colored = "3"
+tokio-util = { version = "0.7", features = ["io"] }
+hmac = "0.12"
+tower_governor = "0.8"
+sigstore = { version = "0.13", default-features = false, features = ["cosign", "rustls-tls"] }
+
+# Internal
+enclava-common = { path = "crates/enclava-common" }
+enclava-engine = { path = "crates/enclava-engine" }
