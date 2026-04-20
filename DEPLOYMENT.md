@@ -75,8 +75,9 @@ The overlay assumes cert-manager with a `letsencrypt-prod` ClusterIssuer and an
 | `SESSION_HMAC_KEY_PATH` | one of these | — | Path to 32-byte session HMAC key |
 | `SESSION_HMAC_KEY_BASE64` | one of these | — | Same key, base64-encoded |
 | `ALLOW_EPHEMERAL_KEYS` | dev only | unset | If `1`, generate signing/HMAC keys in memory |
-| `COSIGN_PUBLIC_KEY_PATH` | optional | — | Cosign public key file for image verification |
-| `COSIGN_PUBLIC_KEY_PEM` | optional | — | Same key, inline PEM |
+| `COSIGN_PUBLIC_KEY_PATH` | one of these | — | Cosign public key file for image verification |
+| `COSIGN_PUBLIC_KEY_PEM` | one of these | — | Same key, inline PEM |
+| `SKIP_COSIGN_VERIFY` | dev only | unset | If `1`, bypass cosign signature verification |
 | `RUST_LOG` | no | `enclava_api=debug,tower_http=debug` | Log filter |
 
 ### Signing keys

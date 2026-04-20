@@ -111,6 +111,14 @@ pub async fn verify_image(
     image_ref: &str,
     digest: &str,
 ) -> Result<bool, CosignError> {
+    if env_flag("SKIP_COSIGN_VERIFY") {
+        tracing::warn!(
+            "SKIP_COSIGN_VERIFY=1 -- skipping cosign verification for {} ({})",
+            image_ref,
+            digest
+        );
+        return Ok(true);
+    }
     let public_key = load_cosign_public_key()?;
     let image: OciReference = image_ref
         .parse()
