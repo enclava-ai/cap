@@ -17,6 +17,7 @@ pub struct AppStatusResponse {
     pub status: String,
     pub domain: String,
     pub unlock_mode: String,
+    pub pod_phase: Option<String>,
     pub pod_status: Option<String>,
     pub tee_status: Option<String>,
     pub storage_status: Option<String>,
@@ -47,33 +48,47 @@ pub async fn app_status(
     let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
     let tee_status_url = format!("https://{}/.well-known/confidential/status", domain);
 
-    let (pod_status, tee_status, storage_status) =
-        match state.http_client.get(&tee_status_url).send().await {
+    let (pod_status, tee_status, storage_status, live_state) =
+        match state.tee_http_client.get(&tee_status_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let live_state = body.get("state").and_then(|v| v.as_str()).map(String::from);
                     (
                         body.get("pod_status")
                             .and_then(|v| v.as_str())
-                            .map(String::from),
+                            .map(String::from)
+                            .or_else(|| Some("Running".to_string())),
                         body.get("tee_status")
                             .and_then(|v| v.as_str())
-                            .map(String::from),
+                            .map(String::from)
+                            .or_else(|| live_state.clone()),
                         body.get("storage_status")
                             .and_then(|v| v.as_str())
-                            .map(String::from),
+                            .map(String::from)
+                            .or_else(|| live_state.clone()),
+                        live_state,
                     )
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 }
             }
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         };
+
+    let db_status = format!("{:?}", app.status).to_lowercase();
+    let effective_status = match live_state.as_deref() {
+        Some("unlocked") => "running".to_string(),
+        Some("locked") => "locked".to_string(),
+        Some("unclaimed") if db_status == "failed" => "creating".to_string(),
+        _ => db_status,
+    };
 
     Ok(Json(AppStatusResponse {
         app_name: app.name,
-        status: format!("{:?}", app.status).to_lowercase(),
+        status: effective_status,
         domain: domain.to_string(),
         unlock_mode: format!("{:?}", app.unlock_mode).to_lowercase(),
+        pod_phase: pod_status.clone(),
         pod_status,
         tee_status,
         storage_status,

@@ -27,6 +27,10 @@ pub fn generate_service(app: &ConfidentialApp) -> Service {
             ..Default::default()
         },
         spec: Some(ServiceSpec {
+            // The owner bootstrap API lives in the attestation-proxy sidecar and
+            // must be reachable before the workload app has unlocked storage and
+            // passed its own readiness checks.
+            publish_not_ready_addresses: Some(true),
             ports: Some(vec![
                 ServicePort {
                     name: Some("https".to_string()),

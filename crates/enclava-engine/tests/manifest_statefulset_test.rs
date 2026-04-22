@@ -125,6 +125,27 @@ fn statefulset_has_init_data_sha256_annotation() {
 }
 
 #[test]
+fn statefulset_has_policy_instance_annotation() {
+    let app = sample_app();
+    let sts = generate_statefulset(&app);
+    let annotations = sts
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .metadata
+        .as_ref()
+        .unwrap()
+        .annotations
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        annotations.get("tenant.flowforge.sh/instance"),
+        Some(&"test-app".to_string())
+    );
+}
+
+#[test]
 fn statefulset_has_kernel_params_annotation() {
     let app = sample_app();
     let sts = generate_statefulset(&app);

@@ -41,6 +41,8 @@ pub struct CreateAppRequest {
     pub port: u16,
     pub image: Option<String>,
     pub unlock_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_pubkey_hash: Option<String>,
     pub storage_size: String,
     pub tls_storage_size: String,
     pub storage_paths: Vec<String>,
@@ -115,6 +117,26 @@ pub struct LogLine {
 pub struct ConfigTokenResponse {
     pub token: String,
     pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnlockStatusResponse {
+    pub unlock_mode: String,
+    pub tee_url: String,
+    pub ownership_state: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateUnlockModeRequest {
+    pub mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUnlockModeResponse {
+    pub app_name: String,
+    pub unlock_mode: String,
+    pub deployment_id: Option<String>,
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,7 +254,8 @@ pub struct MemberResponse {
 #[derive(Debug, Deserialize)]
 pub struct UnlockEndpointResponse {
     pub tee_url: String,
-    pub status: String,
+    pub unlock_endpoint: String,
+    pub claim_endpoint: String,
 }
 
 // --- Errors ---

@@ -1,4 +1,7 @@
+use crate::dns::DnsConfig;
+use crate::kbs::KbsPolicyConfig;
 use ed25519_dalek::SigningKey;
+use enclava_engine::types::AttestationConfig;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -20,6 +23,15 @@ pub struct AppState {
     pub platform_domain: String,
     /// HTTP client for outbound requests.
     pub http_client: reqwest::Client,
+    /// HTTP client for tenant TEE endpoints. Test environments may use staging
+    /// ACME certificates that are not trusted by the public WebPKI roots.
+    pub tee_http_client: reqwest::Client,
     /// BTCPay webhook HMAC secret for signature verification.
     pub btcpay_webhook_secret: String,
+    /// Sidecar/runtime settings used when generating Kubernetes manifests.
+    pub attestation: Option<AttestationConfig>,
+    /// Cloudflare DNS settings for CAP-managed tenant host records.
+    pub dns: Option<DnsConfig>,
+    /// Trustee KBS policy settings for CAP-managed owner-resource bindings.
+    pub kbs_policy: Option<KbsPolicyConfig>,
 }

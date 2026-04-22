@@ -4,10 +4,10 @@ use enclava_engine::manifest::kbs_policy::{
 use enclava_engine::testutil::sample_app;
 
 #[test]
-fn owner_binding_key_uses_instance_id_owner() {
+fn owner_binding_key_uses_namespace_and_app_name_owner() {
     let app = sample_app();
     let (key, _val) = generate_owner_binding_entry(&app);
-    assert_eq!(key, "test-org-a1b2c3d4-owner");
+    assert_eq!(key, "cap-test-org-test-app-test-app-owner");
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn full_policy_contains_owner_bindings() {
     let apps = vec![&app];
     let rego = generate_kbs_policy_rego(&apps, "");
     assert!(rego.contains("owner_resource_bindings"));
-    assert!(rego.contains("test-org-a1b2c3d4-owner"));
+    assert!(rego.contains("cap-test-org-test-app-test-app-owner"));
     assert!(rego.contains("seed-encrypted"));
     assert!(rego.contains("seed-sealed"));
 }
@@ -86,7 +86,7 @@ fn full_policy_with_legacy_bindings() {
     assert!(rego.contains("resource_bindings"));
     assert!(rego.contains("legacy-resource"));
     assert!(rego.contains("owner_resource_bindings"));
-    assert!(rego.contains("test-org-a1b2c3d4-owner"));
+    assert!(rego.contains("cap-test-org-test-app-test-app-owner"));
 }
 
 #[test]
@@ -101,6 +101,8 @@ fn full_policy_without_legacy_bindings_has_empty_resource_bindings() {
 fn multiple_apps_produce_multiple_bindings() {
     let app1 = sample_app();
     let mut app2 = sample_app();
+    app2.name = "test-app-2".to_string();
+    app2.namespace = "cap-test-org-test-app-2".to_string();
     app2.instance_id = "test-org-b2c3d4e5".to_string();
     app2.tenant_instance_identity_hash = enclava_common::crypto::compute_identity_hash(
         &app2.tenant_id,
@@ -109,6 +111,6 @@ fn multiple_apps_produce_multiple_bindings() {
     );
     let apps = vec![&app1, &app2];
     let rego = generate_kbs_policy_rego(&apps, "");
-    assert!(rego.contains("test-org-a1b2c3d4-owner"));
-    assert!(rego.contains("test-org-b2c3d4e5-owner"));
+    assert!(rego.contains("cap-test-org-test-app-test-app-owner"));
+    assert!(rego.contains("cap-test-org-test-app-2-test-app-2-owner"));
 }

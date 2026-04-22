@@ -1,8 +1,12 @@
 use clap::Args;
+use ed25519_dalek::{Signer, SigningKey};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::*;
 use enclava_cli::app_config::AppConfig;
@@ -49,7 +53,24 @@ pub struct CreateArgs {
 
 pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_config = AppConfig::find_and_load()?;
-    let (api, _paths, _cli_config) = build_api_client()?;
+    let (api, paths, cli_config) = build_api_client()?;
+
+    let bootstrap_key = if app_config.unlock.mode == "password" {
+        let org = cli_config
+            .org
+            .as_deref()
+            .ok_or("no active org -- run `enclava login` first")?;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_hash = hex::encode(Sha256::digest(public_key));
+        Some((
+            org.to_string(),
+            hex::encode(signing_key.to_bytes()),
+            public_key_hash,
+        ))
+    } else {
+        None
+    };
 
     let services: Vec<ServiceSpec> = app_config
         .services
@@ -67,6 +88,9 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         port: app_config.app.port,
         image: args.image,
         unlock_mode: app_config.unlock.mode.clone(),
+        bootstrap_pubkey_hash: bootstrap_key
+            .as_ref()
+            .map(|(_, _, public_key_hash)| public_key_hash.clone()),
         storage_size: app_config.storage.size.clone(),
         tls_storage_size: app_config.storage.tls_size.clone(),
         storage_paths: app_config.storage.paths.clone(),
@@ -89,6 +113,12 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let resp = api.create_app(&req).await?;
 
+    if let Some((org, private_key_hex, _)) = bootstrap_key {
+        let key_path =
+            config::save_bootstrap_key(&paths, &org, &app_config.app.name, &private_key_hex)?;
+        println!("Bootstrap key saved: {}", key_path.display());
+    }
+
     spinner.finish_with_message(format!("App '{}' created.", resp.name));
     println!();
     println!("  Domain:    {}", resp.domain);
@@ -97,6 +127,11 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
     println!("  Unlock:    {}", resp.unlock_mode);
     println!();
     println!("Next: run `enclava deploy --image <image>` to deploy.");
+    if resp.unlock_mode == "password" {
+        println!(
+            "During deploy, you will be prompted for the initial storage password inside the TEE claim flow."
+        );
+    }
 
     Ok(())
 }
@@ -173,7 +208,29 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         tokio::time::sleep(poll_interval).await;
     }
 
-    // Phase 3: Push config if --set was used
+    // Phase 3: First ownership claim for password-mode apps
+    let unlock_status = api.get_unlock_status(&app_name).await.ok();
+    if unlock_status
+        .as_ref()
+        .is_some_and(|status| status.unlock_mode == "password")
+        && unlock_status
+            .as_ref()
+            .and_then(|status| status.ownership_state.as_deref())
+            .is_none_or(|state| state == "unclaimed")
+    {
+        pb.set_position(3);
+        pb.set_message("Waiting for ownership claim endpoint...");
+        claim_initial_ownership(&api, &_paths, &_cli_config, &app_name).await?;
+        pb.set_message("Ownership claimed");
+    } else if unlock_status
+        .as_ref()
+        .is_some_and(|status| status.unlock_mode == "password")
+    {
+        pb.set_position(3);
+        pb.set_message("Ownership already claimed");
+    }
+
+    // Phase 4: Push config if --set was used
     if !config_pairs.is_empty() {
         pb.set_position(4);
         pb.set_message(format!("Setting {} config values...", config_pairs.len()));
@@ -216,6 +273,69 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     println!("  Deploy: {}", resp.deployment_id);
     if !config_pairs.is_empty() {
         println!("  Config: {} key(s) set", config_pairs.len());
+    }
+
+    Ok(())
+}
+
+async fn claim_initial_ownership(
+    api: &ApiClient,
+    paths: &CliPaths,
+    cli_config: &config::CliConfig,
+    app_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = api.get_unlock_endpoint(app_name).await?;
+    let tee = TeeClient::new(&endpoint.tee_url);
+
+    let challenge = tee.bootstrap_challenge().await?;
+
+    let org = cli_config
+        .org
+        .as_deref()
+        .ok_or("no active org -- run `enclava login` first")?;
+    let key_path = paths.bootstrap_key_path(org, app_name);
+    let private_key_hex = std::fs::read_to_string(&key_path).map_err(|e| {
+        format!(
+            "bootstrap key not found at {}: {e}. Was this app created with `enclava create`?",
+            key_path.display()
+        )
+    })?;
+    let private_key_bytes: [u8; 32] = hex::decode(private_key_hex.trim())
+        .map_err(|e| format!("invalid bootstrap key format: {e}"))?
+        .try_into()
+        .map_err(|_| "bootstrap key must be 32 bytes (64 hex chars)")?;
+    let signing_key = SigningKey::from_bytes(&private_key_bytes);
+    let verifying_key = signing_key.verifying_key();
+    let challenge_bytes = URL_SAFE_NO_PAD
+        .decode(challenge.nonce.as_bytes())
+        .map_err(|e| format!("invalid bootstrap challenge encoding: {e}"))?;
+    let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&challenge_bytes).to_bytes());
+    let bootstrap_pubkey = URL_SAFE_NO_PAD.encode(verifying_key.to_bytes());
+
+    let password = dialoguer::Password::new()
+        .with_prompt("Set initial storage password")
+        .with_confirmation("Confirm initial storage password", "Passwords don't match")
+        .interact()?;
+
+    let result = match tee
+        .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
+        .await
+    {
+        Ok(result) => Some(result),
+        Err(err) if tee.claim_state_is_successful().await.unwrap_or(false) => {
+            eprintln!(
+                "Claim response was interrupted after the TEE accepted ownership; continuing."
+            );
+            let _ = err;
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if let Some(mnemonic) = result.and_then(|result| result.mnemonic) {
+        println!();
+        println!("IMPORTANT: Save your recovery mnemonic. This is shown ONCE.");
+        println!("{mnemonic}");
     }
 
     Ok(())

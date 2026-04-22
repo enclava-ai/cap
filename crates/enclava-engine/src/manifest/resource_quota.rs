@@ -14,30 +14,46 @@ use crate::types::ConfidentialApp;
 pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     let mut hard = BTreeMap::new();
 
-    // CPU
+    // CPU. ResourceQuota admission accounts every container plus RuntimeClass
+    // overhead. Keep these constants aligned with manifest/containers.rs and
+    // the kata-qemu-snp RuntimeClass used by the StatefulSet.
     hard.insert(
         "requests.cpu".to_string(),
-        Quantity(app.resources.cpu.clone()),
+        Quantity(sum_cpu_quantities(&["250m", "100m", "100m", "1"])),
     );
     hard.insert(
         "limits.cpu".to_string(),
-        Quantity(format_doubled_cpu(&app.resources.cpu)),
+        Quantity(sum_cpu_quantities(&[
+            &app.resources.cpu,
+            "500m",
+            "500m",
+            "1",
+        ])),
     );
 
-    // Memory
+    // Memory. See CPU note above.
     hard.insert(
         "requests.memory".to_string(),
-        Quantity(app.resources.memory.clone()),
+        Quantity(sum_memory_quantities(&["512Mi", "128Mi", "128Mi", "2Gi"])),
     );
     hard.insert(
         "limits.memory".to_string(),
-        Quantity(format_doubled_memory(&app.resources.memory)),
+        Quantity(sum_memory_quantities(&[
+            &app.resources.memory,
+            "256Mi",
+            "256Mi",
+            "2Gi",
+        ])),
     );
 
-    // Storage: sum of app-data + tls-data, plus headroom
+    // Storage must cover both StatefulSet volumeClaimTemplates. If this is too
+    // low, Kubernetes creates the first PVC and then blocks the second one.
     hard.insert(
         "requests.storage".to_string(),
-        Quantity(app.storage.app_data.size.clone()),
+        Quantity(sum_storage_quantities(
+            &app.storage.app_data.size,
+            &app.storage.tls_data.size,
+        )),
     );
     hard.insert(
         "persistentvolumeclaims".to_string(),
@@ -78,39 +94,71 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     }
 }
 
-/// Double the CPU string for limits (e.g., "1" -> "2", "4" -> "8").
-fn format_doubled_cpu(cpu: &str) -> String {
-    if let Ok(n) = cpu.parse::<f64>() {
-        let doubled = n * 2.0;
-        if doubled == doubled.floor() {
-            format!("{}", doubled as i64)
-        } else {
-            format!("{doubled}")
-        }
-    } else {
-        cpu.to_string()
-    }
-}
-
-/// Double the memory string for limits (e.g., "1Gi" -> "2Gi", "512Mi" -> "1024Mi").
-fn format_doubled_memory(mem: &str) -> String {
-    let (num_str, suffix) = split_quantity(mem);
-    if let Ok(n) = num_str.parse::<f64>() {
-        let doubled = n * 2.0;
-        if doubled == doubled.floor() {
-            format!("{}{suffix}", doubled as i64)
-        } else {
-            format!("{doubled}{suffix}")
-        }
-    } else {
-        mem.to_string()
-    }
-}
-
 /// Split a quantity like "10Gi" into ("10", "Gi").
 fn split_quantity(q: &str) -> (&str, &str) {
     let pos = q
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(q.len());
     (&q[..pos], &q[pos..])
+}
+
+fn sum_cpu_quantities(values: &[&str]) -> String {
+    let mut total_millis = 0f64;
+
+    for value in values {
+        if let Some(millis) = value.strip_suffix('m') {
+            total_millis += millis.parse::<f64>().unwrap_or(0.0);
+        } else {
+            total_millis += value.parse::<f64>().unwrap_or(0.0) * 1000.0;
+        }
+    }
+
+    if total_millis % 1000.0 == 0.0 {
+        format!("{}", (total_millis / 1000.0) as i64)
+    } else {
+        format!("{}m", total_millis as i64)
+    }
+}
+
+fn sum_memory_quantities(values: &[&str]) -> String {
+    let mut total_mib = 0f64;
+
+    for value in values {
+        let (num, suffix) = split_quantity(value);
+        let Ok(parsed) = num.parse::<f64>() else {
+            continue;
+        };
+
+        total_mib += match suffix {
+            "Gi" | "GiB" => parsed * 1024.0,
+            "Mi" | "MiB" => parsed,
+            _ => parsed,
+        };
+    }
+
+    if total_mib % 1024.0 == 0.0 {
+        format!("{}Gi", (total_mib / 1024.0) as i64)
+    } else {
+        format!("{}Mi", total_mib as i64)
+    }
+}
+
+fn sum_storage_quantities(a: &str, b: &str) -> String {
+    let (a_num, a_suffix) = split_quantity(a);
+    let (b_num, b_suffix) = split_quantity(b);
+
+    if a_suffix == b_suffix {
+        if let (Ok(a), Ok(b)) = (a_num.parse::<f64>(), b_num.parse::<f64>()) {
+            let total = a + b;
+            if total == total.floor() {
+                return format!("{}{a_suffix}", total as i64);
+            }
+            return format!("{total}{a_suffix}");
+        }
+    }
+
+    // The UI/API defaults use matching units. If a future caller mixes units,
+    // keep the old conservative app-data value instead of inventing a lossy
+    // quantity conversion here.
+    a.to_string()
 }

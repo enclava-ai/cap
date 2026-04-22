@@ -320,6 +320,36 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn get_unlock_status(
+        &self,
+        app_name: &str,
+    ) -> Result<UnlockStatusResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/unlock/status")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn update_unlock_mode(
+        &self,
+        app_name: &str,
+        req: &UpdateUnlockModeRequest,
+    ) -> Result<UpdateUnlockModeResponse, ApiError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/apps/{app_name}/unlock/mode")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Billing ---
 
     pub async fn get_tiers(&self) -> Result<Vec<TierInfo>, ApiError> {

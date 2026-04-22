@@ -33,6 +33,13 @@ fn toml_contains_service_account() {
 }
 
 #[test]
+fn toml_contains_policy_instance_annotation() {
+    let app = sample_app();
+    let toml = build_toml(&app);
+    assert!(toml.contains("\"tenant.flowforge.sh/instance\":\"test-app\""));
+}
+
+#[test]
 fn toml_contains_aa_toml() {
     let app = sample_app();
     let toml = build_toml(&app);
@@ -54,8 +61,16 @@ fn toml_contains_identity_toml() {
     let app = sample_app();
     let toml = build_toml(&app);
     assert!(toml.contains("identity.toml"));
-    assert!(toml.contains(&format!("tenant_id = \"{}\"", app.tenant_id)));
-    assert!(toml.contains(&format!("instance_id = \"{}\"", app.instance_id)));
+    assert!(toml.contains(&format!("tenant_id = \"{}\"", app.namespace)));
+    assert!(toml.contains(&format!("instance_id = \"{}\"", app.name)));
+    assert!(toml.contains(&format!(
+        "owner_resource_type = \"{}\"",
+        app.owner_resource_type()
+    )));
+    assert!(toml.contains(&format!(
+        "bootstrap_owner_pubkey_hash = \"{}\"",
+        app.bootstrap_owner_pubkey_hash
+    )));
     assert!(toml.contains(&format!(
         "tenant_instance_identity_hash = \"{}\"",
         app.tenant_instance_identity_hash

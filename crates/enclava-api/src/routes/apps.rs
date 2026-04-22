@@ -21,6 +21,34 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match &error {
+        crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
+        crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
+        crate::dns::DnsError::Cloudflare(_)
+        | crate::dns::DnsError::Http(_)
+        | crate::dns::DnsError::Db(_) => StatusCode::BAD_GATEWAY,
+    };
+
+    (
+        status,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
+}
+
+async fn delete_tenant_namespace(namespace: &str) -> Result<(), kube::Error> {
+    let client = kube::Client::try_default().await?;
+    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+    match api
+        .delete(namespace, &kube::api::DeleteParams::default())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Comprehensive app name validation
 fn validate_app_name(name: &str) -> Result<(), String> {
     // Length limits
@@ -279,6 +307,23 @@ pub async fn create_app(
             )
         })?;
 
+    if let Err(e) = crate::dns::ensure_dns_record(
+        &state.db,
+        &state.http_client,
+        state.dns.as_ref(),
+        app_id,
+        &domain,
+        false,
+    )
+    .await
+    {
+        let _ = sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_id)
+            .execute(&state.db)
+            .await;
+        return Err(dns_error_response(e));
+    }
+
     // Audit
     let _ = sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.create', $4)",
@@ -382,8 +427,41 @@ pub async fn delete_app(
             )
         })?;
 
-    // TODO: spawn engine cleanup task (Plan 3 integration)
-    // For now, delete from DB. In production, this would be an async cleanup job.
+    crate::dns::delete_all_dns_records_for_app(
+        &state.db,
+        &state.http_client,
+        state.dns.as_ref(),
+        app.id,
+    )
+    .await
+    .map_err(dns_error_response)?;
+
+    delete_tenant_namespace(&app.namespace).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("failed to delete tenant namespace: {}", e)})),
+        )
+    })?;
+
+    crate::kbs::soft_delete_owner_binding(&state.db, app.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("failed to remove KBS owner binding: {}", e)})),
+            )
+        })?;
+    crate::kbs::reconcile_policy(&state.db, state.kbs_policy.as_ref())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(
+                    serde_json::json!({"error": format!("failed to reconcile KBS policy: {}", e)}),
+                ),
+            )
+        })?;
+
     sqlx::query("DELETE FROM apps WHERE id = $1")
         .bind(app.id)
         .execute(&state.db)

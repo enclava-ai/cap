@@ -8,9 +8,9 @@ use serde_json::{Value, json};
 use crate::types::ConfidentialApp;
 
 /// Generate the owner_resource_bindings map entry for a single app.
-/// Returns (key, value) where key is "{instance_id}-owner".
+/// Returns (key, value) where key is "{namespace}-{name}-owner".
 pub fn generate_owner_binding_entry(app: &ConfidentialApp) -> (String, Value) {
-    let key = format!("{}-owner", app.instance_id);
+    let key = app.owner_resource_type();
     let value = json!({
         "repository": "default",
         "allowed_tags": ["seed-encrypted", "seed-sealed"],

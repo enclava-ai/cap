@@ -34,6 +34,45 @@ fn generate_all_manifests_returns_all_resources() {
 
     // Service
     assert_eq!(m.service.metadata.name.as_deref(), Some("test-app"));
+    assert_eq!(
+        m.service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.publish_not_ready_addresses),
+        Some(true)
+    );
+
+    // Public TLS passthrough routing
+    assert_eq!(
+        m.sni_route_configmap.metadata.name.as_deref(),
+        Some("test-app-sni-route")
+    );
+    let sni_data = m.sni_route_configmap.data.as_ref().unwrap();
+    assert_eq!(
+        sni_data.get("host").map(|s| s.as_str()),
+        Some("test-app.enclava.dev")
+    );
+    assert_eq!(
+        sni_data.get("backend_tls").map(|s| s.as_str()),
+        Some("test-app.cap-test-org-test-app.svc.cluster.local:443")
+    );
+    assert_eq!(m.envoy_proxy["kind"], "EnvoyProxy");
+    assert_eq!(
+        m.envoy_proxy["metadata"]["name"],
+        "tenant-gateway-proxy-test-app"
+    );
+    assert_eq!(m.gateway["kind"], "Gateway");
+    assert_eq!(m.gateway["metadata"]["name"], "tenant-gateway-test-app");
+    assert_eq!(m.tls_route["kind"], "TLSRoute");
+    assert_eq!(
+        m.tls_route["metadata"]["name"],
+        "tenant-passthrough-test-app"
+    );
+    assert_eq!(m.tls_route["spec"]["hostnames"][0], "test-app.enclava.dev");
+    assert_eq!(
+        m.tls_route["spec"]["rules"][0]["backendRefs"][0]["name"],
+        "test-app"
+    );
 
     // Bootstrap ConfigMap
     assert_eq!(
@@ -41,10 +80,27 @@ fn generate_all_manifests_returns_all_resources() {
         Some("secure-pv-bootstrap-script")
     );
 
+    // Startup ConfigMap
+    assert_eq!(
+        m.startup_configmap.metadata.name.as_deref(),
+        Some("test-app-startup")
+    );
+
     // Ingress ConfigMap
     assert_eq!(
         m.ingress_configmap.metadata.name.as_deref(),
         Some("test-app-tenant-ingress")
+    );
+
+    // Tenant Cloudflare token Secret
+    assert_eq!(
+        m.cloudflare_token_secret
+            .as_ref()
+            .unwrap()
+            .metadata
+            .name
+            .as_deref(),
+        Some("cloudflare-api-token-enclava-dev")
     );
 
     // StatefulSet
@@ -81,9 +137,26 @@ fn all_namespaced_resources_share_namespace() {
         m.bootstrap_configmap.metadata.namespace.as_deref(),
         Some(ns)
     );
+    assert_eq!(m.startup_configmap.metadata.namespace.as_deref(), Some(ns));
     assert_eq!(m.ingress_configmap.metadata.namespace.as_deref(), Some(ns));
+    assert_eq!(
+        m.cloudflare_token_secret
+            .as_ref()
+            .unwrap()
+            .metadata
+            .namespace
+            .as_deref(),
+        Some(ns)
+    );
     assert_eq!(m.statefulset.metadata.namespace.as_deref(), Some(ns));
     assert_eq!(m.network_policy["metadata"]["namespace"].as_str(), Some(ns));
+    assert_eq!(
+        m.sni_route_configmap.metadata.namespace.as_deref(),
+        Some(ns)
+    );
+    assert_eq!(m.envoy_proxy["metadata"]["namespace"].as_str(), Some(ns));
+    assert_eq!(m.gateway["metadata"]["namespace"].as_str(), Some(ns));
+    assert_eq!(m.tls_route["metadata"]["namespace"].as_str(), Some(ns));
 }
 
 #[test]
@@ -137,9 +210,52 @@ fn all_managed_resources_have_managed_by_label() {
         Some(managed_by)
     );
 
+    let startup_labels = m.startup_configmap.metadata.labels.as_ref().unwrap();
+    assert_eq!(
+        startup_labels
+            .get("app.kubernetes.io/managed-by")
+            .map(|s| s.as_str()),
+        Some(managed_by)
+    );
+
+    let secret_labels = m
+        .cloudflare_token_secret
+        .as_ref()
+        .unwrap()
+        .metadata
+        .labels
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        secret_labels
+            .get("app.kubernetes.io/managed-by")
+            .map(|s| s.as_str()),
+        Some(managed_by)
+    );
+
     // CiliumNetworkPolicy
     assert_eq!(
         m.network_policy["metadata"]["labels"]["app.kubernetes.io/managed-by"].as_str(),
+        Some(managed_by)
+    );
+
+    let sni_labels = m.sni_route_configmap.metadata.labels.as_ref().unwrap();
+    assert_eq!(
+        sni_labels
+            .get("app.kubernetes.io/managed-by")
+            .map(|s| s.as_str()),
+        Some(managed_by)
+    );
+    assert_eq!(
+        m.envoy_proxy["metadata"]["labels"]["app.kubernetes.io/managed-by"].as_str(),
+        Some(managed_by)
+    );
+    assert_eq!(
+        m.gateway["metadata"]["labels"]["app.kubernetes.io/managed-by"].as_str(),
+        Some(managed_by)
+    );
+    assert_eq!(
+        m.tls_route["metadata"]["labels"]["app.kubernetes.io/managed-by"].as_str(),
         Some(managed_by)
     );
 }
@@ -181,6 +297,15 @@ fn manifests_serialize_to_yaml() {
 
     let ingress_yaml = serde_yaml::to_string(&m.ingress_configmap).unwrap();
     assert!(ingress_yaml.contains("test-app-tenant-ingress"));
+
+    let sni_yaml = serde_yaml::to_string(&m.sni_route_configmap).unwrap();
+    assert!(sni_yaml.contains("test-app-sni-route"));
+
+    let gateway_yaml = serde_yaml::to_string(&m.gateway).unwrap();
+    assert!(gateway_yaml.contains("tenant-gateway-test-app"));
+
+    let tls_route_yaml = serde_yaml::to_string(&m.tls_route).unwrap();
+    assert!(tls_route_yaml.contains("tenant-passthrough-test-app"));
 
     // CiliumNetworkPolicy is Value, uses serde_json for serialization
     let np_yaml = serde_yaml::to_string(&m.network_policy).unwrap();

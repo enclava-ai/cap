@@ -126,7 +126,10 @@ fn proxy_container_has_instance_id_env() {
     let c = build_attestation_proxy_container(&app);
     let env = c.env.as_ref().unwrap();
     let found = env.iter().find(|e| e.name == "INSTANCE_ID").unwrap();
-    assert_eq!(found.value.as_deref(), Some("test-org-a1b2c3d4"));
+    assert_eq!(
+        found.value.as_deref(),
+        Some("cap-test-org-test-app-test-app")
+    );
 }
 
 #[test]
@@ -142,13 +145,17 @@ fn proxy_container_has_owner_ciphertext_backend() {
 }
 
 #[test]
-fn proxy_container_non_root_security() {
+fn proxy_container_has_sev_sealing_permissions() {
     let app = sample_app();
     let c = build_attestation_proxy_container(&app);
     let sc = c.security_context.as_ref().unwrap();
-    assert_eq!(sc.run_as_non_root, Some(true));
-    assert_eq!(sc.run_as_user, Some(65532));
+    assert_eq!(sc.run_as_non_root, Some(false));
+    assert_eq!(sc.run_as_user, Some(0));
+    assert_eq!(sc.run_as_group, Some(0));
     assert_eq!(sc.read_only_root_filesystem, Some(true));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert_eq!(caps.add.as_deref(), Some(&["MKNOD".to_string()][..]));
 }
 
 #[test]
@@ -211,6 +218,16 @@ fn caddy_container_has_reset_on_key_mismatch() {
         .find(|e| e.name == "SECURE_PV_RESET_ON_KEY_MISMATCH")
         .unwrap();
     assert_eq!(found.value.as_deref(), Some("true"));
+}
+
+#[test]
+fn caddy_container_starts_ephemeral_ingress_before_tls_unlock() {
+    let app = sample_app();
+    let c = build_caddy_container(&app);
+    let command = c.command.as_ref().unwrap().join("\n");
+    assert!(command.contains("XDG_DATA_HOME=/tmp/caddy-bootstrap"));
+    assert!(command.contains("caddy run --config /etc/caddy/Caddyfile &"));
+    assert!(command.contains("XDG_DATA_HOME=/tls-data/caddy"));
 }
 
 #[test]

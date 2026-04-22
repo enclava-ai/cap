@@ -40,6 +40,8 @@ nostr = { workspace = true }
 hmac = { workspace = true }
 tower_governor = { workspace = true }
 sigstore = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
 
 [dev-dependencies]
 axum-test = "20"

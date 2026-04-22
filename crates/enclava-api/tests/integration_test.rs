@@ -2,6 +2,8 @@
 
 use ed25519_dalek::SigningKey;
 use enclava_api::{state::AppState, test_router};
+use enclava_common::image::ImageRef;
+use enclava_engine::types::AttestationConfig;
 use rand::rngs::OsRng;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -34,7 +36,23 @@ async fn setup_test_state() -> (AppState, PgPool) {
         btcpay_api_key: "test-key".to_string(),
         platform_domain: "enclava.dev".to_string(),
         http_client: reqwest::Client::new(),
+        tee_http_client: reqwest::Client::new(),
         btcpay_webhook_secret: "test-secret".to_string(),
+        attestation: Some(AttestationConfig {
+            proxy_image: ImageRef::parse(
+                "ghcr.io/enclava-ai/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            caddy_image: ImageRef::parse(
+                "ghcr.io/enclava-ai/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .unwrap(),
+            acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+            cloudflare_token_secret: "cloudflare-api-token-enclava-dev".to_string(),
+            cloudflare_api_token: Some("test-cloudflare-token".to_string()),
+        }),
+        dns: None,
+        kbs_policy: None,
     };
 
     (state, pool)

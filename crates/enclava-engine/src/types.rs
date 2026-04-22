@@ -53,8 +53,18 @@ pub struct AttestationConfig {
     pub proxy_image: ImageRef,
     /// Caddy tenant-ingress image reference (digest-pinned).
     pub caddy_image: ImageRef,
+    /// ACME directory URL used by tenant Caddy for DNS-01 issuance.
+    #[serde(default = "default_acme_ca_url")]
+    pub acme_ca_url: String,
     /// Cloudflare API token secret name for ACME DNS-01 challenge.
     pub cloudflare_token_secret: String,
+    /// Cloudflare API token value copied into each tenant namespace for Caddy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare_api_token: Option<String>,
+}
+
+pub fn default_acme_ca_url() -> String {
+    "https://acme-v02.api.letsencrypt.org/directory".to_string()
 }
 
 /// A user-defined container in the app pod.
@@ -161,8 +171,22 @@ impl ConfidentialApp {
     }
 
     /// KBS owner ciphertext path prefix for this app.
-    /// E.g., "default/{instance_id}-owner"
+    /// E.g., "default/{namespace}-{name}-owner"
     pub fn owner_resource_path(&self) -> String {
-        format!("default/{}-owner", self.instance_id)
+        format!("default/{}", self.owner_resource_type())
+    }
+
+    /// Stable owner-resource instance name used by the attestation proxy.
+    ///
+    /// The live Trustee policy derives owner resource access from the attested
+    /// Kubernetes namespace and the `tenant.flowforge.sh/instance` annotation,
+    /// so CAP uses the namespace and app name for the KBS owner path.
+    pub fn owner_instance_id(&self) -> String {
+        format!("{}-{}", self.namespace, self.name)
+    }
+
+    /// KBS owner resource type for `owner_resource_bindings`.
+    pub fn owner_resource_type(&self) -> String {
+        format!("{}-owner", self.owner_instance_id())
     }
 }

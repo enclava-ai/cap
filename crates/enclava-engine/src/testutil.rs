@@ -60,7 +60,9 @@ pub fn sample_app() -> ConfidentialApp {
                  2222222222222222222222222222222222222222222222222222222222222222",
             )
             .unwrap(),
+            acme_ca_url: default_acme_ca_url(),
             cloudflare_token_secret: "cloudflare-api-token-enclava-dev".to_string(),
+            cloudflare_api_token: Some("test-cloudflare-token".to_string()),
         },
     }
 }

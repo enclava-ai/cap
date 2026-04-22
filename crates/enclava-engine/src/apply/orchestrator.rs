@@ -4,6 +4,7 @@ use crate::manifest::{GeneratedManifests, generate_all_manifests};
 use crate::types::ConfidentialApp;
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::gateway::apply_gateway_resources;
 use super::namespace::apply_namespace;
 use super::network_policy::apply_network_policy;
 use super::resources::apply_standard_resources;
@@ -31,7 +32,12 @@ pub fn manifest_hash(manifests: &GeneratedManifests) -> String {
         manifests.network_policy.clone(),
         serde_json::to_value(&manifests.resource_quota).unwrap_or_default(),
         serde_json::to_value(&manifests.service).unwrap_or_default(),
+        serde_json::to_value(&manifests.sni_route_configmap).unwrap_or_default(),
+        manifests.envoy_proxy.clone(),
+        manifests.gateway.clone(),
+        manifests.tls_route.clone(),
         serde_json::to_value(&manifests.bootstrap_configmap).unwrap_or_default(),
+        serde_json::to_value(&manifests.startup_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.ingress_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.statefulset).unwrap_or_default(),
         manifests.kbs_owner_binding.1.clone(),
@@ -51,7 +57,8 @@ pub fn manifest_hash(manifests: &GeneratedManifests) -> String {
 /// 1. Namespace (must exist before anything namespaced)
 /// 2. Standard namespaced resources (SA, ResourceQuota, Service, ConfigMaps)
 /// 3. CiliumNetworkPolicy (CRD, via DynamicObject)
-/// 4. StatefulSet (last, because it references SA, ConfigMaps, and Service)
+/// 4. Gateway API resources (EnvoyProxy, Gateway, TLSRoute)
+/// 5. StatefulSet (last, because it references SA, ConfigMaps, and Service)
 ///
 /// Each resource is applied via SSA with field manager "enclava-platform".
 /// The manifest hash is stored as an annotation on the StatefulSet for drift detection.
@@ -68,17 +75,28 @@ pub async fn apply_all(
 
     // Step 1: Namespace
     apply_namespace(engine, &manifests.namespace).await?;
-    tracing::info!(namespace = %ns_name, "step 1/4: namespace ready");
+    tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
     // Step 2: Standard namespaced resources
     apply_standard_resources(engine, manifests).await?;
-    tracing::info!(namespace = %ns_name, "step 2/4: standard resources applied");
+    tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
     // Step 3: CiliumNetworkPolicy
     apply_network_policy(engine, ns_name, &manifests.network_policy).await?;
-    tracing::info!(namespace = %ns_name, "step 3/4: CiliumNetworkPolicy applied");
+    tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
 
-    // Step 4: StatefulSet (with manifest hash annotation for drift detection)
+    // Step 4: Gateway API routing resources
+    apply_gateway_resources(
+        engine,
+        ns_name,
+        &manifests.envoy_proxy,
+        &manifests.gateway,
+        &manifests.tls_route,
+    )
+    .await?;
+    tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
+
+    // Step 5: StatefulSet (with manifest hash annotation for drift detection)
     let mut sts = manifests.statefulset.clone();
     let hash = manifest_hash(manifests);
 
@@ -93,7 +111,7 @@ pub async fn apply_all(
     tracing::info!(
         namespace = %ns_name,
         manifest_hash = %hash,
-        "step 4/4: StatefulSet applied"
+        "step 5/5: StatefulSet applied"
     );
 
     tracing::info!(namespace = %ns_name, "apply_all complete");

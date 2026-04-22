@@ -17,8 +17,8 @@ fn resource_quota_has_cpu_limits() {
     let app = sample_app();
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert!(hard.contains_key("requests.cpu"));
-    assert!(hard.contains_key("limits.cpu"));
+    assert_eq!(hard.get("requests.cpu").unwrap().0, "1450m");
+    assert_eq!(hard.get("limits.cpu").unwrap().0, "3");
 }
 
 #[test]
@@ -26,8 +26,8 @@ fn resource_quota_has_memory_limits() {
     let app = sample_app();
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert!(hard.contains_key("requests.memory"));
-    assert!(hard.contains_key("limits.memory"));
+    assert_eq!(hard.get("requests.memory").unwrap().0, "2816Mi");
+    assert_eq!(hard.get("limits.memory").unwrap().0, "3584Mi");
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn resource_quota_has_storage() {
     let app = sample_app();
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert!(hard.contains_key("requests.storage"));
+    assert_eq!(hard.get("requests.storage").unwrap().0, "12Gi");
     assert!(hard.contains_key("persistentvolumeclaims"));
 }
 

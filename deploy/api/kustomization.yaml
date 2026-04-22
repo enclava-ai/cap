@@ -24,3 +24,5 @@ secretGenerator:
   - btcpay-url="http://btcpay:23001"
   - btcpay-api-key="placeholder"
   - btcpay-webhook-secret="placeholder"
+  - cloudflare-api-token="placeholder"
+  - tenant-dns-target="203.0.113.10"

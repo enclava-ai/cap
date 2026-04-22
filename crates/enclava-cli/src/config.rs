@@ -145,6 +145,46 @@ pub fn save_credentials(paths: &CliPaths, creds: &Credentials) -> Result<(), Con
     Ok(())
 }
 
+/// Save a password-mode bootstrap private key with owner-only permissions.
+pub fn save_bootstrap_key(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    private_key_hex: &str,
+) -> Result<PathBuf, ConfigError> {
+    paths.ensure_dirs()?;
+    let path = paths.bootstrap_key_path(org, app);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, private_key_hex).map_err(|e| ConfigError::Io {
+        path: temp_path.clone(),
+        source: e,
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&temp_path, perms).map_err(|e| ConfigError::Io {
+            path: temp_path.clone(),
+            source: e,
+        })?;
+    }
+
+    std::fs::rename(&temp_path, &path).map_err(|e| ConfigError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
+
+    Ok(path)
+}
+
 fn load_toml_or_default<T: Default + serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<T, ConfigError> {

@@ -74,6 +74,26 @@ fn caddyfile_has_tls_cloudflare() {
 }
 
 #[test]
+fn caddyfile_defaults_to_letsencrypt_production() {
+    let app = sample_app();
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+    assert!(caddyfile.contains("acme_ca https://acme-v02.api.letsencrypt.org/directory"));
+}
+
+#[test]
+fn caddyfile_uses_configured_acme_ca() {
+    let mut app = sample_app();
+    app.attestation.acme_ca_url =
+        "https://acme-staging-v02.api.letsencrypt.org/directory".to_string();
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+    assert!(caddyfile.contains("acme_ca https://acme-staging-v02.api.letsencrypt.org/directory"));
+}
+
+#[test]
 fn caddyfile_has_health_route() {
     let app = sample_app();
     let cm = generate_ingress_configmap(&app);

@@ -53,8 +53,13 @@ pub async fn apply_standard_resources(
     apply_namespaced_resource(engine, ns, &manifests.service_account).await?;
     apply_namespaced_resource(engine, ns, &manifests.resource_quota).await?;
     apply_namespaced_resource(engine, ns, &manifests.service).await?;
+    apply_namespaced_resource(engine, ns, &manifests.sni_route_configmap).await?;
     apply_namespaced_resource(engine, ns, &manifests.bootstrap_configmap).await?;
+    apply_namespaced_resource(engine, ns, &manifests.startup_configmap).await?;
     apply_namespaced_resource(engine, ns, &manifests.ingress_configmap).await?;
+    if let Some(secret) = manifests.cloudflare_token_secret.as_ref() {
+        apply_namespaced_resource(engine, ns, secret).await?;
+    }
 
     tracing::info!(namespace = %ns, "all standard resources applied");
     Ok(())

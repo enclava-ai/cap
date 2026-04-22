@@ -7,18 +7,23 @@
 pub mod bootstrap;
 pub mod cc_init_data;
 pub mod containers;
+pub mod gateway;
 pub mod ingress;
 pub mod kbs_policy;
 pub mod namespace;
 pub mod network_policy;
 pub mod resource_quota;
+pub mod secrets;
 pub mod service;
 pub mod service_account;
+pub mod startup;
 pub mod statefulset;
 pub mod volumes;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, ResourceQuota, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Namespace, ResourceQuota, Secret, Service, ServiceAccount,
+};
 use serde_json::Value;
 
 use crate::types::ConfidentialApp;
@@ -33,8 +38,14 @@ pub struct GeneratedManifests {
     pub network_policy: Value,
     pub resource_quota: ResourceQuota,
     pub service: Service,
+    pub sni_route_configmap: ConfigMap,
+    pub envoy_proxy: Value,
+    pub gateway: Value,
+    pub tls_route: Value,
     pub bootstrap_configmap: ConfigMap,
+    pub startup_configmap: ConfigMap,
     pub ingress_configmap: ConfigMap,
+    pub cloudflare_token_secret: Option<Secret>,
     pub statefulset: StatefulSet,
     /// KBS owner_resource_bindings entry: (key, value) for the policy Rego.
     pub kbs_owner_binding: (String, Value),
@@ -51,8 +62,14 @@ pub fn generate_all_manifests(app: &ConfidentialApp) -> GeneratedManifests {
         network_policy: network_policy::generate_network_policy(app),
         resource_quota: resource_quota::generate_resource_quota(app),
         service: service::generate_service(app),
+        sni_route_configmap: gateway::generate_sni_route_configmap(app),
+        envoy_proxy: gateway::generate_envoy_proxy(app),
+        gateway: gateway::generate_gateway(app),
+        tls_route: gateway::generate_tls_route(app),
         bootstrap_configmap: bootstrap::generate_bootstrap_configmap(app),
+        startup_configmap: startup::generate_startup_configmap(app),
         ingress_configmap: ingress::generate_ingress_configmap(app),
+        cloudflare_token_secret: secrets::generate_cloudflare_token_secret(app),
         statefulset: statefulset::generate_statefulset(app),
         kbs_owner_binding: kbs_policy::generate_owner_binding_entry(app),
     }

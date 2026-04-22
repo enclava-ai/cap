@@ -78,7 +78,19 @@ The overlay assumes cert-manager with a `letsencrypt-prod` ClusterIssuer and an
 | `COSIGN_PUBLIC_KEY_PATH` | one of these | — | Cosign public key file for image verification |
 | `COSIGN_PUBLIC_KEY_PEM` | one of these | — | Same key, inline PEM |
 | `SKIP_COSIGN_VERIFY` | dev only | unset | If `1`, bypass cosign signature verification |
+| `ATTESTATION_PROXY_IMAGE` | yes (deploy) | — | Digest-pinned attestation-proxy image (`name@sha256:...`) |
+| `CADDY_INGRESS_IMAGE` | yes (deploy) | — | Digest-pinned tenant ingress Caddy image (`name@sha256:...`) |
+| `CLOUDFLARE_TOKEN_SECRET` | no | `cloudflare-api-token-enclava-dev` | Kubernetes Secret name used by tenant ingress for DNS-01 |
+| `CLOUDFLARE_API_TOKEN` | no | — | Cloudflare API token used by CAP to manage tenant A/AAAA records |
+| `CLOUDFLARE_ZONE_NAME` | no | `enclava.dev` | Cloudflare zone name CAP manages |
+| `CLOUDFLARE_ZONE_ID` | no | — | Optional Cloudflare zone ID; avoids zone lookup when set |
+| `TENANT_DNS_TARGET` | no | — | Public tenant ingress IP for CAP-managed A/AAAA records |
+| `DNS_MANAGEMENT_REQUIRED` | no | unset | If `1`, API startup fails unless CAP DNS env is configured |
 | `RUST_LOG` | no | `enclava_api=debug,tower_http=debug` | Log filter |
+
+CAP manages public tenant DNS records. Tenant TLS private keys and certificates
+remain workload-owned: the generated tenant ingress sidecar still performs
+DNS-01 and stores certificate state in the tenant TLS volume.
 
 ### Signing keys
 

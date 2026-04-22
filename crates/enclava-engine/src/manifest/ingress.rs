@@ -45,12 +45,13 @@ pub fn generate_ingress_configmap(app: &ConfidentialApp) -> ConfigMap {
 fn render_caddyfile(app: &ConfidentialApp) -> String {
     let domain = app.primary_domain();
     let app_port = app.primary_container().and_then(|c| c.port).unwrap_or(8080);
+    let acme_ca = app.attestation.acme_ca_url.trim();
 
     format!(
         r#"{{
   email infra@enclava.dev
   storage file_system /tls-data/caddy
-  acme_ca https://acme-v02.api.letsencrypt.org/directory
+  acme_ca {acme_ca}
 }}
 {domain} {{
   tls {{
@@ -75,5 +76,6 @@ fn render_caddyfile(app: &ConfidentialApp) -> String {
 "#,
         domain = domain,
         app_port = app_port,
+        acme_ca = acme_ca,
     )
 }

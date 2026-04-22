@@ -79,6 +79,30 @@ fn list_apps_deserializes_bare_array() {
 }
 
 #[test]
+fn unlock_mode_transition_request_contains_only_mode() {
+    let req = UpdateUnlockModeRequest {
+        mode: "auto-unlock".to_string(),
+    };
+    let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+    assert_eq!(v, serde_json::json!({ "mode": "auto-unlock" }));
+    assert!(v.get("password").is_none());
+}
+
+#[test]
+fn unlock_mode_transition_response_deserializes() {
+    let body = serde_json::json!({
+        "app_name": "acme-web",
+        "unlock_mode": "auto",
+        "deployment_id": "90dc3149-02e2-4d44-8398-67637abbcbbe",
+        "status": "deploying"
+    });
+    let resp: UpdateUnlockModeResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(resp.app_name, "acme-web");
+    assert_eq!(resp.unlock_mode, "auto");
+    assert!(resp.deployment_id.is_some());
+}
+
+#[test]
 fn billing_status_uses_period_end() {
     // Real server response: {"tier":"free","status":"active","period_end":null,"grace_period_ends":null}
     let body = serde_json::json!({

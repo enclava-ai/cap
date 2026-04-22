@@ -3,6 +3,9 @@ pub mod billing;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
+pub mod dns;
+pub mod edge;
+pub mod kbs;
 pub mod models;
 pub mod registry;
 pub mod routes;
@@ -20,10 +23,12 @@ use tower_http::{
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
-    // Rate limiting: 5 requests per 60 seconds per IP for unlock endpoints (UNLK-06)
+    // Unlock routes are metadata/control-plane helpers. The secret-bearing
+    // claim/unlock requests go directly to the tenant TEE, so this API limiter
+    // must tolerate several concurrent CLIs behind the same NAT.
     let unlock_governor_conf = GovernorConfigBuilder::default()
-        .per_second(60)
-        .burst_size(5)
+        .per_second(1)
+        .burst_size(120)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .expect("unlock governor config");
@@ -146,6 +151,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/apps/{name}/unlock/endpoint",
             axum::routing::get(routes::unlock::unlock_endpoint),
+        )
+        .route(
+            "/apps/{name}/unlock/mode",
+            axum::routing::put(routes::unlock::update_unlock_mode),
         )
         .layer(GovernorLayer::new(unlock_governor_conf));
 

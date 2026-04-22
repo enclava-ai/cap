@@ -1315,6 +1315,8 @@ dependencies = [
  "hmac",
  "http-body-util",
  "jsonwebtoken",
+ "k8s-openapi",
+ "kube",
  "nostr",
  "rand 0.8.5",
  "reqwest 0.13.2",
@@ -1338,6 +1340,7 @@ name = "enclava-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "colored",
  "dialoguer",
@@ -1352,6 +1355,7 @@ dependencies = [
  "reqwest 0.13.2",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

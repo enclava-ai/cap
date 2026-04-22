@@ -1,5 +1,5 @@
 use enclava_engine::apply::types::DeployPhase;
-use enclava_engine::apply::watch::{PodSnapshot, classify_pod_phase};
+use enclava_engine::apply::watch::{PodSnapshot, classify_pod_phase, pod_label_selector};
 
 #[test]
 fn pending_pod_maps_to_pods_scheduled_or_tee_booting() {
@@ -73,6 +73,11 @@ fn unknown_phase_maps_to_tee_booting() {
     let phase = classify_pod_phase(&snap);
     // Unknown means the kubelet lost contact -- TEE VM may still be booting
     assert_eq!(phase, DeployPhase::TeeBooting);
+}
+
+#[test]
+fn pod_label_selector_matches_generated_statefulset_labels() {
+    assert_eq!(pod_label_selector("my-app"), "app=my-app");
 }
 
 /// Integration test: requires a running cluster.

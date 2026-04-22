@@ -26,8 +26,10 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     let image_digest = primary.image.digest_ref();
 
     let identity_toml = build_identity_toml(
-        &app.tenant_id,
-        &app.instance_id,
+        &app.namespace,
+        &app.name,
+        &app.owner_resource_type(),
+        &app.bootstrap_owner_pubkey_hash,
         &app.tenant_instance_identity_hash,
     );
 
@@ -45,10 +47,11 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     toml.push_str("default AllowRequestsFailingPolicy := true\n");
     toml.push('\n');
     toml.push_str(&format!(
-        "policy_data := {{\"containers\":[{{\"OCI\":{{\"Annotations\":{{\"io.kubernetes.cri.image-name\":\"{image_digest}\",\"io.kubernetes.pod.namespace\":\"{namespace}\",\"io.kubernetes.pod.service-account.name\":\"{service_account}\"}}}},\"image_name\":\"{image_digest}\"}}]}}\n",
+        "policy_data := {{\"containers\":[{{\"OCI\":{{\"Annotations\":{{\"io.kubernetes.cri.image-name\":\"{image_digest}\",\"io.kubernetes.pod.namespace\":\"{namespace}\",\"io.kubernetes.pod.service-account.name\":\"{service_account}\",\"tenant.flowforge.sh/instance\":\"{instance}\"}}}},\"image_name\":\"{image_digest}\"}}]}}\n",
         image_digest = image_digest,
         namespace = app.namespace,
         service_account = app.service_account,
+        instance = app.name,
     ));
     toml.push_str("'''\n");
     toml.push('\n');
@@ -78,10 +81,18 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
 }
 
 /// Build the identity.toml content.
-fn build_identity_toml(tenant_id: &str, instance_id: &str, identity_hash: &str) -> String {
+fn build_identity_toml(
+    tenant_id: &str,
+    instance_id: &str,
+    owner_resource_type: &str,
+    bootstrap_owner_pubkey_hash: &str,
+    identity_hash: &str,
+) -> String {
     format!(
         "tenant_id = \"{tenant_id}\"\n\
          instance_id = \"{instance_id}\"\n\
+         owner_resource_type = \"{owner_resource_type}\"\n\
+         bootstrap_owner_pubkey_hash = \"{bootstrap_owner_pubkey_hash}\"\n\
          tenant_instance_identity_hash = \"{identity_hash}\"\n"
     )
 }

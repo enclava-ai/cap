@@ -29,6 +29,20 @@ spec:
           value: "https://api.enclava.dev"
         - name: PLATFORM_DOMAIN
           value: "enclava.dev"
+        - name: DNS_MANAGEMENT_REQUIRED
+          value: "true"
+        - name: CLOUDFLARE_ZONE_NAME
+          value: "enclava.dev"
+        - name: CLOUDFLARE_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: cloudflare-api-token
+        - name: TENANT_DNS_TARGET
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: tenant-dns-target
         - name: BTCPAY_URL
           valueFrom:
             secretKeyRef:

@@ -19,9 +19,12 @@ fn sample_app_serializes_to_json() {
 }
 
 #[test]
-fn owner_resource_path_uses_instance_id() {
+fn owner_resource_path_uses_namespace_and_app_name() {
     let app = sample_app();
-    assert_eq!(app.owner_resource_path(), "default/test-org-a1b2c3d4-owner");
+    assert_eq!(
+        app.owner_resource_path(),
+        "default/cap-test-org-test-app-test-app-owner"
+    );
 }
 
 #[test]

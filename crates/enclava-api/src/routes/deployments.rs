@@ -10,6 +10,21 @@ use crate::auth::middleware::AuthContext;
 use crate::models::{App, Deployment};
 use crate::state::AppState;
 
+fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match &error {
+        crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
+        crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
+        crate::dns::DnsError::Cloudflare(_)
+        | crate::dns::DnsError::Http(_)
+        | crate::dns::DnsError::Db(_) => StatusCode::BAD_GATEWAY,
+    };
+
+    (
+        status,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
+}
+
 /// Parse memory string like "1Gi", "8Gi" to f64 in GiB with validation.
 fn parse_memory_gi(s: &str) -> Result<f64, String> {
     if s.is_empty() {
@@ -82,7 +97,10 @@ pub struct DeploymentResponse {
 
 impl DeploymentResponse {
     fn from_deployment(d: Deployment, app: &App) -> Self {
-        let app_domain = app.custom_domain.clone().unwrap_or_else(|| app.domain.clone());
+        let app_domain = app
+            .custom_domain
+            .clone()
+            .unwrap_or_else(|| app.domain.clone());
         Self {
             deployment_id: d.id,
             app_id: d.app_id,
@@ -310,6 +328,68 @@ pub async fn deploy(
     .bind(serde_json::json!({"image": &body.image, "deployment_id": deploy_id}))
     .execute(&state.db)
     .await;
+
+    crate::dns::ensure_dns_record(
+        &state.db,
+        &state.http_client,
+        state.dns.as_ref(),
+        app.id,
+        &app.domain,
+        false,
+    )
+    .await
+    .map_err(dns_error_response)?;
+
+    if let Some(custom_domain) = app.custom_domain.as_ref() {
+        crate::dns::ensure_dns_record(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            app.id,
+            custom_domain,
+            true,
+        )
+        .await
+        .map_err(dns_error_response)?;
+    }
+
+    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+    let db = state.db.clone();
+    let attestation = state.attestation.clone();
+    let kbs_policy = state.kbs_policy.clone();
+    let api_url = state.api_url.clone();
+    let apply_app = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::deploy::apply_deployment_manifests(
+            db.clone(),
+            apply_app.clone(),
+            deploy_id,
+            attestation,
+            kbs_policy,
+            api_signing_pubkey,
+            api_url,
+        )
+        .await
+        {
+            let error_message = e.to_string();
+            let _ = crate::deploy::set_deployment_status(
+                &db,
+                deploy_id,
+                "failed",
+                None,
+                Some(&error_message),
+                true,
+            )
+            .await;
+            let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+            tracing::error!(
+                app_id = %apply_app.id,
+                deployment_id = %deploy_id,
+                error = %error_message,
+                "failed to apply deployment manifests"
+            );
+        }
+    });
 
     let deployment: Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = $1")
         .bind(deploy_id)

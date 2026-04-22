@@ -6,6 +6,10 @@ use tokio::time::Instant;
 use super::engine::{ApplyEngine, ApplyError};
 use super::types::{DeployPhase, DeployStatus};
 
+pub fn pod_label_selector(statefulset_name: &str) -> String {
+    format!("app={statefulset_name}")
+}
+
 /// Lightweight snapshot of a pod's state for phase classification.
 /// Extracted from a k8s Pod object to keep classification logic pure and testable.
 #[derive(Debug, Clone)]
@@ -151,9 +155,8 @@ pub async fn watch_rollout(
         }
 
         // Inspect pods for more granular phase info
-        let label_selector = format!("app.kubernetes.io/name={statefulset_name}");
         let pods = pod_api
-            .list(&ListParams::default().labels(&label_selector))
+            .list(&ListParams::default().labels(&pod_label_selector(statefulset_name)))
             .await?;
 
         let mut worst_phase = DeployPhase::Running;

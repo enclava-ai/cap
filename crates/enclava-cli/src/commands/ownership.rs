@@ -1,8 +1,10 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use dialoguer::{Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
 
 use enclava_cli::api_client::ApiClient;
+use enclava_cli::api_types::UpdateUnlockModeRequest;
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::tee_client::TeeClient;
@@ -113,11 +115,15 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signing_key = SigningKey::from_bytes(&private_key_bytes);
     let verifying_key = signing_key.verifying_key();
 
-    // Sign the challenge nonce
-    let signature_bytes = signing_key.sign(challenge.nonce.as_bytes());
+    // The TEE challenge is base64url-encoded bytes. Sign the decoded challenge
+    // bytes, matching the attestation-proxy verifier.
+    let challenge_bytes = URL_SAFE_NO_PAD
+        .decode(challenge.nonce.as_bytes())
+        .map_err(|e| format!("invalid bootstrap challenge encoding: {e}"))?;
+    let signature_bytes = signing_key.sign(&challenge_bytes);
 
-    let bootstrap_pubkey = hex::encode(verifying_key.to_bytes());
-    let signature = hex::encode(signature_bytes.to_bytes());
+    let bootstrap_pubkey = URL_SAFE_NO_PAD.encode(verifying_key.to_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(signature_bytes.to_bytes());
 
     // Step 4: Get password
     let password = Password::new()
@@ -126,13 +132,24 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
         .interact()?;
 
     // Step 5: Claim
-    let result = tee
+    let result = match tee
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
-        .await?;
+        .await
+    {
+        Ok(result) => Some(result),
+        Err(err) if tee.claim_state_is_successful().await.unwrap_or(false) => {
+            eprintln!(
+                "Claim response was interrupted after the TEE accepted ownership; continuing."
+            );
+            let _ = err;
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     println!("Ownership claimed.");
 
-    if let Some(mnemonic) = &result.mnemonic {
+    if let Some(mnemonic) = result.as_ref().and_then(|result| result.mnemonic.as_ref()) {
         println!();
         println!("IMPORTANT: Save your recovery mnemonic. This is shown ONCE.");
         println!("If you lose your password, this is the only way to recover.");
@@ -212,6 +229,23 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
 
             println!("Enabling auto-unlock for {app_name}...");
             tee.enable_auto_unlock(&password).await?;
+            println!("Sealed seed written inside the TEE.");
+
+            let transition = api
+                .update_unlock_mode(
+                    &app_name,
+                    &UpdateUnlockModeRequest {
+                        mode: "auto-unlock".to_string(),
+                    },
+                )
+                .await?;
+            match transition.deployment_id {
+                Some(id) => println!(
+                    "CAP unlock mode updated to {}. Redeploy started: {id}",
+                    transition.unlock_mode
+                ),
+                None => println!("CAP unlock mode already set to {}.", transition.unlock_mode),
+            }
             println!("Auto-unlock enabled. Restarts no longer require a password.");
             Ok(())
         }
@@ -227,6 +261,23 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
+            println!("Sealed seed removed inside the TEE.");
+
+            let transition = api
+                .update_unlock_mode(
+                    &app_name,
+                    &UpdateUnlockModeRequest {
+                        mode: "password".to_string(),
+                    },
+                )
+                .await?;
+            match transition.deployment_id {
+                Some(id) => println!(
+                    "CAP unlock mode updated to {}. Redeploy started: {id}",
+                    transition.unlock_mode
+                ),
+                None => println!("CAP unlock mode already set to {}.", transition.unlock_mode),
+            }
             println!("Auto-unlock disabled. Restarts require the password.");
             Ok(())
         }

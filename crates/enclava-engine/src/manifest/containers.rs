@@ -221,7 +221,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_RUNTIME_CLASS", "kata-qemu-snp"),
         env("ATTESTATION_WORKLOAD_IMAGE", &primary.image.digest_ref()),
         env("STORAGE_OWNERSHIP_MODE", mode),
-        env("INSTANCE_ID", &app.instance_id),
+        env("INSTANCE_ID", &app.owner_instance_id()),
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
         env("OWNERSHIP_MOUNT_PATH", "/run/ownership-signal"),
         env("KBS_RESOURCE_CACHE_SECONDS", "300"),
@@ -250,10 +250,11 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         security_context: Some(SecurityContext {
             allow_privilege_escalation: Some(false),
             read_only_root_filesystem: Some(true),
-            run_as_non_root: Some(true),
-            run_as_user: Some(65532),
-            run_as_group: Some(65532),
+            run_as_non_root: Some(false),
+            run_as_user: Some(0),
+            run_as_group: Some(0),
             capabilities: Some(Capabilities {
+                add: Some(vec!["MKNOD".to_string()]),
                 drop: Some(vec!["ALL".to_string()]),
                 ..Default::default()
             }),
@@ -327,7 +328,14 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
              export LUKS_MAPPING_NAME\n\
              export CF_API_TOKEN=$(cat /run/secrets/cloudflare/token)\n\
              caddy validate --config /etc/caddy/Caddyfile\n\
-             exec /bin/sh /secure-pv/bootstrap.sh -- caddy run --config /etc/caddy/Caddyfile"
+             export XDG_DATA_HOME=/tmp/caddy-bootstrap\n\
+             caddy run --config /etc/caddy/Caddyfile &\n\
+             CADDY_PID=$!\n\
+             /bin/sh /secure-pv/bootstrap.sh -- /bin/sh -c 'true'\n\
+             kill \"$CADDY_PID\" 2>/dev/null || true\n\
+             wait \"$CADDY_PID\" 2>/dev/null || true\n\
+             export XDG_DATA_HOME=/tls-data/caddy\n\
+             exec caddy run --config /etc/caddy/Caddyfile"
                 .to_string(),
         ]),
         ports: Some(vec![ContainerPort {

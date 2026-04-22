@@ -1,10 +1,20 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use serde::Deserialize;
 
 /// Direct HTTPS client for the attestation proxy running inside a TEE.
 /// All requests go to https://{app-domain}/.well-known/confidential/...
 pub struct TeeClient {
-    base_url: String,
+    confidential_base_url: String,
     http: reqwest::Client,
+}
+
+fn accepts_invalid_tee_certs() -> bool {
+    std::env::var("ENCLAVA_TEE_TLS_MODE")
+        .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
+        .unwrap_or(false)
+        || std::env::var("ENCLAVA_TEE_ACCEPT_INVALID_CERTS")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -19,6 +29,10 @@ pub enum TeeError {
 #[derive(Debug, serde::Deserialize)]
 pub struct ChallengeResponse {
     pub nonce: String,
+    #[serde(
+        alias = "expires_in_seconds",
+        deserialize_with = "deserialize_seconds_as_u64"
+    )]
     pub ttl_seconds: u64,
 }
 
@@ -38,14 +52,37 @@ pub struct TeeStatusResponse {
     pub auto_unlock_enabled: bool,
 }
 
+fn deserialize_seconds_as_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(seconds) = number.as_u64() {
+                return Ok(seconds);
+            }
+            number
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| seconds as u64)
+                .ok_or_else(|| serde::de::Error::custom("invalid seconds value"))
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "expected seconds number, got {other}"
+        ))),
+    }
+}
+
 impl TeeClient {
     /// Create a TEE client for the given app domain.
     /// The domain is the HTTPS endpoint of the app (e.g., "myapp.enclava.dev").
     pub fn new(app_domain: &str) -> Self {
+        let accept_invalid_certs = accepts_invalid_tee_certs();
         let http = reqwest::Client::builder()
             .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(30))
-            .danger_accept_invalid_certs(false) // Require valid certificates
+            .timeout(std::time::Duration::from_secs(180))
+            .danger_accept_invalid_certs(accept_invalid_certs)
             .https_only(true) // Enforce HTTPS
             .build()
             .expect("failed to build HTTP client");
@@ -55,12 +92,20 @@ impl TeeClient {
         } else {
             format!("https://{}", app_domain.trim_end_matches('/'))
         };
+        let confidential_base_url = if base_url.ends_with("/.well-known/confidential") {
+            base_url
+        } else {
+            format!("{base_url}/.well-known/confidential")
+        };
 
-        Self { base_url, http }
+        Self {
+            confidential_base_url,
+            http,
+        }
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}/.well-known/confidential{}", self.base_url, path)
+        format!("{}{}", self.confidential_base_url, path)
     }
 
     async fn check_response(&self, resp: reqwest::Response) -> Result<reqwest::Response, TeeError> {
@@ -126,6 +171,25 @@ impl TeeClient {
         let resp = self.http.get(self.url("/status")).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
+    }
+
+    /// Return whether the TEE status shows ownership has already been claimed.
+    ///
+    /// The claim endpoint can commit ownership and then close the connection
+    /// before the client receives the response. Callers use this as an
+    /// idempotence check after an indeterminate claim transport error.
+    pub async fn claim_state_is_successful(&self) -> Result<bool, TeeError> {
+        let resp = self.http.get(self.url("/status")).send().await?;
+        let resp = self.check_response(resp).await?;
+        let body = resp.json::<serde_json::Value>().await?;
+        let state = body
+            .get("ownership_state")
+            .or_else(|| body.get("state"))
+            .and_then(|value| value.as_str());
+        let unlock_state = body.get("unlock_state").and_then(|value| value.as_str());
+
+        Ok(matches!(state, Some("claimed" | "unlocked"))
+            || matches!(unlock_state, Some("unlocked")))
     }
 
     // --- Ownership operations (direct to TEE, no API token) ---
@@ -238,5 +302,69 @@ impl TeeClient {
             .await?;
         self.check_response(resp).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TeeClient, accepts_invalid_tee_certs};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn normalizes_plain_domain_to_confidential_base() {
+        let tee = TeeClient::new("app.enclava.dev");
+        assert_eq!(
+            tee.url("/status"),
+            "https://app.enclava.dev/.well-known/confidential/status"
+        );
+    }
+
+    #[test]
+    fn accepts_api_returned_confidential_base() {
+        let tee = TeeClient::new("https://app.enclava.dev/.well-known/confidential");
+        assert_eq!(
+            tee.url("/bootstrap/challenge"),
+            "https://app.enclava.dev/.well-known/confidential/bootstrap/challenge"
+        );
+    }
+
+    #[test]
+    fn challenge_response_accepts_live_proxy_shape() {
+        let parsed: super::ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "challenge": "abc",
+            "nonce": "abc",
+            "expires_in_seconds": 300.0
+        }))
+        .expect("parse challenge");
+        assert_eq!(parsed.nonce, "abc");
+        assert_eq!(parsed.ttl_seconds, 300);
+    }
+
+    #[test]
+    fn staging_tls_mode_accepts_invalid_tee_certs() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            std::env::remove_var("ENCLAVA_TEE_ACCEPT_INVALID_CERTS");
+        }
+        assert!(accepts_invalid_tee_certs());
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+        }
+    }
+
+    #[test]
+    fn default_tls_mode_requires_valid_tee_certs() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+            std::env::remove_var("ENCLAVA_TEE_ACCEPT_INVALID_CERTS");
+        }
+        assert!(!accepts_invalid_tee_certs());
     }
 }
