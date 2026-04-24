@@ -34,7 +34,7 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     // Memory. See CPU note above.
     hard.insert(
         "requests.memory".to_string(),
-        Quantity(sum_memory_quantities(&["512Mi", "128Mi", "128Mi", "2Gi"])),
+        Quantity(sum_memory_quantities(&["512Mi", "128Mi", "128Mi", "4Gi"])),
     );
     hard.insert(
         "limits.memory".to_string(),
@@ -42,7 +42,7 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
             &app.resources.memory,
             "256Mi",
             "256Mi",
-            "2Gi",
+            "4Gi",
         ])),
     );
 

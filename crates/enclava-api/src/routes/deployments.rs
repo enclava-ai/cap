@@ -359,7 +359,32 @@ pub async fn deploy(
     let kbs_policy = state.kbs_policy.clone();
     let api_url = state.api_url.clone();
     let apply_app = app.clone();
+    let apply_permits = state.deployment_apply_permits.clone();
     tokio::spawn(async move {
+        let _apply_permit = match apply_permits.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                let error_message = format!("deployment apply limiter closed: {}", e);
+                let _ = crate::deploy::set_deployment_status(
+                    &db,
+                    deploy_id,
+                    "failed",
+                    None,
+                    Some(&error_message),
+                    true,
+                )
+                .await;
+                let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+                tracing::error!(
+                    app_id = %apply_app.id,
+                    deployment_id = %deploy_id,
+                    error = %error_message,
+                    "failed to acquire deployment apply permit"
+                );
+                return;
+            }
+        };
+
         if let Err(e) = crate::deploy::apply_deployment_manifests(
             db.clone(),
             apply_app.clone(),

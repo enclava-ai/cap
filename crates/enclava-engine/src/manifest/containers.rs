@@ -294,8 +294,6 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 /// Handles TLS termination inside the TEE. Has its own LUKS volume for cert storage.
 /// Security: privileged=true, SYS_ADMIN + NET_BIND_SERVICE caps (for port 443 and LUKS).
 pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
-    let mode = ownership_mode_str(app.unlock_mode);
-
     let env_vars = vec![
         env_field_ref("POD_NAME", "metadata.name"),
         env_field_ref("POD_NAMESPACE", "metadata.namespace"),
@@ -306,11 +304,13 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         env("SECURE_PV_LUKS_INTEGRITY", "hmac-sha256"),
         env("WORKLOAD_SECRET_SOURCE", "kbs"),
         env("WORKLOAD_SECRET_PATH", "/run/secure-pv/tls-secret-seed"),
+        env("KBS_RESOURCE_PATH", &app.tls_resource_path()),
         env("KBS_CDH_ENDPOINT", "http://127.0.0.1:8081/cdh/resource"),
         env_field_ref("LUKS_MAPPING_NAME", "metadata.name"),
         env("ENCLAVA_SECURE_PV_BOOTSTRAP", "1"),
-        env("SECURE_PV_RESET_ON_KEY_MISMATCH", "true"),
-        env("STORAGE_OWNERSHIP_MODE", mode),
+        env("FLOWFORGE_SECURE_PV_BOOTSTRAP", "1"),
+        env("SECURE_PV_RESET_ON_KEY_MISMATCH", "false"),
+        env("STORAGE_OWNERSHIP_MODE", "kbs-resource"),
         env("OWNERSHIP_SLOT", "tls-data"),
         env("XDG_DATA_HOME", "/tls-data/caddy"),
         env("KBS_FETCH_RETRIES", "120"),
@@ -328,14 +328,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
              export LUKS_MAPPING_NAME\n\
              export CF_API_TOKEN=$(cat /run/secrets/cloudflare/token)\n\
              caddy validate --config /etc/caddy/Caddyfile\n\
-             export XDG_DATA_HOME=/tmp/caddy-bootstrap\n\
-             caddy run --config /etc/caddy/Caddyfile &\n\
-             CADDY_PID=$!\n\
-             /bin/sh /secure-pv/bootstrap.sh -- /bin/sh -c 'true'\n\
-             kill \"$CADDY_PID\" 2>/dev/null || true\n\
-             wait \"$CADDY_PID\" 2>/dev/null || true\n\
-             export XDG_DATA_HOME=/tls-data/caddy\n\
-             exec caddy run --config /etc/caddy/Caddyfile"
+             exec /bin/sh /secure-pv/bootstrap.sh -- caddy run --config /etc/caddy/Caddyfile"
                 .to_string(),
         ]),
         ports: Some(vec![ContainerPort {

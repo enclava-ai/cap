@@ -44,6 +44,46 @@ pub async fn ensure_haproxy_route(
     config: &EdgeRouteConfig,
     app: &ConfidentialApp,
 ) -> Result<(), EdgeRouteError> {
+    mutate_haproxy_config(config, |current| {
+        let backend_name = backend_name(app);
+        render_route(current, &backend_name, app)
+    })
+    .await?;
+
+    tracing::info!(
+        host = %app.primary_domain(),
+        backend = %format!("{}.{}.svc.cluster.local:443", app.name, app.namespace),
+        "ensured tenant HAProxy SNI route"
+    );
+
+    Ok(())
+}
+
+pub async fn remove_haproxy_route(
+    config: &EdgeRouteConfig,
+    app_name: &str,
+    domain: &str,
+) -> Result<(), EdgeRouteError> {
+    let backend_name = backend_name_for_app_name(app_name);
+    let changed = mutate_haproxy_config(config, |current| {
+        remove_route(current, &backend_name, domain)
+    })
+    .await?;
+
+    if changed {
+        tracing::info!(host = %domain, backend = %backend_name, "removed tenant HAProxy SNI route");
+    }
+
+    Ok(())
+}
+
+async fn mutate_haproxy_config<F>(
+    config: &EdgeRouteConfig,
+    mutate: F,
+) -> Result<bool, EdgeRouteError>
+where
+    F: FnOnce(&str) -> String,
+{
     let lock = HAPROXY_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().await;
 
@@ -59,10 +99,9 @@ pub async fn ensure_haproxy_route(
             name: config.configmap_name.clone(),
         })?;
 
-    let backend_name = backend_name(app);
-    let updated = render_route(current, &backend_name, app);
+    let updated = mutate(current);
     if updated == *current {
-        return Ok(());
+        return Ok(false);
     }
 
     let patch = json!({
@@ -98,17 +137,15 @@ pub async fn ensure_haproxy_route(
         )
         .await?;
 
-    tracing::info!(
-        host = %app.primary_domain(),
-        backend = %format!("{}.{}.svc.cluster.local:443", app.name, app.namespace),
-        "ensured tenant HAProxy SNI route"
-    );
-
-    Ok(())
+    Ok(true)
 }
 
 fn backend_name(app: &ConfidentialApp) -> String {
-    format!("be_cap_{}_sni_route", sanitize_backend_token(&app.name))
+    backend_name_for_app_name(&app.name)
+}
+
+fn backend_name_for_app_name(app_name: &str) -> String {
+    format!("be_cap_{}_sni_route", sanitize_backend_token(app_name))
 }
 
 fn sanitize_backend_token(value: &str) -> String {
@@ -128,7 +165,7 @@ fn render_route(config: &str, backend_name: &str, app: &ConfidentialApp) -> Stri
     let host = app.primary_domain();
     let use_backend = format!("  use_backend {backend_name} if {{ req.ssl_sni -i {host} }}");
     let server = format!(
-        "  server tenant {}.{}.svc.cluster.local:443 check",
+        "  server tenant {}.{}.svc.cluster.local:443 check init-addr none",
         app.name, app.namespace
     );
     let backend = format!(
@@ -153,6 +190,37 @@ fn render_route(config: &str, backend_name: &str, app: &ConfidentialApp) -> Stri
     }
 
     out
+}
+
+fn remove_route(config: &str, backend_name: &str, domain: &str) -> String {
+    let use_backend = format!("use_backend {backend_name} if {{ req.ssl_sni -i {domain} }}");
+    let mut out = Vec::new();
+    let mut skipping_backend = false;
+
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed == use_backend {
+            continue;
+        }
+        if trimmed == format!("backend {backend_name}") {
+            skipping_backend = true;
+            continue;
+        }
+        if skipping_backend {
+            if trimmed.starts_with("backend ") {
+                skipping_backend = false;
+            } else {
+                continue;
+            }
+        }
+        out.push(line);
+    }
+
+    let mut rendered = out.join("\n");
+    if config.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
 }
 
 #[cfg(test)]
@@ -219,9 +287,9 @@ mod tests {
                 < rendered.find("default_backend be_reject").unwrap()
         );
         assert!(rendered.contains("backend be_cap_test_app_sni_route"));
-        assert!(
-            rendered.contains("server tenant test-app.cap-test-app.svc.cluster.local:443 check")
-        );
+        assert!(rendered.contains(
+            "server tenant test-app.cap-test-app.svc.cluster.local:443 check init-addr none"
+        ));
     }
 
     #[test]
@@ -231,5 +299,14 @@ mod tests {
         let once = render_route(cfg, "be_cap_test_app_sni_route", &app());
         let twice = render_route(&once, "be_cap_test_app_sni_route", &app());
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn remove_route_removes_use_backend_and_backend_block() {
+        let cfg = "frontend fe_443\n  bind :443\n  use_backend be_cap_test_app_sni_route if { req.ssl_sni -i test-app.enclava.dev }\n  default_backend be_reject\n\nbackend be_cap_test_app_sni_route\n  # Generated from CAP caddy-sni-route ConfigMap.\n  # TLS termination remains inside the confidential workload.\n  server tenant test-app.cap-test-app.svc.cluster.local:443 check init-addr none\n\nbackend be_reject\n";
+        let rendered = remove_route(cfg, "be_cap_test_app_sni_route", "test-app.enclava.dev");
+        assert!(!rendered.contains("be_cap_test_app_sni_route"));
+        assert!(rendered.contains("default_backend be_reject"));
+        assert!(rendered.contains("backend be_reject"));
     }
 }

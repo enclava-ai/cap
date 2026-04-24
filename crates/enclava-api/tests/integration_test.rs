@@ -53,6 +53,7 @@ async fn setup_test_state() -> (AppState, PgPool) {
         }),
         dns: None,
         kbs_policy: None,
+        deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
     };
 
     (state, pool)

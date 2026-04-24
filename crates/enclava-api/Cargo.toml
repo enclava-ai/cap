@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "enclava-api"
 path = "src/main.rs"
 
+[[bin]]
+name = "kbs-resource-writer"
+path = "src/bin/kbs-resource-writer.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 enclava-engine = { workspace = true }
@@ -42,6 +46,7 @@ tower_governor = { workspace = true }
 sigstore = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+json-patch = "4.1"
 
 [dev-dependencies]
 axum-test = "20"

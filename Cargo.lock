@@ -1314,6 +1314,7 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "json-patch",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",

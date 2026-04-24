@@ -11,9 +11,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build static binary
-RUN cargo build --release --bin enclava-api && \
-    strip /build/target/release/enclava-api
+# Build static binaries
+RUN cargo build --release --bin enclava-api --bin kbs-resource-writer && \
+    strip /build/target/release/enclava-api && \
+    strip /build/target/release/kbs-resource-writer
 
 # Runtime stage
 FROM alpine:3.20
@@ -27,9 +28,10 @@ RUN addgroup -g 1000 enclava && \
 
 # Copy binary from builder
 COPY --from=builder /build/target/release/enclava-api /usr/local/bin/enclava-api
+COPY --from=builder /build/target/release/kbs-resource-writer /usr/local/bin/kbs-resource-writer
 
 # Set permissions
-RUN chown enclava:enclava /usr/local/bin/enclava-api
+RUN chown enclava:enclava /usr/local/bin/enclava-api /usr/local/bin/kbs-resource-writer
 
 # Switch to non-root user
 USER enclava

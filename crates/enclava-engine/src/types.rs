@@ -87,10 +87,10 @@ pub struct Container {
 }
 
 /// Two-volume storage specification.
-/// CAP is owner-seed-only: both LUKS keys derived from a single owner_seed via HKDF.
-/// No per-volume KBS seed paths. The only KBS resources are:
-///   default/{instance_id}-owner/seed-encrypted
-///   default/{instance_id}-owner/seed-sealed
+///
+/// App data is owner-seed backed. TLS data keeps the legacy KBS seed model so
+/// Caddy can start with persisted certificates before app-data is claimed or
+/// unlocked.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageSpec {
     pub app_data: VolumeSpec,
@@ -188,5 +188,15 @@ impl ConfidentialApp {
     /// KBS owner resource type for `owner_resource_bindings`.
     pub fn owner_resource_type(&self) -> String {
         format!("{}-owner", self.owner_instance_id())
+    }
+
+    /// KBS TLS resource path used by tenant-ingress Caddy.
+    pub fn tls_resource_path(&self) -> String {
+        format!("default/{}/workload-secret-seed", self.tls_resource_type())
+    }
+
+    /// KBS TLS resource type for generic `resource_bindings`.
+    pub fn tls_resource_type(&self) -> String {
+        format!("{}-tls", self.owner_instance_id())
     }
 }

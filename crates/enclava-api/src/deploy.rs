@@ -235,6 +235,7 @@ pub async fn apply_deployment_manifests(
     set_app_status(&pool, app.id, "creating").await?;
 
     crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
+    crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
     crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
 
     let engine = ApplyEngine::try_default().await?;

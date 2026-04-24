@@ -217,17 +217,43 @@ fn caddy_container_has_reset_on_key_mismatch() {
         .iter()
         .find(|e| e.name == "SECURE_PV_RESET_ON_KEY_MISMATCH")
         .unwrap();
-    assert_eq!(found.value.as_deref(), Some("true"));
+    assert_eq!(found.value.as_deref(), Some("false"));
 }
 
 #[test]
-fn caddy_container_starts_ephemeral_ingress_before_tls_unlock() {
+fn caddy_container_uses_kbs_tls_seed_path() {
+    let app = sample_app();
+    let c = build_caddy_container(&app);
+    let env = c.env.as_ref().unwrap();
+    let found = env.iter().find(|e| e.name == "KBS_RESOURCE_PATH").unwrap();
+    assert_eq!(
+        found.value.as_deref(),
+        Some("default/cap-test-org-test-app-test-app-tls/workload-secret-seed")
+    );
+}
+
+#[test]
+fn caddy_container_does_not_use_owner_unlock_mode() {
+    let app = sample_app();
+    let c = build_caddy_container(&app);
+    let env = c.env.as_ref().unwrap();
+    let found = env
+        .iter()
+        .find(|e| e.name == "STORAGE_OWNERSHIP_MODE")
+        .unwrap();
+    assert_eq!(found.value.as_deref(), Some("kbs-resource"));
+}
+
+#[test]
+fn caddy_container_runs_inside_persistent_tls_volume() {
     let app = sample_app();
     let c = build_caddy_container(&app);
     let command = c.command.as_ref().unwrap().join("\n");
-    assert!(command.contains("XDG_DATA_HOME=/tmp/caddy-bootstrap"));
-    assert!(command.contains("caddy run --config /etc/caddy/Caddyfile &"));
-    assert!(command.contains("XDG_DATA_HOME=/tls-data/caddy"));
+    assert!(!command.contains("/tmp/caddy-bootstrap"));
+    assert!(!command.contains("caddy run --config /etc/caddy/Caddyfile &"));
+    assert!(command.contains(
+        "exec /bin/sh /secure-pv/bootstrap.sh -- caddy run --config /etc/caddy/Caddyfile"
+    ));
 }
 
 #[test]

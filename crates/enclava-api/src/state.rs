@@ -4,6 +4,7 @@ use ed25519_dalek::SigningKey;
 use enclava_engine::types::AttestationConfig;
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Shared application state accessible from all axum handlers.
 #[derive(Clone)]
@@ -34,4 +35,8 @@ pub struct AppState {
     pub dns: Option<DnsConfig>,
     /// Trustee KBS policy settings for CAP-managed owner-resource bindings.
     pub kbs_policy: Option<KbsPolicyConfig>,
+    /// Cluster-wide apply backpressure for this API instance. Applying a CAP
+    /// deployment starts a Kata VM and attaches Longhorn volumes; bursts can
+    /// overwhelm a single worker node before Kubernetes has useful feedback.
+    pub deployment_apply_permits: Arc<Semaphore>,
 }

@@ -1,7 +1,8 @@
 //! KBS owner_resource_bindings Rego generation.
 //!
-//! CAP generates `owner_resource_bindings` for each app. Legacy `resource_bindings`
-//! are imported as frozen entries per OID-5.
+//! CAP generates `owner_resource_bindings` for owner state and generic
+//! `resource_bindings` for tenant TLS seeds. Legacy `resource_bindings` are
+//! imported as frozen entries per OID-5.
 
 use serde_json::{Value, json};
 
@@ -14,6 +15,23 @@ pub fn generate_owner_binding_entry(app: &ConfidentialApp) -> (String, Value) {
     let value = json!({
         "repository": "default",
         "allowed_tags": ["seed-encrypted", "seed-sealed"],
+        "allowed_namespaces": [&app.namespace],
+        "allowed_service_accounts": [&app.service_account],
+        "allowed_identity_hashes": [&app.tenant_instance_identity_hash]
+    });
+    (key, value)
+}
+
+/// Generate the generic resource_bindings map entry for a single app's TLS seed.
+/// Returns (key, value) where key is "{namespace}-{name}-tls".
+pub fn generate_tls_binding_entry(app: &ConfidentialApp) -> (String, Value) {
+    let key = app.tls_resource_type();
+    let value = json!({
+        "repository": "default",
+        "tag": "workload-secret-seed",
+        "allowed_images": [],
+        "allowed_image_tag_prefixes": [],
+        "allowed_init_data_hashes": [],
         "allowed_namespaces": [&app.namespace],
         "allowed_service_accounts": [&app.service_account],
         "allowed_identity_hashes": [&app.tenant_instance_identity_hash]
@@ -38,14 +56,42 @@ pub fn generate_kbs_policy_rego(
     // Header
     rego.push_str("package policy\n\nimport rego.v1\n\ndefault allow := false\n\n");
 
-    // Legacy resource_bindings (frozen per OID-5)
+    // Legacy resource_bindings (frozen per OID-5) plus CAP TLS seed bindings.
     if legacy_resource_bindings_body.trim().is_empty() {
-        rego.push_str("resource_bindings := {}\n\n");
+        rego.push_str("resource_bindings := {\n");
     } else {
         rego.push_str("resource_bindings := {\n");
         rego.push_str(legacy_resource_bindings_body);
-        rego.push_str("\n}\n\n");
     }
+    let tls_entries: Vec<String> = apps
+        .iter()
+        .map(|app| {
+            let (key, _val) = generate_tls_binding_entry(app);
+            format!(
+                "  \"{key}\": {{\n\
+                 {indent}\"repository\": \"default\",\n\
+                 {indent}\"tag\": \"workload-secret-seed\",\n\
+                 {indent}\"allowed_images\": [],\n\
+                 {indent}\"allowed_image_tag_prefixes\": [],\n\
+                 {indent}\"allowed_init_data_hashes\": [],\n\
+                 {indent}\"allowed_namespaces\": [\"{namespace}\"],\n\
+                 {indent}\"allowed_service_accounts\": [\"{sa}\"],\n\
+                 {indent}\"allowed_identity_hashes\": [\"{hash}\"]\n\
+                 {indent2}}}",
+                key = key,
+                indent = "    ",
+                indent2 = "  ",
+                namespace = app.namespace,
+                sa = app.service_account,
+                hash = app.tenant_instance_identity_hash,
+            )
+        })
+        .collect();
+    if !legacy_resource_bindings_body.trim().is_empty() && !tls_entries.is_empty() {
+        rego.push_str(",\n");
+    }
+    rego.push_str(&tls_entries.join(",\n"));
+    rego.push_str("\n}\n\n");
 
     // CAP owner_resource_bindings
     rego.push_str("owner_resource_bindings := {\n");

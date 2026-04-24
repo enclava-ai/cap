@@ -436,6 +436,21 @@ pub async fn delete_app(
     .await
     .map_err(dns_error_response)?;
 
+    crate::edge::remove_haproxy_route(
+        &crate::edge::EdgeRouteConfig::from_env(),
+        &app.name,
+        &app.domain,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(
+                serde_json::json!({"error": format!("failed to remove tenant edge route: {}", e)}),
+            ),
+        )
+    })?;
+
     delete_tenant_namespace(&app.namespace).await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
@@ -449,6 +464,14 @@ pub async fn delete_app(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({"error": format!("failed to remove KBS owner binding: {}", e)})),
+            )
+        })?;
+    crate::kbs::soft_delete_tls_binding(&state.db, state.kbs_policy.as_ref(), app.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("failed to remove KBS TLS binding: {}", e)})),
             )
         })?;
     crate::kbs::reconcile_policy(&state.db, state.kbs_policy.as_ref())

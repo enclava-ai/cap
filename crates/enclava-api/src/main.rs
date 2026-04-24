@@ -218,6 +218,15 @@ async fn main() {
     let attestation = load_attestation_config().expect("failed to load attestation config");
     let dns = load_dns_config().expect("failed to load DNS config");
     let kbs_policy = enclava_api::kbs::config_from_env();
+    let max_concurrent_applies = std::env::var("CAP_MAX_CONCURRENT_APPLIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    tracing::info!(
+        max_concurrent_applies,
+        "configured deployment apply concurrency"
+    );
     let tee_http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(tee_accepts_invalid_certs())
         .https_only(true)
@@ -238,6 +247,7 @@ async fn main() {
         attestation,
         dns,
         kbs_policy,
+        deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
     };
 
     let app = build_router(state);
