@@ -223,6 +223,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("STORAGE_OWNERSHIP_MODE", mode),
         env("INSTANCE_ID", &app.owner_instance_id()),
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
+        env("OWNER_SEED_HANDOFF_SLOTS", "app-data"),
         env("OWNERSHIP_MOUNT_PATH", "/run/ownership-signal"),
         env("KBS_RESOURCE_CACHE_SECONDS", "300"),
         env("KBS_RESOURCE_FAILURE_CACHE_SECONDS", "30"),

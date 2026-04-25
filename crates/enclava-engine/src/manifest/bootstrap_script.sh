@@ -83,6 +83,7 @@ ensure_kbs_fetch_tool() {
 
 # Wait for attestation-proxy /health when KBS_CDH_ENDPOINT uses the sidecar (port 8081).
 # Avoids a bootstrap race where the workload curls CDH before the proxy has bound its socket.
+# Locked owner storage returns 423, but TLS CDH is intentionally available while locked.
 wait_for_kbs_proxy_health() {
   WAIT_MAX="${KBS_PROXY_HEALTH_WAIT_SECONDS:-}"
   if [ -z "$WAIT_MAX" ]; then
@@ -115,15 +116,19 @@ wait_for_kbs_proxy_health() {
   echo "secure-pv: waiting for KBS attestation-proxy (${HEALTH}, up to ${WAIT_MAX}s)" >&2
   while [ "$ELAPSED" -lt "$WAIT_MAX" ]; do
     if command -v curl >/dev/null 2>&1; then
-      if curl -sf --connect-timeout 2 --max-time 5 "$HEALTH" >/dev/null 2>&1; then
+      HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$HEALTH" 2>/dev/null || true)"
+      if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "423" ]; then
         echo "secure-pv: KBS proxy ready after ${ELAPSED}s" >&2
         return 0
       fi
     elif command -v wget >/dev/null 2>&1; then
-      if wget -q --timeout=5 -O /dev/null "$HEALTH" 2>/dev/null; then
+      WGET_OUTPUT="$(wget -S --timeout=5 -O /dev/null "$HEALTH" 2>&1 || true)"
+      case "$WGET_OUTPUT" in
+        *" 200 "*|*" 423 "*)
         echo "secure-pv: KBS proxy ready after ${ELAPSED}s" >&2
         return 0
-      fi
+          ;;
+      esac
     else
       echo "secure-pv: curl or wget required to wait for KBS proxy" >&2
       return 1

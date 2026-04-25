@@ -145,6 +145,18 @@ fn proxy_container_has_owner_ciphertext_backend() {
 }
 
 #[test]
+fn proxy_container_limits_owner_seed_handoff_to_app_data() {
+    let app = sample_app();
+    let c = build_attestation_proxy_container(&app);
+    let env = c.env.as_ref().unwrap();
+    let found = env
+        .iter()
+        .find(|e| e.name == "OWNER_SEED_HANDOFF_SLOTS")
+        .unwrap();
+    assert_eq!(found.value.as_deref(), Some("app-data"));
+}
+
+#[test]
 fn proxy_container_has_sev_sealing_permissions() {
     let app = sample_app();
     let c = build_attestation_proxy_container(&app);

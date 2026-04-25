@@ -78,10 +78,15 @@ impl TeeClient {
     /// Create a TEE client for the given app domain.
     /// The domain is the HTTPS endpoint of the app (e.g., "myapp.enclava.dev").
     pub fn new(app_domain: &str) -> Self {
+        Self::new_with_timeout(app_domain, std::time::Duration::from_secs(180))
+    }
+
+    /// Create a TEE client with a custom request timeout.
+    pub fn new_with_timeout(app_domain: &str, timeout: std::time::Duration) -> Self {
         let accept_invalid_certs = accepts_invalid_tee_certs();
         let http = reqwest::Client::builder()
             .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(180))
+            .timeout(timeout)
             .danger_accept_invalid_certs(accept_invalid_certs)
             .https_only(true) // Enforce HTTPS
             .build()

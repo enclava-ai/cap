@@ -23,6 +23,14 @@ fn bootstrap_script_contains_secure_pv_bootstrap() {
 }
 
 #[test]
+fn bootstrap_proxy_wait_accepts_locked_health() {
+    assert!(BOOTSTRAP_SCRIPT.contains("HTTP_CODE="));
+    assert!(BOOTSTRAP_SCRIPT.contains("[ \"$HTTP_CODE\" = \"423\" ]"));
+    assert!(BOOTSTRAP_SCRIPT.contains("WGET_OUTPUT="));
+    assert!(BOOTSTRAP_SCRIPT.contains("*\" 423 \"*"));
+}
+
+#[test]
 fn bootstrap_configmap_name() {
     let app = sample_app();
     let cm = generate_bootstrap_configmap(&app);

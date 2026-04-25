@@ -156,6 +156,8 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let config_pairs = parse_config_vars(&args.config_vars)?;
     let (api, _paths, _cli_config) = build_api_client()?;
+    let app = api.get_app(&app_name).await?;
+    let is_password_mode = app.unlock_mode == "password";
 
     let req = DeployRequest {
         image: args.image.clone(),
@@ -179,55 +181,33 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     pb.set_position(2);
     pb.set_message("Waiting for TEE boot...");
 
-    let max_wait = Duration::from_secs(300);
+    let max_wait = Duration::from_secs(900);
     let poll_interval = Duration::from_secs(3);
-    let start = std::time::Instant::now();
 
-    loop {
-        if start.elapsed() > max_wait {
-            pb.abandon_with_message("Timeout waiting for TEE boot");
-            return Err("deploy timed out waiting for TEE to boot".into());
-        }
-
-        match api.get_status(&app_name).await {
-            Ok(status) => match status.pod_phase.as_deref() {
-                Some("Running") => {
-                    pb.set_position(3);
-                    pb.set_message("TEE running, attestation complete");
-                    break;
-                }
-                Some(phase) => {
-                    pb.set_message(format!("Pod: {phase}"));
-                }
-                None => {}
-            },
-            Err(_) => {
-                // Status endpoint may not be ready yet
-            }
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-
-    // Phase 3: First ownership claim for password-mode apps
-    let unlock_status = api.get_unlock_status(&app_name).await.ok();
-    if unlock_status
-        .as_ref()
-        .is_some_and(|status| status.unlock_mode == "password")
-        && unlock_status
-            .as_ref()
-            .and_then(|status| status.ownership_state.as_deref())
+    // Phase 3: First ownership claim for password-mode apps.
+    //
+    // On first boot the app container is intentionally unhealthy until the
+    // owner claims storage, so waiting for app-level readiness deadlocks.
+    // Instead, wait for the TEE bootstrap endpoint and claim directly.
+    let needs_initial_claim = if is_password_mode {
+        api.get_unlock_status(&app_name)
+            .await
+            .ok()
+            .and_then(|status| status.ownership_state)
             .is_none_or(|state| state == "unclaimed")
-    {
+    } else {
+        false
+    };
+
+    if needs_initial_claim {
         pb.set_position(3);
         pb.set_message("Waiting for ownership claim endpoint...");
-        claim_initial_ownership(&api, &_paths, &_cli_config, &app_name).await?;
-        pb.set_message("Ownership claimed");
-    } else if unlock_status
-        .as_ref()
-        .is_some_and(|status| status.unlock_mode == "password")
-    {
-        pb.set_position(3);
-        pb.set_message("Ownership already claimed");
+        if wait_for_bootstrap_endpoint(&api, &app_name, max_wait, poll_interval, &pb).await? {
+            claim_initial_ownership(&api, &_paths, &_cli_config, &app_name).await?;
+            pb.set_message("Ownership claimed");
+        }
+    } else {
+        wait_for_deploy_runtime(&api, &app_name, max_wait, poll_interval, &pb).await?;
     }
 
     // Phase 4: Push config if --set was used
@@ -276,6 +256,89 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+async fn wait_for_bootstrap_endpoint(
+    api: &ApiClient,
+    app_name: &str,
+    max_wait: Duration,
+    poll_interval: Duration,
+    pb: &ProgressBar,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let endpoint = api.get_unlock_endpoint(app_name).await?;
+    let tee = TeeClient::new_with_timeout(&endpoint.tee_url, Duration::from_secs(10));
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > max_wait {
+            pb.abandon_with_message("Timeout waiting for ownership claim endpoint");
+            return Err("deploy timed out waiting for TEE ownership claim endpoint".into());
+        }
+
+        match tee.bootstrap_challenge().await {
+            Ok(_) => {
+                pb.set_message("Ownership claim endpoint ready");
+                return Ok(true);
+            }
+            Err(err) if tee.claim_state_is_successful().await.unwrap_or(false) => {
+                pb.set_message("Ownership already claimed");
+                let _ = err;
+                return Ok(false);
+            }
+            Err(_) => {
+                pb.set_message("Waiting for ownership claim endpoint...");
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn wait_for_deploy_runtime(
+    api: &ApiClient,
+    app_name: &str,
+    max_wait: Duration,
+    poll_interval: Duration,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > max_wait {
+            pb.abandon_with_message("Timeout waiting for TEE boot");
+            return Err("deploy timed out waiting for TEE to boot".into());
+        }
+
+        match api.get_status(app_name).await {
+            Ok(status) => {
+                if matches!(status.status.as_str(), "running" | "locked") {
+                    pb.set_position(3);
+                    pb.set_message(match status.status.as_str() {
+                        "locked" => "TEE running, storage locked",
+                        _ => "TEE running, attestation complete",
+                    });
+                    return Ok(());
+                }
+
+                match status.pod_phase.as_deref() {
+                    Some("Running") => {
+                        pb.set_position(3);
+                        pb.set_message("TEE running, attestation complete");
+                        return Ok(());
+                    }
+                    Some(phase) => {
+                        pb.set_message(format!("Pod: {phase}"));
+                    }
+                    None => {}
+                }
+            }
+            Err(_) => {
+                // Status endpoint may not be ready yet.
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 async fn claim_initial_ownership(

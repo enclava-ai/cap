@@ -2,7 +2,10 @@ use std::sync::OnceLock;
 
 use chrono::Utc;
 use enclava_engine::types::ConfidentialApp;
-use k8s_openapi::api::{apps::v1::DaemonSet, core::v1::ConfigMap};
+use k8s_openapi::api::{
+    apps::v1::DaemonSet,
+    core::v1::{ConfigMap, Service},
+};
 use kube::{
     Api, Client,
     api::{Patch, PatchParams},
@@ -44,15 +47,16 @@ pub async fn ensure_haproxy_route(
     config: &EdgeRouteConfig,
     app: &ConfidentialApp,
 ) -> Result<(), EdgeRouteError> {
+    let backend_target = resolve_service_backend(app).await?;
     mutate_haproxy_config(config, |current| {
         let backend_name = backend_name(app);
-        render_route(current, &backend_name, app)
+        render_route(current, &backend_name, app, &backend_target)
     })
     .await?;
 
     tracing::info!(
         host = %app.primary_domain(),
-        backend = %format!("{}.{}.svc.cluster.local:443", app.name, app.namespace),
+        backend = %backend_target,
         "ensured tenant HAProxy SNI route"
     );
 
@@ -161,18 +165,34 @@ fn sanitize_backend_token(value: &str) -> String {
         .collect()
 }
 
-fn render_route(config: &str, backend_name: &str, app: &ConfidentialApp) -> String {
+async fn resolve_service_backend(app: &ConfidentialApp) -> Result<String, EdgeRouteError> {
+    let client = Client::try_default().await?;
+    let service_api: Api<Service> = Api::namespaced(client, &app.namespace);
+    let service = service_api.get(&app.name).await?;
+    let cluster_ip = service
+        .spec
+        .and_then(|spec| spec.cluster_ip)
+        .filter(|ip| !ip.is_empty() && ip != "None")
+        .unwrap_or_else(|| format!("{}.{}.svc.cluster.local", app.name, app.namespace));
+
+    Ok(format!("{cluster_ip}:443"))
+}
+
+fn render_route(
+    config: &str,
+    backend_name: &str,
+    app: &ConfidentialApp,
+    backend_target: &str,
+) -> String {
     let host = app.primary_domain();
+    let config = remove_route(config, backend_name, &host);
     let use_backend = format!("  use_backend {backend_name} if {{ req.ssl_sni -i {host} }}");
-    let server = format!(
-        "  server tenant {}.{}.svc.cluster.local:443 check init-addr none",
-        app.name, app.namespace
-    );
+    let server = format!("  server tenant {backend_target} check");
     let backend = format!(
-        "\nbackend {backend_name}\n  # Generated from CAP caddy-sni-route ConfigMap.\n  # TLS termination remains inside the confidential workload.\n{server}\n"
+        "backend {backend_name}\n  # Generated from CAP caddy-sni-route ConfigMap.\n  # TLS termination remains inside the confidential workload.\n{server}\n"
     );
 
-    let mut out = config.to_string();
+    let mut out = config;
     if !out.lines().any(|line| line.trim() == use_backend.trim()) {
         if let Some(index) = out.find("  default_backend be_reject") {
             out.insert_str(index, &format!("{use_backend}\n"));
@@ -183,9 +203,13 @@ fn render_route(config: &str, backend_name: &str, app: &ConfidentialApp) -> Stri
         .lines()
         .any(|line| line.trim() == format!("backend {backend_name}"))
     {
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
         if !out.ends_with('\n') {
             out.push('\n');
         }
+        out.push('\n');
         out.push_str(&backend);
     }
 
@@ -279,7 +303,7 @@ mod tests {
     fn adds_route_before_default_backend_and_backend_block() {
         let cfg =
             "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
-        let rendered = render_route(cfg, "be_cap_test_app_sni_route", &app());
+        let rendered = render_route(cfg, "be_cap_test_app_sni_route", &app(), "10.43.1.2:443");
         assert!(
             rendered
                 .find("use_backend be_cap_test_app_sni_route")
@@ -287,18 +311,24 @@ mod tests {
                 < rendered.find("default_backend be_reject").unwrap()
         );
         assert!(rendered.contains("backend be_cap_test_app_sni_route"));
-        assert!(rendered.contains(
-            "server tenant test-app.cap-test-app.svc.cluster.local:443 check init-addr none"
-        ));
+        assert!(rendered.contains("server tenant 10.43.1.2:443 check"));
     }
 
     #[test]
     fn route_render_is_idempotent() {
         let cfg =
             "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
-        let once = render_route(cfg, "be_cap_test_app_sni_route", &app());
-        let twice = render_route(&once, "be_cap_test_app_sni_route", &app());
+        let once = render_route(cfg, "be_cap_test_app_sni_route", &app(), "10.43.1.2:443");
+        let twice = render_route(&once, "be_cap_test_app_sni_route", &app(), "10.43.1.2:443");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn route_render_updates_existing_backend_target() {
+        let cfg = "frontend fe_443\n  bind :443\n  use_backend be_cap_test_app_sni_route if { req.ssl_sni -i test-app.enclava.dev }\n  default_backend be_reject\n\nbackend be_cap_test_app_sni_route\n  # Generated from CAP caddy-sni-route ConfigMap.\n  # TLS termination remains inside the confidential workload.\n  server tenant test-app.cap-test-app.svc.cluster.local:443 check init-addr none\n\nbackend be_reject\n";
+        let rendered = render_route(cfg, "be_cap_test_app_sni_route", &app(), "10.43.1.2:443");
+        assert!(rendered.contains("server tenant 10.43.1.2:443 check"));
+        assert!(!rendered.contains("test-app.cap-test-app.svc.cluster.local:443"));
     }
 
     #[test]
