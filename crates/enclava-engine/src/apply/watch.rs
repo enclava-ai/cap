@@ -172,19 +172,18 @@ pub async fn watch_rollout(
                 .and_then(|s| s.container_statuses.as_ref())
             {
                 for cs in statuses {
-                    if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) {
-                        if let Some(reason) = &waiting.reason {
-                            if reason == "CrashLoopBackOff" || reason == "Error" {
-                                let msg = format!(
-                                    "container '{}' in {}: {}",
-                                    cs.name,
-                                    reason,
-                                    waiting.message.as_deref().unwrap_or("no details")
-                                );
-                                tracing::warn!(%msg, "crash loop detected");
-                                return Ok(DeployStatus::failed(&msg));
-                            }
-                        }
+                    if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref())
+                        && let Some(reason) = &waiting.reason
+                        && (reason == "CrashLoopBackOff" || reason == "Error")
+                    {
+                        let msg = format!(
+                            "container '{}' in {}: {}",
+                            cs.name,
+                            reason,
+                            waiting.message.as_deref().unwrap_or("no details")
+                        );
+                        tracing::warn!(%msg, "crash loop detected");
+                        return Ok(DeployStatus::failed(&msg));
                     }
                 }
             }

@@ -1,6 +1,7 @@
 # Build
 /target
-
+/docs
+/tools
 # Agent scratch (never commit)
 .claude/
 .remember/

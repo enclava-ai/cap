@@ -185,7 +185,7 @@ fn render_route(
     backend_target: &str,
 ) -> String {
     let host = app.primary_domain();
-    let config = remove_route(config, backend_name, &host);
+    let config = remove_route(config, backend_name, host);
     let use_backend = format!("  use_backend {backend_name} if {{ req.ssl_sni -i {host} }}");
     let server = format!("  server tenant {backend_target} check");
     let backend = format!(
@@ -193,10 +193,10 @@ fn render_route(
     );
 
     let mut out = config;
-    if !out.lines().any(|line| line.trim() == use_backend.trim()) {
-        if let Some(index) = out.find("  default_backend be_reject") {
-            out.insert_str(index, &format!("{use_backend}\n"));
-        }
+    if !out.lines().any(|line| line.trim() == use_backend.trim())
+        && let Some(index) = out.find("  default_backend be_reject")
+    {
+        out.insert_str(index, &format!("{use_backend}\n"));
     }
 
     if !out

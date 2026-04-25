@@ -129,10 +129,10 @@ pub async fn validate_api_key(
         .into_iter()
         .filter_map(|(id, org_id, created_by, key_hash, scopes, expires_at)| {
             // Check expiry
-            if let Some(exp) = expires_at {
-                if exp < Utc::now() {
-                    return None;
-                }
+            if let Some(exp) = expires_at
+                && exp < Utc::now()
+            {
+                return None;
             }
             Some((id, org_id, created_by, key_hash, scopes))
         })

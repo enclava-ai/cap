@@ -9,7 +9,9 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 async fn setup_test_db() -> PgPool {
-    let pool = sqlx::PgPool::connect("postgresql://test:test@localhost:5432/test")
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let pool = sqlx::PgPool::connect(&database_url)
         .await
         .expect("failed to connect to test db");
 
@@ -66,7 +68,10 @@ async fn health_endpoint_returns_ok() {
 
     let server = axum_test::TestServer::new(app);
 
-    let response = server.get("/health").await;
+    let response = server
+        .get("/health")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .await;
 
     response.assert_status_ok();
     response.assert_text("ok");

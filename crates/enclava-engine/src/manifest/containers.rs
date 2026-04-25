@@ -257,7 +257,6 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
             capabilities: Some(Capabilities {
                 add: Some(vec!["MKNOD".to_string()]),
                 drop: Some(vec!["ALL".to_string()]),
-                ..Default::default()
             }),
             ..Default::default()
         }),

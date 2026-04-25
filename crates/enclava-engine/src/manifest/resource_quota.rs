@@ -147,14 +147,14 @@ fn sum_storage_quantities(a: &str, b: &str) -> String {
     let (a_num, a_suffix) = split_quantity(a);
     let (b_num, b_suffix) = split_quantity(b);
 
-    if a_suffix == b_suffix {
-        if let (Ok(a), Ok(b)) = (a_num.parse::<f64>(), b_num.parse::<f64>()) {
-            let total = a + b;
-            if total == total.floor() {
-                return format!("{}{a_suffix}", total as i64);
-            }
-            return format!("{total}{a_suffix}");
+    if a_suffix == b_suffix
+        && let (Ok(a), Ok(b)) = (a_num.parse::<f64>(), b_num.parse::<f64>())
+    {
+        let total = a + b;
+        if total == total.floor() {
+            return format!("{}{a_suffix}", total as i64);
         }
+        return format!("{total}{a_suffix}");
     }
 
     // The UI/API defaults use matching units. If a future caller mixes units,

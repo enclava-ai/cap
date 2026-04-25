@@ -111,13 +111,13 @@ async fn resolve_auth(
     parts: &Parts,
 ) -> Result<(Uuid, Option<ValidatedApiKey>), AuthError> {
     // Try X-API-Key header first
-    if let Some(key) = extract_api_key_header(parts) {
-        if key.starts_with("enc_") {
-            let validated = validate_api_key(pool, &key)
-                .await
-                .map_err(|_| AuthError::MissingAuth)?;
-            return Ok((validated.created_by, Some(validated)));
-        }
+    if let Some(key) = extract_api_key_header(parts)
+        && key.starts_with("enc_")
+    {
+        let validated = validate_api_key(pool, &key)
+            .await
+            .map_err(|_| AuthError::MissingAuth)?;
+        return Ok((validated.created_by, Some(validated)));
     }
 
     // Try Authorization: Bearer

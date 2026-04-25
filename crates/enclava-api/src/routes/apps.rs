@@ -52,7 +52,7 @@ async fn delete_tenant_namespace(namespace: &str) -> Result<(), kube::Error> {
 /// Comprehensive app name validation
 fn validate_app_name(name: &str) -> Result<(), String> {
     // Length limits
-    if name.len() < 1 || name.len() > 63 {
+    if name.is_empty() || name.len() > 63 {
         return Err("app name must be between 1 and 63 characters".to_string());
     }
 
