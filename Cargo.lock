@@ -1371,6 +1371,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "colored",
  "dialoguer",
@@ -1391,6 +1392,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

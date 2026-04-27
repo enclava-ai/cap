@@ -1,6 +1,7 @@
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod descriptor;
 pub mod domains;
 pub mod init;
 pub mod org;
@@ -66,6 +67,9 @@ pub enum Command {
     /// Manage organizations
     #[command(subcommand)]
     Org(org::OrgCommand),
+    /// Inspect a deployment descriptor (debug; phase 7 groundwork)
+    #[command(subcommand)]
+    Descriptor(descriptor::DescriptorCommand),
 }
 
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,5 +93,6 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Signer(cmd) => app::signer(cmd).await,
         Command::Tier(cmd) => tier::run(cmd).await,
         Command::Org(cmd) => org::run(cmd).await,
+        Command::Descriptor(cmd) => descriptor::run(cmd).await,
     }
 }
