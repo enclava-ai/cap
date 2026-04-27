@@ -100,17 +100,17 @@ fn generate_all_manifests_returns_all_resources() {
 
     // StatefulSet
     assert_eq!(m.statefulset.metadata.name.as_deref(), Some("test-app"));
-    let containers = &m
-        .statefulset
-        .spec
-        .as_ref()
-        .unwrap()
-        .template
-        .spec
-        .as_ref()
-        .unwrap()
-        .containers;
-    assert_eq!(containers.len(), 3);
+    // Phase 5: 2 init containers (proxy as native sidecar + enclava-init) and
+    // 2 steady-state containers (app + caddy).
+    let pod = m.statefulset.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    assert_eq!(pod.containers.len(), 2);
+    assert_eq!(pod.init_containers.as_ref().unwrap().len(), 2);
+
+    // enclava-init ConfigMap is generated.
+    assert_eq!(
+        m.enclava_init_configmap.metadata.name.as_deref(),
+        Some("test-app-enclava-init")
+    );
 
     // KBS owner binding
     let (key, value) = &m.kbs_owner_binding;

@@ -7,6 +7,7 @@
 pub mod bootstrap;
 pub mod cc_init_data;
 pub mod containers;
+pub mod enclava_init_config;
 pub mod gateway;
 pub mod ingress;
 pub mod kbs_policy;
@@ -45,6 +46,7 @@ pub struct GeneratedManifests {
     pub bootstrap_configmap: ConfigMap,
     pub startup_configmap: ConfigMap,
     pub ingress_configmap: ConfigMap,
+    pub enclava_init_configmap: ConfigMap,
     pub cloudflare_token_secret: Option<Secret>,
     pub statefulset: StatefulSet,
     /// KBS owner_resource_bindings entry: (key, value) for the policy Rego.
@@ -69,6 +71,7 @@ pub fn generate_all_manifests(app: &ConfidentialApp) -> GeneratedManifests {
         bootstrap_configmap: bootstrap::generate_bootstrap_configmap(app),
         startup_configmap: startup::generate_startup_configmap(app),
         ingress_configmap: ingress::generate_ingress_configmap(app),
+        enclava_init_configmap: enclava_init_config::generate_enclava_init_configmap(app),
         // Phase 0/11 cutover: tenant Caddy now uses TLS-ALPN-01 only, so no
         // Cloudflare DNS-01 token should be created in tenant namespaces.
         cloudflare_token_secret: None,

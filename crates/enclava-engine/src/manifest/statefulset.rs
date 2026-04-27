@@ -10,25 +10,19 @@ use std::collections::BTreeMap;
 use crate::manifest::cc_init_data;
 use crate::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
+    build_enclava_init_container, legacy_bootstrap_enabled,
 };
 use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
 
 const KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
 
-/// Generate a complete StatefulSet for a confidential workload.
-///
-/// Matches the live shape at components/templates/confidential-workload/statefulset.yaml.
-/// Three containers (app, attestation-proxy, caddy), two VCTs (state, tls-state),
-/// and all CoCo pod annotations.
 pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     let (cc_init_data_encoded, cc_init_data_hash) = cc_init_data::compute_cc_init_data(app);
 
-    // Pod labels
     let mut pod_labels = BTreeMap::new();
     pod_labels.insert("app".to_string(), app.name.clone());
 
-    // Pod annotations
     let mut annotations = BTreeMap::new();
     annotations.insert(
         "io.containerd.cri.runtime-handler".to_string(),
@@ -52,7 +46,19 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     );
     annotations.insert("tenant.flowforge.sh/instance".to_string(), app.name.clone());
 
-    // Node selector
+    let legacy = legacy_bootstrap_enabled();
+
+    // B2 investigation: enclava-init's cryptsetup luksOpen needs `dm_mod` and
+    // `dm_crypt` loadable inside the SEV-SNP guest kernel. Defense in depth —
+    // the guest kernel image should already have them, but the annotation
+    // makes a misbuilt image fail loudly instead of silently.
+    if !legacy {
+        annotations.insert(
+            "io.katacontainers.config.agent.kernel_modules".to_string(),
+            "dm_mod; dm_crypt".to_string(),
+        );
+    }
+
     let mut node_selector = BTreeMap::new();
     node_selector.insert(
         "katacontainers.io/kata-runtime".to_string(),
@@ -60,11 +66,9 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     );
     node_selector.insert("node.kubernetes.io/worker".to_string(), "true".to_string());
 
-    // Selector labels
     let mut selector_labels = BTreeMap::new();
     selector_labels.insert("app".to_string(), app.name.clone());
 
-    // Metadata labels
     let mut sts_labels = BTreeMap::new();
     sts_labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
@@ -72,12 +76,30 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     );
     sts_labels.insert("app".to_string(), app.name.clone());
 
-    // Build containers
-    let containers = vec![
-        build_app_container(app),
-        build_attestation_proxy_container(app),
-        build_caddy_container(app),
-    ];
+    // Phase 5 split: attestation-proxy runs as a native Kubernetes sidecar
+    // (initContainer with restartPolicy=Always; requires K8s ≥1.28 where
+    // sidecar containers are stable). enclava-init follows it as a one-shot
+    // initContainer that opens LUKS, runs the in-TEE Trustee policy
+    // verification chain, writes per-component seeds, and exits 0. The dm
+    // mapping persists across init exit because the Kata SEV-SNP sandbox VM
+    // outlives the init container's userspace (B2 investigation).
+    let (init_containers, containers) = if legacy {
+        (
+            None,
+            vec![
+                build_app_container(app),
+                build_attestation_proxy_container(app),
+                build_caddy_container(app),
+            ],
+        )
+    } else {
+        let mut proxy = build_attestation_proxy_container(app);
+        proxy.restart_policy = Some("Always".to_string());
+        (
+            Some(vec![proxy, build_enclava_init_container(app)]),
+            vec![build_app_container(app), build_caddy_container(app)],
+        )
+    };
 
     let volumes = build_volumes(app);
     let volume_claim_templates = build_volume_claim_templates(app);
@@ -121,6 +143,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                         supplemental_groups: Some(vec![6]),
                         ..Default::default()
                     }),
+                    init_containers,
                     containers,
                     volumes: Some(volumes),
                     ..Default::default()

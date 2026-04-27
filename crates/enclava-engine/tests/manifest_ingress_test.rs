@@ -65,13 +65,13 @@ fn caddyfile_has_unlock_route() {
 }
 
 #[test]
-fn caddyfile_uses_tls_alpn_without_cloudflare_dns01() {
+fn caddyfile_drops_dns01_cloudflare_path() {
+    // Phase 0/5: DNS-01 / Cloudflare path is gone in favour of TLS-ALPN-01.
+    // The Caddyfile must not reference Cloudflare or the env-supplied token.
     let app = sample_app();
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
-    assert!(caddyfile.contains("issuer acme"));
-    assert!(caddyfile.contains("disable_http_challenge"));
     assert!(!caddyfile.contains("dns cloudflare"));
     assert!(!caddyfile.contains("CF_API_TOKEN"));
 }

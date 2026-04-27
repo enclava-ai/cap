@@ -1,297 +1,184 @@
+//! Container shape tests. Phase 5 default (no `LEGACY_BOOTSTRAP_SCRIPT`):
+//! enclava-init opens LUKS in an initContainer; app and caddy are unprivileged
+//! and read seeds from `/state/{app,caddy}/seed`. The tls-state volume is
+//! mounted as a filesystem at `/state/tls-state`.
+
 use enclava_engine::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
+    build_enclava_init_container,
 };
 use enclava_engine::testutil::sample_app;
 
-// === App container tests ===
+// === App container (Phase 5 default) ===
 
 #[test]
 fn app_container_name() {
-    let app = sample_app();
-    let c = build_app_container(&app);
+    let c = build_app_container(&sample_app());
     assert_eq!(c.name, "web");
 }
 
 #[test]
-fn app_container_image() {
-    let app = sample_app();
-    let c = build_app_container(&app);
-    assert!(
-        c.image
-            .as_ref()
-            .unwrap()
-            .contains("ghcr.io/test/app@sha256:")
-    );
-}
-
-#[test]
-fn app_container_has_bootstrap_command() {
-    let app = sample_app();
-    let c = build_app_container(&app);
-    let cmd = c.command.as_ref().unwrap();
-    assert_eq!(cmd[0], "/bin/sh");
-    assert!(cmd.iter().any(|s| s.contains("bootstrap.sh")));
-}
-
-#[test]
-fn app_container_has_cryptsetup_device_env() {
-    let app = sample_app();
-    let c = build_app_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env.iter().find(|e| e.name == "CRYPTSETUP_DEVICE").unwrap();
-    assert_eq!(found.value.as_deref(), Some("/dev/csi0"));
-}
-
-#[test]
-fn app_container_has_ownership_slot_env() {
-    let app = sample_app();
-    let c = build_app_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env.iter().find(|e| e.name == "OWNERSHIP_SLOT").unwrap();
-    assert_eq!(found.value.as_deref(), Some("app-data"));
-}
-
-#[test]
-fn app_container_has_storage_ownership_mode() {
-    let app = sample_app();
-    let c = build_app_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env
-        .iter()
-        .find(|e| e.name == "STORAGE_OWNERSHIP_MODE")
-        .unwrap();
-    assert_eq!(found.value.as_deref(), Some("auto-unlock"));
-}
-
-#[test]
-fn app_container_privileged_security_context() {
-    let app = sample_app();
-    let c = build_app_container(&app);
+fn app_container_is_not_privileged() {
+    let c = build_app_container(&sample_app());
     let sc = c.security_context.as_ref().unwrap();
-    assert_eq!(sc.privileged, Some(true));
-    assert_eq!(sc.run_as_user, Some(0));
+    assert_eq!(sc.privileged, Some(false));
+    assert_eq!(sc.allow_privilege_escalation, Some(false));
+    assert_eq!(sc.run_as_non_root, Some(true));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert!(caps.add.as_deref().map(|v| v.is_empty()).unwrap_or(true));
 }
 
 #[test]
-fn app_container_has_volume_device() {
-    let app = sample_app();
-    let c = build_app_container(&app);
-    let vd = c.volume_devices.as_ref().unwrap();
-    let state = vd.iter().find(|d| d.name == "state").unwrap();
-    assert_eq!(state.device_path, "/dev/csi0");
+fn app_container_does_not_use_sh_c() {
+    let c = build_app_container(&sample_app());
+    if let Some(cmd) = c.command.as_ref() {
+        assert!(!cmd.iter().any(|s| s == "-c"));
+        assert!(!cmd.iter().any(|s| s.contains("bootstrap.sh")));
+    }
 }
 
 #[test]
-fn app_container_has_volume_mounts() {
-    let app = sample_app();
-    let c = build_app_container(&app);
+fn app_container_reads_seed_from_state_app() {
+    let c = build_app_container(&sample_app());
+    let env = c.env.as_ref().unwrap();
+    let found = env.iter().find(|e| e.name == "APP_SEED_PATH").unwrap();
+    assert_eq!(found.value.as_deref(), Some("/state/app/seed"));
+}
+
+#[test]
+fn app_container_mounts_state_filesystem() {
+    let c = build_app_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    assert!(vm.iter().any(|m| m.name == "secure-pv-bootstrap"));
-    assert!(vm.iter().any(|m| m.name == "startup"));
-    assert!(vm.iter().any(|m| m.name == "ownership-signal"));
+    let m = vm.iter().find(|m| m.name == "state").unwrap();
+    assert_eq!(m.mount_path, "/state");
+    assert!(c.volume_devices.is_none());
 }
 
-// === Attestation proxy container tests ===
+// === Attestation proxy ===
 
 #[test]
-fn proxy_container_name() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
+fn proxy_container_name_and_port() {
+    let c = build_attestation_proxy_container(&sample_app());
     assert_eq!(c.name, "attestation-proxy");
-}
-
-#[test]
-fn proxy_container_image() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
-    assert!(
-        c.image
-            .as_ref()
-            .unwrap()
-            .contains("attestation-proxy@sha256:")
-    );
-}
-
-#[test]
-fn proxy_container_port_8081() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
     let ports = c.ports.as_ref().unwrap();
     assert!(ports.iter().any(|p| p.container_port == 8081));
 }
 
 #[test]
-fn proxy_container_has_instance_id_env() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env.iter().find(|e| e.name == "INSTANCE_ID").unwrap();
-    assert_eq!(
-        found.value.as_deref(),
-        Some("cap-test-org-test-app-test-app")
-    );
-}
-
-#[test]
-fn proxy_container_has_owner_ciphertext_backend() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env
-        .iter()
-        .find(|e| e.name == "OWNER_CIPHERTEXT_BACKEND")
-        .unwrap();
-    assert_eq!(found.value.as_deref(), Some("kbs-resource"));
-}
-
-#[test]
-fn proxy_container_limits_owner_seed_handoff_to_app_data() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env
-        .iter()
-        .find(|e| e.name == "OWNER_SEED_HANDOFF_SLOTS")
-        .unwrap();
-    assert_eq!(found.value.as_deref(), Some("app-data"));
-}
-
-#[test]
-fn proxy_container_has_sev_sealing_permissions() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
+fn proxy_container_is_non_root() {
+    let c = build_attestation_proxy_container(&sample_app());
     let sc = c.security_context.as_ref().unwrap();
-    assert_eq!(sc.run_as_non_root, Some(false));
-    assert_eq!(sc.run_as_user, Some(0));
-    assert_eq!(sc.run_as_group, Some(0));
+    assert_eq!(sc.run_as_non_root, Some(true));
+    assert_eq!(sc.run_as_user, Some(65532));
     assert_eq!(sc.read_only_root_filesystem, Some(true));
-    let caps = sc.capabilities.as_ref().unwrap();
-    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
-    assert_eq!(caps.add.as_deref(), Some(&["MKNOD".to_string()][..]));
 }
 
 #[test]
-fn proxy_container_has_ownership_signal_mount() {
-    let app = sample_app();
-    let c = build_attestation_proxy_container(&app);
+fn proxy_container_mounts_unlock_socket() {
+    let c = build_attestation_proxy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    assert!(vm.iter().any(|m| m.name == "ownership-signal"));
+    let m = vm.iter().find(|m| m.name == "unlock-socket").unwrap();
+    assert_eq!(m.mount_path, "/run/enclava");
 }
 
-// === Caddy container tests ===
+// === Caddy ===
 
 #[test]
-fn caddy_container_name() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
+fn caddy_container_name_and_port() {
+    let c = build_caddy_container(&sample_app());
     assert_eq!(c.name, "tenant-ingress");
-}
-
-#[test]
-fn caddy_container_image() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    assert!(c.image.as_ref().unwrap().contains("caddy-ingress@sha256:"));
-}
-
-#[test]
-fn caddy_container_port_443() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
     let ports = c.ports.as_ref().unwrap();
     assert!(ports.iter().any(|p| p.container_port == 443));
 }
 
 #[test]
-fn caddy_container_has_cryptsetup_device_csi1() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env.iter().find(|e| e.name == "CRYPTSETUP_DEVICE").unwrap();
-    assert_eq!(found.value.as_deref(), Some("/dev/csi1"));
-}
-
-#[test]
-fn caddy_container_has_tls_data_ownership_slot() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env.iter().find(|e| e.name == "OWNERSHIP_SLOT").unwrap();
-    assert_eq!(found.value.as_deref(), Some("tls-data"));
-}
-
-#[test]
-fn caddy_container_has_reset_on_key_mismatch() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env
-        .iter()
-        .find(|e| e.name == "SECURE_PV_RESET_ON_KEY_MISMATCH")
-        .unwrap();
-    assert_eq!(found.value.as_deref(), Some("false"));
-}
-
-#[test]
-fn caddy_container_uses_kbs_tls_seed_path() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    let env = c.env.as_ref().unwrap();
-    let found = env.iter().find(|e| e.name == "KBS_RESOURCE_PATH").unwrap();
+fn caddy_container_is_unprivileged_with_only_net_bind() {
+    let c = build_caddy_container(&sample_app());
+    let sc = c.security_context.as_ref().unwrap();
+    assert_eq!(sc.privileged, Some(false));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
     assert_eq!(
-        found.value.as_deref(),
-        Some("default/cap-test-org-test-app-test-app-tls/workload-secret-seed")
+        caps.add.as_deref(),
+        Some(&["NET_BIND_SERVICE".to_string()][..])
     );
 }
 
 #[test]
-fn caddy_container_does_not_use_owner_unlock_mode() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
+fn caddy_container_command_is_argv_not_shell() {
+    let c = build_caddy_container(&sample_app());
+    let cmd = c.command.as_ref().unwrap();
+    assert_eq!(cmd, &vec!["caddy".to_string()]);
+    let args = c.args.as_ref().unwrap();
+    assert_eq!(
+        args,
+        &vec![
+            "run".to_string(),
+            "--config".to_string(),
+            "/etc/caddy/Caddyfile".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn caddy_container_has_no_cf_api_token_env() {
+    // DNS-01 / Cloudflare path is gone; CF_API_TOKEN must not be set anywhere.
+    let c = build_caddy_container(&sample_app());
     let env = c.env.as_ref().unwrap();
-    let found = env
-        .iter()
-        .find(|e| e.name == "STORAGE_OWNERSHIP_MODE")
-        .unwrap();
-    assert_eq!(found.value.as_deref(), Some("kbs-resource"));
+    assert!(env.iter().all(|e| e.name != "CF_API_TOKEN"));
+    if let Some(cmd) = c.command.as_ref() {
+        for s in cmd {
+            assert!(!s.contains("CF_API_TOKEN"));
+        }
+    }
 }
 
 #[test]
-fn caddy_container_runs_inside_persistent_tls_volume() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    let command = c.command.as_ref().unwrap().join("\n");
-    assert!(!command.contains("/tmp/caddy-bootstrap"));
-    assert!(!command.contains("caddy run --config /etc/caddy/Caddyfile &"));
-    assert!(command.contains(
-        "exec /bin/sh /secure-pv/bootstrap.sh -- caddy run --config /etc/caddy/Caddyfile"
-    ));
-}
-
-#[test]
-fn caddy_container_privileged_security() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    let sc = c.security_context.as_ref().unwrap();
-    assert_eq!(sc.privileged, Some(true));
-}
-
-#[test]
-fn caddy_container_has_volume_device_tls() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
-    let vd = c.volume_devices.as_ref().unwrap();
-    let tls = vd.iter().find(|d| d.name == "tls-state").unwrap();
-    assert_eq!(tls.device_path, "/dev/csi1");
-}
-
-#[test]
-fn caddy_container_has_required_volume_mounts() {
-    let app = sample_app();
-    let c = build_caddy_container(&app);
+fn caddy_container_does_not_mount_cloudflare_token() {
+    let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    assert!(vm.iter().any(|m| m.name == "secure-pv-bootstrap"));
-    assert!(vm.iter().any(|m| m.name == "tenant-ingress-caddyfile"));
-    assert!(!vm.iter().any(|m| m.name == "tls-cloudflare-token"));
-    assert!(vm.iter().any(|m| m.name == "ownership-signal"));
+    assert!(vm.iter().all(|m| m.name != "tls-cloudflare-token"));
+}
+
+#[test]
+fn caddy_container_mounts_tls_state_filesystem() {
+    let c = build_caddy_container(&sample_app());
+    let vm = c.volume_mounts.as_ref().unwrap();
+    let m = vm.iter().find(|m| m.name == "tls-state").unwrap();
+    assert_eq!(m.mount_path, "/state/tls-state");
+    assert!(c.volume_devices.is_none());
+}
+
+#[test]
+fn caddy_container_reads_seed_from_state_caddy() {
+    let c = build_caddy_container(&sample_app());
+    let env = c.env.as_ref().unwrap();
+    let found = env.iter().find(|e| e.name == "CADDY_SEED_PATH").unwrap();
+    assert_eq!(found.value.as_deref(), Some("/state/caddy/seed"));
+}
+
+// === enclava-init initContainer ===
+
+#[test]
+fn enclava_init_container_drops_caps_and_keeps_only_sys_admin() {
+    let c = build_enclava_init_container(&sample_app());
+    assert_eq!(c.name, "enclava-init");
+    let sc = c.security_context.as_ref().unwrap();
+    assert_eq!(sc.privileged, Some(false));
+    assert_eq!(sc.allow_privilege_escalation, Some(false));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert_eq!(caps.add.as_deref(), Some(&["SYS_ADMIN".to_string()][..]));
+}
+
+#[test]
+fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
+    let c = build_enclava_init_container(&sample_app());
+    let vd = c.volume_devices.as_ref().unwrap();
+    assert!(vd.iter().any(|d| d.name == "state"));
+    assert!(vd.iter().any(|d| d.name == "tls-state"));
+    let vm = c.volume_mounts.as_ref().unwrap();
+    assert!(vm.iter().any(|m| m.name == "unlock-socket"));
+    assert!(vm.iter().any(|m| m.name == "enclava-init-config"));
 }

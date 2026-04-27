@@ -181,13 +181,15 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("  email ");
     out.push_str(&spec.contact_email);
     out.push('\n');
-    out.push_str("  storage file_system /tls-data/caddy\n");
+    out.push_str("  storage file_system /state/tls-state/caddy\n");
     out.push_str("  acme_ca ");
     out.push_str(&spec.acme_ca);
     out.push('\n');
     out.push_str("}\n");
     out.push_str(&spec.hosts.join(", "));
     out.push_str(" {\n");
+    // Phase 0/5: TLS-ALPN-01 only — DNS-01 / Cloudflare path is gone.
+    // Caddy default ACME issuers cover ALPN; no per-app credentials needed.
     out.push_str("  tls {\n");
     out.push_str("    issuer acme {\n");
     out.push_str("      disable_http_challenge\n");
