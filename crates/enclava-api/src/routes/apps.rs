@@ -483,24 +483,39 @@ pub async fn delete_app(
     .await
     .map_err(dns_error_response)?;
 
-    let app_backend = crate::edge::backend_name_for(&app.name, crate::edge::BackendTag::App)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
-            )
-        })?;
-    let tee_backend = crate::edge::backend_name_for(&app.name, crate::edge::BackendTag::Tee)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
-            )
-        })?;
+    let org_slug: String = sqlx::query_scalar(
+        "SELECT cust_slug FROM organizations WHERE id = $1",
+    )
+    .bind(auth.org_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "database error"})),
+    ))?;
+    let app_backend =
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
+                )
+            })?;
+    let tee_backend =
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::Tee)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
+                )
+            })?;
     let mut routes_to_remove: Vec<(String, String)> =
-        vec![(app_backend, app.domain.clone())];
+        vec![(app_backend.clone(), app.domain.clone())];
     if let Some(t) = app.tee_domain.as_deref() {
         routes_to_remove.push((tee_backend, t.to_string()));
+    }
+    if let Some(c) = app.custom_domain.as_deref() {
+        routes_to_remove.push((app_backend, c.to_string()));
     }
     crate::edge::remove_haproxy_routes(
         &state.db,

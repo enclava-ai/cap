@@ -251,6 +251,8 @@ pub async fn verify_challenge(
     .await
     .map_err(|_| internal_error())?;
 
+    let previous_custom = app.custom_domain.clone();
+
     crate::dns::ensure_dns_record(
         &state.db,
         &state.http_client,
@@ -268,6 +270,63 @@ pub async fn verify_challenge(
         .execute(&state.db)
         .await
         .map_err(|_| internal_error())?;
+
+    let org_slug: String = sqlx::query_scalar(
+        "SELECT cust_slug FROM organizations WHERE id = $1",
+    )
+    .bind(auth.org_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| internal_error())?;
+    let app_backend =
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App)
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
+            ))?;
+    let app_target =
+        crate::edge::resolve_backend_target(&app.name, &app.namespace, 443)
+            .await
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("resolve backend: {e}")})),
+            ))?;
+    let route = crate::edge::SniRoute::new(&domain, &app_backend, &app_target).map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": format!("sni route: {e}")})),
+    ))?;
+    let edge_config = crate::edge::EdgeRouteConfig::from_env();
+    crate::edge::ensure_haproxy_routes(&state.db, &edge_config, &[route])
+        .await
+        .map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("haproxy update: {e}")})),
+        ))?;
+
+    if let Some(old) = previous_custom.as_deref()
+        && old != domain
+    {
+        if let Err(e) = crate::dns::delete_dns_record(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            app.id,
+            old,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, old_domain = %old, "failed to clean up previous custom domain DNS record");
+        }
+        if let Err(e) = crate::edge::remove_haproxy_routes(
+            &state.db,
+            &edge_config,
+            &[(app_backend.clone(), old.to_string())],
+        )
+        .await
+        {
+            tracing::warn!(error = %e, old_domain = %old, "failed to remove previous custom domain HAProxy route");
+        }
+    }
 
     Ok(Json(VerifyResponse { domain, verified_at }))
 }
@@ -301,6 +360,30 @@ pub async fn remove_custom_domain(
     )
     .await
     .map_err(dns_error_response)?;
+
+    let org_slug: String = sqlx::query_scalar(
+        "SELECT cust_slug FROM organizations WHERE id = $1",
+    )
+    .bind(auth.org_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| internal_error())?;
+    let app_backend =
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App)
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
+            ))?;
+    let edge_config = crate::edge::EdgeRouteConfig::from_env();
+    if let Err(e) = crate::edge::remove_haproxy_routes(
+        &state.db,
+        &edge_config,
+        &[(app_backend, domain.clone())],
+    )
+    .await
+    {
+        tracing::warn!(error = %e, %domain, "failed to remove custom domain HAProxy route");
+    }
 
     sqlx::query("UPDATE apps SET custom_domain = NULL, updated_at = now() WHERE id = $1 AND custom_domain = $2")
         .bind(app.id)

@@ -100,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
             enclava_api::edge::resolve_backend_target(&app.name, &app.namespace, 443).await?;
         let tee_target =
             enclava_api::edge::resolve_backend_target(&app.name, &app.namespace, 8081).await?;
-        let app_backend = backend_name_for(&app.name, BackendTag::App)?;
-        let tee_backend = backend_name_for(&app.name, BackendTag::Tee)?;
+        let app_backend = backend_name_for(&app.cust_slug, &app.name, BackendTag::App)?;
+        let tee_backend = backend_name_for(&app.cust_slug, &app.name, BackendTag::Tee)?;
         let routes = vec![
             SniRoute::new(&app_host, &app_backend, &app_target)?,
             SniRoute::new(&tee_host, &tee_backend, &tee_target)?,

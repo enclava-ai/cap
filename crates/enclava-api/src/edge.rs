@@ -1,5 +1,5 @@
 use chrono::Utc;
-use enclava_common::validate::{validate_app_name, validate_fqdn, ValidateError};
+use enclava_common::validate::{validate_app_name, validate_fqdn, validate_org_slug, ValidateError};
 use k8s_openapi::api::{
     apps::v1::DaemonSet,
     core::v1::{ConfigMap, Service},
@@ -216,13 +216,19 @@ where
     Ok(true)
 }
 
-/// Build a backend identifier for a given app name + suffix tag (e.g. "app",
-/// "tee"). `app_name` must validate; the tag must be one of the fixed labels
-/// below.
-pub fn backend_name_for(app_name: &str, tag: BackendTag) -> Result<String, EdgeRouteError> {
+/// Build a backend identifier scoped by tenant `org_slug` and tagged by the
+/// destination port (`app` for the workload, `tee` for the attestation
+/// channel). Both inputs validate; tenant scoping prevents two orgs that pick
+/// the same `app_name` from colliding on the HAProxy backend block.
+pub fn backend_name_for(
+    org_slug: &str,
+    app_name: &str,
+    tag: BackendTag,
+) -> Result<String, EdgeRouteError> {
+    validate_org_slug(org_slug)?;
     validate_app_name(app_name)?;
     let sanitized = app_name.replace('-', "_");
-    Ok(format!("be_cap_{sanitized}_{}", tag.as_str()))
+    Ok(format!("be_cap_{org_slug}_{sanitized}_{}", tag.as_str()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,18 +350,29 @@ mod tests {
     }
 
     #[test]
-    fn backend_name_uses_app_tag() {
-        let n = backend_name_for("test-app", BackendTag::App).unwrap();
-        assert_eq!(n, "be_cap_test_app_app");
-        let n = backend_name_for("test-app", BackendTag::Tee).unwrap();
-        assert_eq!(n, "be_cap_test_app_tee");
+    fn backend_name_includes_tenant_slug() {
+        let n = backend_name_for("abcd1234", "test-app", BackendTag::App).unwrap();
+        assert_eq!(n, "be_cap_abcd1234_test_app_app");
+        let n = backend_name_for("abcd1234", "test-app", BackendTag::Tee).unwrap();
+        assert_eq!(n, "be_cap_abcd1234_test_app_tee");
     }
 
     #[test]
-    fn backend_name_rejects_invalid_app_name() {
-        assert!(backend_name_for("Bad", BackendTag::App).is_err());
-        assert!(backend_name_for("a/b", BackendTag::App).is_err());
-        assert!(backend_name_for("", BackendTag::App).is_err());
+    fn backend_name_separates_same_app_in_different_orgs() {
+        // Two orgs deploying an app called `api` must not collide.
+        let a = backend_name_for("aaaaaaaa", "api", BackendTag::App).unwrap();
+        let b = backend_name_for("bbbbbbbb", "api", BackendTag::App).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn backend_name_rejects_invalid_inputs() {
+        assert!(backend_name_for("abcd1234", "Bad", BackendTag::App).is_err());
+        assert!(backend_name_for("abcd1234", "a/b", BackendTag::App).is_err());
+        assert!(backend_name_for("abcd1234", "", BackendTag::App).is_err());
+        assert!(backend_name_for("ABCD1234", "ok", BackendTag::App).is_err());
+        assert!(backend_name_for("abc", "ok", BackendTag::App).is_err());
+        assert!(backend_name_for("", "ok", BackendTag::App).is_err());
     }
 
     #[test]
