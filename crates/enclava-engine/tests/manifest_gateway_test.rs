@@ -39,7 +39,7 @@ fn sni_route_configmap_matches_haproxy_discovery_contract() {
     );
     assert_eq!(
         data.get("host").map(String::as_str),
-        Some("test-app.enclava.dev")
+        Some("test-app.abcd1234.enclava.dev")
     );
     assert_eq!(
         data.get("backend_tls").map(String::as_str),
@@ -66,7 +66,7 @@ fn tls_route_routes_domain_to_tenant_service() {
     let route = generate_tls_route(&app);
 
     assert_eq!(route["apiVersion"], "gateway.networking.k8s.io/v1alpha3");
-    assert_eq!(route["spec"]["hostnames"][0], "test-app.enclava.dev");
+    assert_eq!(route["spec"]["hostnames"][0], "test-app.abcd1234.enclava.dev");
     assert_eq!(
         route["spec"]["parentRefs"][0]["name"],
         "tenant-gateway-test-app"

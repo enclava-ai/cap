@@ -30,8 +30,53 @@ pub enum NostrAuthError {
     UrlMismatch,
     #[error("event method tag does not match request method")]
     MethodMismatch,
+    #[error("event payload tag missing for mutating request with body")]
+    PayloadTagMissing,
+    #[error("event payload tag does not match sha256(body)")]
+    PayloadMismatch,
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+}
+
+/// Verify a NIP-98 signed event including the `payload` tag binding to
+/// `sha256(body)`. Use this on every mutating endpoint that carries a body.
+pub fn verify_nip98_event_with_body(
+    event_json: &str,
+    expected_url: &str,
+    expected_method: &str,
+    body: &[u8],
+) -> Result<VerifiedIdentity, NostrAuthError> {
+    let identity = verify_nip98_event(event_json, expected_url, expected_method)?;
+
+    let method_upper = expected_method.to_ascii_uppercase();
+    let mutating = matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+
+    if !mutating || body.is_empty() {
+        return Ok(identity);
+    }
+
+    let event: Event =
+        Event::from_json(event_json).map_err(|e| NostrAuthError::InvalidEvent(e.to_string()))?;
+
+    let payload_tag = event
+        .tags
+        .iter()
+        .find(|t| t.kind().as_str() == "payload")
+        .and_then(|t| t.content())
+        .ok_or(NostrAuthError::PayloadTagMissing)?;
+
+    let expected = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hex::encode(hasher.finalize())
+    };
+
+    if !payload_tag.eq_ignore_ascii_case(&expected) {
+        return Err(NostrAuthError::PayloadMismatch);
+    }
+
+    Ok(identity)
 }
 
 /// Verify a NIP-98 signed event and return the verified identity.
@@ -222,5 +267,64 @@ mod tests {
 
         let verified = verify_nip98_event(&event_json, url, "POST");
         assert!(verified.is_ok());
+    }
+
+    fn signed_http_auth_event_with_payload(
+        url: &str,
+        method: &str,
+        payload_hex: Option<&str>,
+    ) -> String {
+        let keys = Keys::generate();
+        let mut builder = EventBuilder::new(Kind::HttpAuth, "")
+            .tag(Tag::parse(["u".to_string(), url.to_string()]).unwrap())
+            .tag(Tag::parse(["method".to_string(), method.to_string()]).unwrap());
+        if let Some(p) = payload_hex {
+            builder =
+                builder.tag(Tag::parse(["payload".to_string(), p.to_string()]).unwrap());
+        }
+        let event = builder.sign_with_keys(&keys).unwrap();
+        JsonUtil::as_json(&event)
+    }
+
+    fn sha256_hex(body: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hex::encode(hasher.finalize())
+    }
+
+    #[test]
+    fn verify_nip98_with_body_requires_payload_tag_for_mutating_request() {
+        let url = "https://api.example.test/apps";
+        let body = br#"{"name":"foo"}"#;
+        let event = signed_http_auth_event_with_payload(url, "POST", None);
+        let err = verify_nip98_event_with_body(&event, url, "POST", body).unwrap_err();
+        assert!(matches!(err, NostrAuthError::PayloadTagMissing));
+    }
+
+    #[test]
+    fn verify_nip98_with_body_rejects_payload_mismatch() {
+        let url = "https://api.example.test/apps";
+        let body = br#"{"name":"foo"}"#;
+        let event =
+            signed_http_auth_event_with_payload(url, "POST", Some(&sha256_hex(b"different")));
+        let err = verify_nip98_event_with_body(&event, url, "POST", body).unwrap_err();
+        assert!(matches!(err, NostrAuthError::PayloadMismatch));
+    }
+
+    #[test]
+    fn verify_nip98_with_body_accepts_matching_payload_tag() {
+        let url = "https://api.example.test/apps";
+        let body = br#"{"name":"foo"}"#;
+        let event = signed_http_auth_event_with_payload(url, "POST", Some(&sha256_hex(body)));
+        let verified = verify_nip98_event_with_body(&event, url, "POST", body);
+        assert!(verified.is_ok(), "payload-bound event should verify");
+    }
+
+    #[test]
+    fn verify_nip98_with_body_skips_payload_check_when_body_empty() {
+        let url = "https://api.example.test/apps";
+        let event = signed_http_auth_event_with_payload(url, "POST", None);
+        verify_nip98_event_with_body(&event, url, "POST", &[]).unwrap();
     }
 }

@@ -1,0 +1,129 @@
+//! One-shot operator tool: cut existing apps over to the D1 two-hostname
+//! model.
+//!
+//! For every row in `apps`:
+//!   - Compute the new `<app>.<orgSlug>.<platform_domain>` and
+//!     `<app>.<orgSlug>.<tee_domain_suffix>`.
+//!   - Idempotently create the A/AAAA records in Cloudflare (skip if a row
+//!     already exists in `dns_records`).
+//!   - Idempotently insert HAProxy SNI map entries for both hostnames.
+//!   - Update the `apps.domain` and `apps.tee_domain` columns to the new
+//!     hostnames.
+//!
+//! Old hostnames are NOT removed — operators are expected to keep them
+//! live for one release cycle and remove via a follow-up cleanup tool
+//! once clients have migrated.
+//!
+//! Usage: `cargo run -p enclava-api --bin migrate-two-hostnames`
+//!
+//! Env: DATABASE_URL, PLATFORM_DOMAIN, TEE_DOMAIN_SUFFIX,
+//!      CLOUDFLARE_API_TOKEN, TENANT_DNS_TARGET, CLOUDFLARE_ZONE_NAME.
+
+use enclava_api::dns::DnsConfig;
+use enclava_api::edge::{
+    backend_name_for, ensure_haproxy_routes, BackendTag, EdgeRouteConfig, SniRoute,
+};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(Debug, sqlx::FromRow)]
+struct AppRow {
+    id: Uuid,
+    name: String,
+    namespace: String,
+    domain: String,
+    tee_domain: Option<String>,
+    cust_slug: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let database_url = std::env::var("DATABASE_URL")?;
+    let platform_domain =
+        std::env::var("PLATFORM_DOMAIN").unwrap_or_else(|_| "enclava.dev".to_string());
+    let tee_domain_suffix = std::env::var("TEE_DOMAIN_SUFFIX")
+        .unwrap_or_else(|_| format!("tee.{platform_domain}"));
+
+    let pool = PgPool::connect(&database_url).await?;
+    let http = reqwest::Client::new();
+
+    let dns = match (
+        std::env::var("CLOUDFLARE_API_TOKEN"),
+        std::env::var("TENANT_DNS_TARGET"),
+    ) {
+        (Ok(t), Ok(target)) if !t.is_empty() && !target.is_empty() => Some(DnsConfig {
+            cloudflare_api_token: t,
+            cloudflare_zone_id: std::env::var("CLOUDFLARE_ZONE_ID").ok().filter(|v| !v.is_empty()),
+            cloudflare_zone_name: std::env::var("CLOUDFLARE_ZONE_NAME")
+                .unwrap_or_else(|_| platform_domain.clone()),
+            target,
+            required: true,
+        }),
+        _ => {
+            tracing::warn!("CLOUDFLARE_API_TOKEN/TENANT_DNS_TARGET not set; running DRY-RUN");
+            None
+        }
+    };
+
+    let edge = EdgeRouteConfig::from_env();
+
+    let rows: Vec<AppRow> = sqlx::query_as(
+        "SELECT a.id, a.name, a.namespace, a.domain, a.tee_domain, o.cust_slug
+         FROM apps a JOIN organizations o ON o.id = a.org_id
+         ORDER BY a.created_at ASC",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    tracing::info!(count = rows.len(), "iterating apps");
+
+    for app in rows {
+        let app_host =
+            enclava_common::hostnames::app_hostname(&app.name, &app.cust_slug, &platform_domain)?;
+        let tee_host =
+            enclava_common::hostnames::tee_hostname(&app.name, &app.cust_slug, &tee_domain_suffix)?;
+
+        tracing::info!(app = %app.name, app_host, tee_host, "migrating");
+
+        if let Some(cfg) = dns.as_ref() {
+            // Idempotent: ensure_dns_record updates existing row by hostname.
+            enclava_api::dns::ensure_dns_record(&pool, &http, Some(cfg), app.id, &app_host, false)
+                .await?;
+            enclava_api::dns::ensure_dns_record(&pool, &http, Some(cfg), app.id, &tee_host, false)
+                .await?;
+        }
+
+        // HAProxy: insert (idempotent) two SNI entries.
+        let app_target =
+            enclava_api::edge::resolve_backend_target(&app.name, &app.namespace, 443).await?;
+        let tee_target =
+            enclava_api::edge::resolve_backend_target(&app.name, &app.namespace, 8081).await?;
+        let app_backend = backend_name_for(&app.name, BackendTag::App)?;
+        let tee_backend = backend_name_for(&app.name, BackendTag::Tee)?;
+        let routes = vec![
+            SniRoute::new(&app_host, &app_backend, &app_target)?,
+            SniRoute::new(&tee_host, &tee_backend, &tee_target)?,
+        ];
+        ensure_haproxy_routes(&pool, &edge, &routes).await?;
+
+        // Update DB row to point at the new hostnames.
+        sqlx::query("UPDATE apps SET domain = $1, tee_domain = $2, updated_at = now() WHERE id = $3")
+            .bind(&app_host)
+            .bind(&tee_host)
+            .bind(app.id)
+            .execute(&pool)
+            .await?;
+
+        if app.domain != app_host {
+            tracing::info!(old = %app.domain, new = %app_host, "rewrote app.domain");
+        }
+        if app.tee_domain.as_deref() != Some(tee_host.as_str()) {
+            tracing::info!(new = %tee_host, "set app.tee_domain");
+        }
+    }
+
+    tracing::info!("done");
+    Ok(())
+}

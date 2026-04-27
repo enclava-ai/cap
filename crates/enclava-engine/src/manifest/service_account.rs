@@ -20,6 +20,10 @@ pub fn generate_service_account(app: &ConfidentialApp) -> ServiceAccount {
             labels: Some(labels),
             ..Default::default()
         },
+        // Phase 0 item E: confidential workloads must never automount the
+        // default token; nothing inside the TEE talks to the K8s API.
+        automount_service_account_token: Some(false),
         ..Default::default()
     }
 }
+

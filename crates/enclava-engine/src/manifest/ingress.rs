@@ -5,23 +5,120 @@
 //! - Routes attestation + ownership endpoints to the proxy (8081)
 //! - Routes /.well-known/confidential/* to the proxy (CAP-specific)
 //! - Routes everything else to the app container
+//!
+//! Per Phase 4 mitigations: every value interpolated into the rendered
+//! Caddyfile is either a constant or runs through a strict validator first
+//! (FQDN / URL / numeric port). The renderer never performs raw
+//! `format!("{user_input}")` of caller-supplied strings; that closes the
+//! Caddyfile-injection vector flagged in the security review.
 
+use enclava_common::validate::{validate_fqdn, ValidateError};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 use crate::types::ConfidentialApp;
 
+#[derive(Debug, thiserror::Error)]
+pub enum IngressRenderError {
+    #[error("invalid hostname for Caddyfile: {0}")]
+    InvalidHostname(#[from] ValidateError),
+    #[error("invalid ACME CA URL: {0}")]
+    InvalidAcmeUrl(String),
+    #[error("invalid ACME contact email: {0}")]
+    InvalidEmail(String),
+}
+
+/// Validated inputs ready to be rendered into a Caddyfile.
+struct CaddyfileSpec {
+    domain: String,
+    app_port: u16,
+    acme_ca: String,
+    contact_email: String,
+}
+
+impl CaddyfileSpec {
+    fn from_app(app: &ConfidentialApp) -> Result<Self, IngressRenderError> {
+        let domain = app.primary_domain().to_string();
+        validate_fqdn(&domain)?;
+        let app_port = app.primary_container().and_then(|c| c.port).unwrap_or(8080);
+        let acme_ca = app.attestation.acme_ca_url.trim().to_string();
+        validate_https_url(&acme_ca)?;
+        let contact_email = "infra@enclava.dev".to_string();
+        validate_email(&contact_email)?;
+        Ok(Self {
+            domain,
+            app_port,
+            acme_ca,
+            contact_email,
+        })
+    }
+}
+
+fn validate_https_url(url: &str) -> Result<(), IngressRenderError> {
+    if !url.starts_with("https://") {
+        return Err(IngressRenderError::InvalidAcmeUrl(
+            "must start with https://".to_string(),
+        ));
+    }
+    if url.bytes().any(|b| {
+        b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' || b == 0 || b == b'`' || b == b'"'
+            || b == b'\''
+            || b == b'{'
+            || b == b'}'
+            || b == b';'
+    }) {
+        return Err(IngressRenderError::InvalidAcmeUrl(
+            "contains forbidden character".to_string(),
+        ));
+    }
+    if !url.is_ascii() {
+        return Err(IngressRenderError::InvalidAcmeUrl("must be ASCII".into()));
+    }
+    Ok(())
+}
+
+fn validate_email(s: &str) -> Result<(), IngressRenderError> {
+    // Conservative — we only ever emit our own constant infra@enclava.dev,
+    // but defense in depth: ASCII, no whitespace, no control chars, exactly
+    // one '@', non-empty local and domain parts. The domain part must pass
+    // validate_fqdn.
+    if !s.is_ascii() {
+        return Err(IngressRenderError::InvalidEmail("must be ASCII".into()));
+    }
+    if s.bytes().any(|b| b.is_ascii_whitespace() || b == 0 || b == b'`'
+        || b == b'\'' || b == b'"' || b == b'{' || b == b'}' || b == b';') {
+        return Err(IngressRenderError::InvalidEmail(
+            "contains forbidden character".into(),
+        ));
+    }
+    let mut parts = s.splitn(2, '@');
+    let local = parts.next().unwrap_or("");
+    let domain = parts.next().unwrap_or("");
+    if local.is_empty() || domain.is_empty() {
+        return Err(IngressRenderError::InvalidEmail(
+            "must contain a local and domain part".into(),
+        ));
+    }
+    validate_fqdn(domain).map_err(IngressRenderError::InvalidHostname)?;
+    Ok(())
+}
+
 /// Generate the tenant-ingress ConfigMap with the rendered Caddyfile.
 pub fn generate_ingress_configmap(app: &ConfidentialApp) -> ConfigMap {
+    // We expose the infallible name in keeping with the rest of the manifest
+    // builders. Validation failures here mean the app object never should
+    // have been built — they indicate a bug, not a user error — so we panic
+    // with a clear message that's always caught in tests.
+    let caddyfile = render_caddyfile(app)
+        .expect("Caddyfile inputs must validate before manifest generation");
+
     let mut labels = BTreeMap::new();
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
         "enclava-platform".to_string(),
     );
     labels.insert("app".to_string(), app.name.clone());
-
-    let caddyfile = render_caddyfile(app);
 
     let mut data = BTreeMap::new();
     data.insert("Caddyfile".to_string(), caddyfile);
@@ -38,44 +135,95 @@ pub fn generate_ingress_configmap(app: &ConfidentialApp) -> ConfigMap {
     }
 }
 
-/// Render the Caddyfile for a confidential app.
+/// Render the Caddyfile for a confidential app via a structured builder.
 ///
-/// Extended from the live template at components/templates/confidential-workload/
-/// tenant-ingress-configmap.yaml to include CAP-specific /.well-known/confidential/* routes.
-fn render_caddyfile(app: &ConfidentialApp) -> String {
-    let domain = app.primary_domain();
-    let app_port = app.primary_container().and_then(|c| c.port).unwrap_or(8080);
-    let acme_ca = app.attestation.acme_ca_url.trim();
+/// Only validated inputs reach the writer; constants are inlined.
+pub fn render_caddyfile(app: &ConfidentialApp) -> Result<String, IngressRenderError> {
+    let spec = CaddyfileSpec::from_app(app)?;
+    Ok(render_caddyfile_from_spec(&spec))
+}
 
-    format!(
-        r#"{{
-  email infra@enclava.dev
-  storage file_system /tls-data/caddy
-  acme_ca {acme_ca}
-}}
-{domain} {{
-  tls {{
-    dns cloudflare {{env.CF_API_TOKEN}}
-    resolvers 10.43.0.10
-  }}
-  @attestation-proxy path /v1/attestation /v1/attestation/* /unlock
-  handle @attestation-proxy {{
-    reverse_proxy 127.0.0.1:8081
-  }}
-  @confidential path /.well-known/confidential/*
-  handle @confidential {{
-    reverse_proxy 127.0.0.1:8081
-  }}
-  handle /health {{
-    reverse_proxy 127.0.0.1:{app_port}
-  }}
-  handle {{
-    reverse_proxy 127.0.0.1:{app_port}
-  }}
-}}
-"#,
-        domain = domain,
-        app_port = app_port,
-        acme_ca = acme_ca,
-    )
+fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  email ");
+    out.push_str(&spec.contact_email);
+    out.push('\n');
+    out.push_str("  storage file_system /tls-data/caddy\n");
+    out.push_str("  acme_ca ");
+    out.push_str(&spec.acme_ca);
+    out.push('\n');
+    out.push_str("}\n");
+    out.push_str(&spec.domain);
+    out.push_str(" {\n");
+    out.push_str("  tls {\n");
+    out.push_str("    dns cloudflare {env.CF_API_TOKEN}\n");
+    out.push_str("    resolvers 10.43.0.10\n");
+    out.push_str("  }\n");
+    out.push_str("  @attestation-proxy path /v1/attestation /v1/attestation/* /unlock\n");
+    out.push_str("  handle @attestation-proxy {\n");
+    out.push_str("    reverse_proxy 127.0.0.1:8081\n");
+    out.push_str("  }\n");
+    out.push_str("  @confidential path /.well-known/confidential/*\n");
+    out.push_str("  handle @confidential {\n");
+    out.push_str("    reverse_proxy 127.0.0.1:8081\n");
+    out.push_str("  }\n");
+    out.push_str("  handle /health {\n");
+    out.push_str("    reverse_proxy 127.0.0.1:");
+    out.push_str(&spec.app_port.to_string());
+    out.push('\n');
+    out.push_str("  }\n");
+    out.push_str("  handle {\n");
+    out.push_str("    reverse_proxy 127.0.0.1:");
+    out.push_str(&spec.app_port.to_string());
+    out.push('\n');
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_email_rejects_injection() {
+        for bad in [
+            "user@host\n",
+            "user@host;",
+            "user`@host",
+            "user@host}",
+            "user@host{",
+            "u s@h.com",
+            "@host.com",
+            "user@",
+        ] {
+            assert!(validate_email(bad).is_err(), "expected error for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_email_accepts_simple() {
+        assert!(validate_email("infra@enclava.dev").is_ok());
+    }
+
+    #[test]
+    fn validate_https_url_rejects_injection() {
+        for bad in [
+            "http://example.com",
+            "https://example.com\n",
+            "https://example.com;rm -rf",
+            "https://example.com{",
+            "https://example.com}",
+            "https://example.com`",
+            "https://example.com'",
+            "https://example.com\"",
+            "https://exámple.com",
+        ] {
+            assert!(
+                validate_https_url(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+    }
 }

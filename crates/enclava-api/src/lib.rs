@@ -1,44 +1,41 @@
 pub mod auth;
 pub mod billing;
+pub mod clients;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
 pub mod dns;
 pub mod edge;
+pub mod env_gates;
 pub mod kbs;
 pub mod models;
+pub mod ratelimit;
 pub mod registry;
 pub mod routes;
 pub mod state;
 
+use axum::http::{HeaderValue, Method, header};
 use axum::Router;
-use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
-};
-use tower_http::{
-    cors::{Any, CorsLayer},
-    trace::TraceLayer,
-};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
+use crate::ratelimit::TrustedProxyKeyExtractor;
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
-    // Unlock routes are metadata/control-plane helpers. The secret-bearing
-    // claim/unlock requests go directly to the tenant TEE, so this API limiter
-    // must tolerate several concurrent CLIs behind the same NAT.
+    let key_extractor = TrustedProxyKeyExtractor::from_env();
+
     let unlock_governor_conf = GovernorConfigBuilder::default()
         .per_second(1)
         .burst_size(120)
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(key_extractor.clone())
         .finish()
         .expect("unlock governor config");
 
-    // General API rate limit: 100 requests per second per IP
-    // SmartIpKeyExtractor checks x-forwarded-for, x-real-ip, forwarded headers, then peer IP
     let api_governor_conf = GovernorConfigBuilder::default()
         .per_second(1)
         .burst_size(100)
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(key_extractor)
         .finish()
         .expect("api governor config");
 
@@ -80,6 +77,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/apps/{name}",
             axum::routing::delete(routes::apps::delete_app),
+        )
+        .route(
+            "/apps/{name}/signer",
+            axum::routing::patch(routes::apps::rotate_signer),
         );
 
     // Deployment routes (authenticated)
@@ -116,19 +117,25 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::delete(routes::config::delete_config_meta),
         );
 
-    // Domain routes (authenticated)
+    // Domain routes (authenticated). Phase 4 introduces a TXT-based
+    // verification flow before any A/AAAA record is created for a custom
+    // domain; the legacy `PUT /domain` shortcut is gone.
     let domain_routes = Router::new()
-        .route(
-            "/apps/{name}/domain",
-            axum::routing::put(routes::domains::set_domain),
-        )
         .route(
             "/apps/{name}/domain",
             axum::routing::get(routes::domains::get_domain),
         )
         .route(
-            "/apps/{name}/domain",
-            axum::routing::delete(routes::domains::remove_domain),
+            "/apps/{name}/domains",
+            axum::routing::post(routes::domains::create_challenge),
+        )
+        .route(
+            "/apps/{name}/domains/{domain}/verify",
+            axum::routing::post(routes::domains::verify_challenge),
+        )
+        .route(
+            "/apps/{name}/domains/{domain}",
+            axum::routing::delete(routes::domains::remove_custom_domain),
         );
 
     // Status routes (authenticated)
@@ -197,13 +204,56 @@ pub fn build_router(state: AppState) -> Router {
         .merge(billing_routes)
         .layer(GovernorLayer::new(api_governor_conf))
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(build_cors_layer())
         .with_state(state)
+}
+
+/// Build the CORS layer from `CORS_ALLOWED_ORIGINS` (comma-separated).
+/// Production default: empty (no cross-origin). Debug default: localhost.
+pub fn build_cors_layer() -> CorsLayer {
+    let raw = std::env::var("CORS_ALLOWED_ORIGINS").ok();
+    let origins: Vec<HeaderValue> = match raw.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<HeaderValue>().ok())
+            .collect(),
+        _ if cfg!(debug_assertions) => vec![
+            HeaderValue::from_static("http://localhost"),
+            HeaderValue::from_static("http://localhost:3000"),
+            HeaderValue::from_static("http://localhost:5173"),
+            HeaderValue::from_static("http://127.0.0.1:3000"),
+        ],
+        _ => Vec::new(),
+    };
+
+    let methods = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ];
+    let headers = [
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::ACCEPT,
+        header::HeaderName::from_static("x-api-key"),
+        header::HeaderName::from_static("x-enclava-org"),
+    ];
+
+    if origins.is_empty() {
+        // No allowed origins -> no Access-Control-Allow-Origin header.
+        // Build an empty layer; tower-http will not echo origins back.
+        CorsLayer::new()
+    } else {
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(methods)
+            .allow_headers(headers)
+    }
 }
 
 /// Expose build_router for testing.

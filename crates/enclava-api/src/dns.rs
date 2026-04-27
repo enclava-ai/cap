@@ -342,6 +342,70 @@ pub async fn delete_dns_record(
     Ok(())
 }
 
+/// Atomically ensure DNS records for both the user-facing app hostname and
+/// the TEE hostname. If any record creation fails, the records that were
+/// successfully created in this call are deleted before returning the error
+/// (best-effort rollback). Existing records (created in a prior successful
+/// call) are not touched on failure -- the operation is idempotent so a
+/// retry will reconcile.
+pub async fn ensure_dns_pair(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    config: Option<&DnsConfig>,
+    app_id: Uuid,
+    app_host: &str,
+    tee_host: &str,
+) -> Result<(), DnsError> {
+    if config.is_none() {
+        return Ok(());
+    }
+
+    let mut created: Vec<String> = Vec::new();
+
+    // Track whether each hostname existed already so that rollback only
+    // removes records that this call created.
+    let app_existed = dns_record_exists(pool, app_id, app_host).await?;
+    ensure_dns_record(pool, client, config, app_id, app_host, false).await?;
+    if !app_existed {
+        created.push(app_host.to_string());
+    }
+
+    let tee_existed = dns_record_exists(pool, app_id, tee_host).await?;
+    if let Err(e) = ensure_dns_record(pool, client, config, app_id, tee_host, false).await {
+        for host in created {
+            if let Err(rb_err) = delete_dns_record(pool, client, config, app_id, &host).await {
+                tracing::error!(
+                    app_id = %app_id,
+                    hostname = %host,
+                    error = %rb_err,
+                    "rollback delete failed during ensure_dns_pair"
+                );
+            }
+        }
+        return Err(e);
+    }
+    if !tee_existed {
+        created.push(tee_host.to_string());
+    }
+
+    Ok(())
+}
+
+async fn dns_record_exists(
+    pool: &PgPool,
+    app_id: Uuid,
+    hostname: &str,
+) -> Result<bool, DnsError> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2",
+    )
+    .bind(app_id)
+    .bind(hostname)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
 pub async fn delete_all_dns_records_for_app(
     pool: &PgPool,
     client: &reqwest::Client,

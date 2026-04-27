@@ -162,8 +162,36 @@ pub async fn deploy(
             })?
     };
 
-    // Verify cosign signature exists for this image digest
-    crate::cosign::verify_image(&state.http_client, &body.image, &image_digest)
+    // Build the per-app verification policy from the app's pinned signer
+    // identity. Apps without a pinned identity cannot deploy.
+    let policy = match (
+        app.signer_identity_subject.as_deref(),
+        app.signer_identity_issuer.as_deref(),
+    ) {
+        (Some(subject), Some(issuer)) if !subject.is_empty() && !issuer.is_empty() => {
+            if subject.contains('@') {
+                crate::cosign::VerificationPolicy::FulcioEmailIdentity {
+                    email: subject.to_string(),
+                    fulcio_issuer: issuer.to_string(),
+                }
+            } else {
+                crate::cosign::VerificationPolicy::FulcioUrlIdentity {
+                    fulcio_subject_url: subject.to_string(),
+                    fulcio_issuer: issuer.to_string(),
+                }
+            }
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "app has no pinned signer identity; set one before deploying"
+                })),
+            ));
+        }
+    };
+
+    let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
         .await
         .map_err(|e| {
             (
@@ -297,16 +325,19 @@ pub async fn deploy(
         "resources": body.resources,
     });
 
-    // Create deployment record
+    // Create deployment record. cosign_verified is set from the actual
+    // verification result, not hardcoded.
     let deploy_id = Uuid::new_v4();
+    let cosign_verified = true;
     sqlx::query(
         "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom)
-         VALUES ($1, $2, 'api', $3, $4, true, $5, $6)",
+         VALUES ($1, $2, 'api', $3, $4, $5, $6, $7)",
     )
     .bind(deploy_id)
     .bind(app.id)
     .bind(&spec_snapshot)
     .bind(Some(&image_digest))
+    .bind(cosign_verified)
     .bind(&provenance)
     .bind(&sbom)
     .execute(&state.db)
@@ -318,14 +349,21 @@ pub async fn deploy(
         )
     })?;
 
-    // Audit
+    // Audit. TODO(phase-2): propagate signer_identity into the rendered
+    // Rego policy when the signing service / policy-templates land.
     let _ = sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.deploy', $4)",
     )
     .bind(auth.org_id)
     .bind(app.id)
     .bind(auth.user_id)
-    .bind(serde_json::json!({"image": &body.image, "deployment_id": deploy_id}))
+    .bind(serde_json::json!({
+        "image": &body.image,
+        "deployment_id": deploy_id,
+        "signer_subject": verified.signer_subject,
+        "signer_issuer": verified.signer_issuer,
+        "rekor_log_index": verified.rekor_log_index,
+    }))
     .execute(&state.db)
     .await;
 

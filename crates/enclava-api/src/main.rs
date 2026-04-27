@@ -190,6 +190,11 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    if let Err(e) = enclava_api::env_gates::enforce_production_env_gates() {
+        eprintln!("startup refused: {e}");
+        std::process::exit(1);
+    }
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let btcpay_url =
@@ -198,6 +203,8 @@ async fn main() {
     let btcpay_webhook_secret = std::env::var("BTCPAY_WEBHOOK_SECRET").unwrap_or_default();
     let platform_domain =
         std::env::var("PLATFORM_DOMAIN").unwrap_or_else(|_| "enclava.dev".to_string());
+    let tee_domain_suffix = std::env::var("TEE_DOMAIN_SUFFIX")
+        .unwrap_or_else(|_| format!("tee.{}", platform_domain));
 
     let pool = enclava_api::db::pool::create_pool(&database_url)
         .await
@@ -233,6 +240,10 @@ async fn main() {
         .build()
         .expect("failed to build tenant TEE HTTP client");
 
+    let outbound_config = enclava_api::clients::ClientConfig::from_env();
+    let http_client = enclava_api::clients::build_guarded_client(&outbound_config)
+        .expect("failed to build SSRF-defended outbound HTTP client");
+
     let state = AppState {
         db: pool,
         signing_key: Arc::new(signing_key),
@@ -241,7 +252,8 @@ async fn main() {
         btcpay_url,
         btcpay_api_key,
         platform_domain,
-        http_client: reqwest::Client::new(),
+        tee_domain_suffix,
+        http_client,
         tee_http_client,
         btcpay_webhook_secret,
         attestation,

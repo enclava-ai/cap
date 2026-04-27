@@ -47,8 +47,10 @@ dirs = "6"
 colored = "3"
 tokio-util = { version = "0.7", features = ["io"] }
 hmac = "0.12"
+subtle = "2"
 tower_governor = "0.8"
-sigstore = { version = "0.13", default-features = false, features = ["cosign", "rustls-tls"] }
+sigstore = { version = "0.13", default-features = false, features = ["cosign", "sigstore-trust-root", "rustls-tls"] }
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
 
 # Internal
 enclava-common = { path = "crates/enclava-common" }

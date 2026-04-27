@@ -130,6 +130,7 @@ pub async fn build_confidential_app(
         unlock_mode,
         domain: DomainSpec {
             platform_domain: app.domain.clone(),
+            tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
             custom_domain: app.custom_domain.clone(),
         },
         api_signing_pubkey: api_signing_pubkey.to_string(),
@@ -241,7 +242,19 @@ pub async fn apply_deployment_manifests(
     let engine = ApplyEngine::try_default().await?;
     apply_all(&engine, &manifests).await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
-    crate::edge::ensure_haproxy_route(&edge_config, &app_spec).await?;
+    let app_target =
+        crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 443).await?;
+    let tee_target =
+        crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 8081).await?;
+    let app_backend =
+        crate::edge::backend_name_for(&app_spec.name, crate::edge::BackendTag::App)?;
+    let tee_backend =
+        crate::edge::backend_name_for(&app_spec.name, crate::edge::BackendTag::Tee)?;
+    let routes = vec![
+        crate::edge::SniRoute::new(&app_spec.domain.platform_domain, &app_backend, &app_target)?,
+        crate::edge::SniRoute::new(&app_spec.domain.tee_domain, &tee_backend, &tee_target)?,
+    ];
+    crate::edge::ensure_haproxy_routes(&pool, &edge_config, &routes).await?;
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
 
     tokio::spawn(async move {

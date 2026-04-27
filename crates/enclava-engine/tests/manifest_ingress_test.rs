@@ -24,7 +24,7 @@ fn caddyfile_contains_domain() {
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
-    assert!(caddyfile.contains("test-app.enclava.dev"));
+    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev"));
 }
 
 #[test]
