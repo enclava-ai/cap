@@ -25,6 +25,63 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
     )
 }
 
+/// Pick the right cosign `VerificationPolicy` for a stored signer identity.
+///
+/// GitHub Actions OIDC subjects are URLs that contain `@` after the workflow
+/// path (e.g. `https://github.com/me/repo/.github/workflows/build.yml@refs/heads/main`),
+/// so the URL prefix must be checked before the `@`-as-email heuristic.
+fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::VerificationPolicy {
+    if subject.starts_with("https://") || subject.starts_with("http://") {
+        crate::cosign::VerificationPolicy::FulcioUrlIdentity {
+            fulcio_subject_url: subject.to_string(),
+            fulcio_issuer: issuer.to_string(),
+        }
+    } else if subject.contains('@') {
+        crate::cosign::VerificationPolicy::FulcioEmailIdentity {
+            email: subject.to_string(),
+            fulcio_issuer: issuer.to_string(),
+        }
+    } else {
+        crate::cosign::VerificationPolicy::FulcioUrlIdentity {
+            fulcio_subject_url: subject.to_string(),
+            fulcio_issuer: issuer.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::*;
+    use crate::cosign::VerificationPolicy;
+
+    #[test]
+    fn github_actions_oidc_url_with_at_is_url_policy() {
+        let policy = classify_signer_identity(
+            "https://github.com/me/repo/.github/workflows/build.yml@refs/heads/main",
+            "https://token.actions.githubusercontent.com",
+        );
+        assert!(matches!(policy, VerificationPolicy::FulcioUrlIdentity { .. }));
+    }
+
+    #[test]
+    fn email_subject_is_email_policy() {
+        let policy = classify_signer_identity(
+            "alice@example.com",
+            "https://accounts.google.com",
+        );
+        assert!(matches!(policy, VerificationPolicy::FulcioEmailIdentity { .. }));
+    }
+
+    #[test]
+    fn http_url_subject_is_url_policy() {
+        let policy = classify_signer_identity(
+            "http://gitlab.example.com/foo@v1",
+            "https://gitlab.example.com",
+        );
+        assert!(matches!(policy, VerificationPolicy::FulcioUrlIdentity { .. }));
+    }
+}
+
 /// Parse memory string like "1Gi", "8Gi" to f64 in GiB with validation.
 fn parse_memory_gi(s: &str) -> Result<f64, String> {
     if s.is_empty() {
@@ -169,17 +226,7 @@ pub async fn deploy(
         app.signer_identity_issuer.as_deref(),
     ) {
         (Some(subject), Some(issuer)) if !subject.is_empty() && !issuer.is_empty() => {
-            if subject.contains('@') {
-                crate::cosign::VerificationPolicy::FulcioEmailIdentity {
-                    email: subject.to_string(),
-                    fulcio_issuer: issuer.to_string(),
-                }
-            } else {
-                crate::cosign::VerificationPolicy::FulcioUrlIdentity {
-                    fulcio_subject_url: subject.to_string(),
-                    fulcio_issuer: issuer.to_string(),
-                }
-            }
+            classify_signer_identity(subject, issuer)
         }
         _ => {
             return Err((
