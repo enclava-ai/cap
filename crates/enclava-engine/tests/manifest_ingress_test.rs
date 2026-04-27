@@ -111,3 +111,18 @@ fn custom_domain_app_uses_custom_domain() {
     let caddyfile = data.get("Caddyfile").unwrap();
     assert!(caddyfile.contains("app.example.com"));
 }
+
+#[test]
+fn custom_domain_keeps_platform_domain_in_site_block() {
+    // Regression for security review finding 3: when a custom domain is
+    // verified post-deploy, the regenerated Caddyfile must still serve the
+    // platform hostname so existing CLI/API clients keep working AND the new
+    // custom hostname so HAProxy SNI routing has somewhere to terminate.
+    let mut app = sample_app();
+    app.domain.custom_domain = Some("app.example.com".to_string());
+    let cm = generate_ingress_configmap(&app);
+    let caddyfile = cm.data.as_ref().unwrap().get("Caddyfile").unwrap();
+    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev"));
+    assert!(caddyfile.contains("app.example.com"));
+    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev, app.example.com"));
+}

@@ -206,6 +206,46 @@ pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result
     Ok(())
 }
 
+/// Re-render and SSA-apply only the tenant-ingress ConfigMap for an app.
+///
+/// Used when domain-only state changes (e.g. a custom-domain verification)
+/// must reach the running pod's Caddyfile without a full redeploy. Caddy
+/// inside the pod runs `caddy run` with no live config-watch sidecar, so the
+/// new Caddyfile takes effect on next pod restart -- callers should advise
+/// the user accordingly.
+///
+/// No-op (Ok) when the app has not been deployed yet (no namespace/pods).
+pub async fn reapply_tenant_ingress(
+    pool: &PgPool,
+    app: &App,
+    attestation_config: Option<&AttestationConfig>,
+    api_signing_pubkey: &str,
+    api_url: &str,
+) -> Result<(), DeployError> {
+    let Some(attestation_config) = attestation_config else {
+        return Err(DeployError::MissingAttestationConfig);
+    };
+
+    let app_spec = build_confidential_app(
+        pool,
+        app,
+        attestation_config,
+        api_signing_pubkey,
+        api_url,
+    )
+    .await?;
+    enclava_engine::validate::validate_app(&app_spec)
+        .map_err(|e| DeployError::Validation(e.to_string()))?;
+
+    let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
+
+    let engine = ApplyEngine::try_default().await?;
+    enclava_engine::apply::resources::apply_namespaced_resource(&engine, &app_spec.namespace, &cm)
+        .await?;
+
+    Ok(())
+}
+
 /// Apply manifests before returning the deploy response, then continue rollout
 /// monitoring in the background so CLI/API calls are not held for TEE boot.
 pub async fn apply_deployment_manifests(

@@ -300,6 +300,47 @@ pub async fn verify_challenge(
             Json(serde_json::json!({"error": format!("haproxy update: {e}")})),
         ))?;
 
+    // Re-render the tenant-ingress ConfigMap so Caddy serves the new custom
+    // hostname. Caddy in the pod runs `caddy run` (no live config-watch), so
+    // the new Caddyfile takes effect on the next pod restart -- log a warning
+    // for the user. If the app has never been deployed (no namespace yet),
+    // SSA-apply still succeeds (creates the ConfigMap in the existing
+    // namespace) but if the namespace is missing we treat it as a no-op.
+    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+    match crate::deploy::reapply_tenant_ingress(
+        &state.db,
+        &App { custom_domain: Some(domain.clone()), ..app.clone() },
+        state.attestation.as_ref(),
+        &api_signing_pubkey,
+        &state.api_url,
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::warn!(
+                app_id = %app.id,
+                %domain,
+                "tenant ingress regenerated for new custom domain; redeploy or restart pod for Caddy to pick up the change"
+            );
+        }
+        Err(crate::deploy::DeployError::MissingAttestationConfig)
+        | Err(crate::deploy::DeployError::NoContainers) => {
+            tracing::info!(
+                app_id = %app.id,
+                %domain,
+                "tenant ingress regeneration skipped: app not yet deployed"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                app_id = %app.id,
+                %domain,
+                error = %e,
+                "failed to regenerate tenant ingress for verified custom domain"
+            );
+        }
+    }
+
     if let Some(old) = previous_custom.as_deref()
         && old != domain
     {

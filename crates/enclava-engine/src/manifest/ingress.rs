@@ -31,7 +31,7 @@ pub enum IngressRenderError {
 
 /// Validated inputs ready to be rendered into a Caddyfile.
 struct CaddyfileSpec {
-    domain: String,
+    hosts: Vec<String>,
     app_port: u16,
     acme_ca: String,
     contact_email: String,
@@ -39,15 +39,33 @@ struct CaddyfileSpec {
 
 impl CaddyfileSpec {
     fn from_app(app: &ConfidentialApp) -> Result<Self, IngressRenderError> {
-        let domain = app.primary_domain().to_string();
-        validate_fqdn(&domain)?;
+        let mut hosts: Vec<String> = Vec::new();
+        let primary = app.domain.platform_domain.as_str();
+        if !primary.is_empty() {
+            validate_fqdn(primary)?;
+            hosts.push(primary.to_string());
+        }
+        if let Some(custom) = app.domain.custom_domain.as_deref()
+            && !custom.is_empty()
+            && !hosts.iter().any(|h| h.as_str() == custom)
+        {
+            validate_fqdn(custom)?;
+            hosts.push(custom.to_string());
+        }
+        if hosts.is_empty() {
+            // Fall back to whatever primary_domain resolves to so we still emit
+            // a well-formed Caddyfile -- validate_fqdn will catch bad input.
+            let domain = app.primary_domain().to_string();
+            validate_fqdn(&domain)?;
+            hosts.push(domain);
+        }
         let app_port = app.primary_container().and_then(|c| c.port).unwrap_or(8080);
         let acme_ca = app.attestation.acme_ca_url.trim().to_string();
         validate_https_url(&acme_ca)?;
         let contact_email = "infra@enclava.dev".to_string();
         validate_email(&contact_email)?;
         Ok(Self {
-            domain,
+            hosts,
             app_port,
             acme_ca,
             contact_email,
@@ -154,7 +172,7 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str(&spec.acme_ca);
     out.push('\n');
     out.push_str("}\n");
-    out.push_str(&spec.domain);
+    out.push_str(&spec.hosts.join(", "));
     out.push_str(" {\n");
     out.push_str("  tls {\n");
     out.push_str("    dns cloudflare {env.CF_API_TOKEN}\n");
