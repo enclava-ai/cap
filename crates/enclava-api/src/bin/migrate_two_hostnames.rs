@@ -23,6 +23,8 @@ use enclava_api::dns::DnsConfig;
 use enclava_api::edge::{
     backend_name_for, ensure_haproxy_routes, BackendTag, EdgeRouteConfig, SniRoute,
 };
+use enclava_api::models::App;
+use enclava_engine::types::AttestationConfig;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -79,6 +81,13 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(count = rows.len(), "iterating apps");
 
+    let attestation = load_attestation_for_migration();
+    let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost".to_string());
+    let api_signing_pubkey = std::env::var("API_SIGNING_PUBKEY_BASE64").unwrap_or_default();
+
+    let mut succeeded: u64 = 0;
+    let mut failed: u64 = 0;
+
     for app in rows {
         let app_host =
             enclava_common::hostnames::app_hostname(&app.name, &app.cust_slug, &platform_domain)?;
@@ -122,8 +131,85 @@ async fn main() -> anyhow::Result<()> {
         if app.tee_domain.as_deref() != Some(tee_host.as_str()) {
             tracing::info!(new = %tee_host, "set app.tee_domain");
         }
+
+        // Re-render and SSA-apply the tenant-ingress ConfigMap so Caddy serves
+        // the new hostname pair. Existing pods need a restart for Caddy to
+        // pick up the new Caddyfile (no live config-watch sidecar).
+        match attestation.as_ref() {
+            Some(att) => {
+                match reapply_one(&pool, app.id, att, &api_signing_pubkey, &api_url).await {
+                    Ok(()) => {
+                        succeeded += 1;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        tracing::error!(
+                            app_id = %app.id,
+                            app = %app.name,
+                            error = %e,
+                            "failed to re-render tenant ingress; redeploy this app manually"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    app = %app.name,
+                    "ATTESTATION_PROXY_IMAGE/CADDY_INGRESS_IMAGE unset; tenant ingress NOT regenerated -- redeploy app manually"
+                );
+            }
+        }
     }
 
-    tracing::info!("done");
+    tracing::info!(succeeded, failed, "done");
+    if failed > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn load_attestation_for_migration() -> Option<AttestationConfig> {
+    use enclava_common::image::ImageRef;
+
+    let proxy = std::env::var("ATTESTATION_PROXY_IMAGE").ok()?;
+    let caddy = std::env::var("CADDY_INGRESS_IMAGE").ok()?;
+    let proxy_image = ImageRef::parse(&proxy).ok()?;
+    let caddy_image = ImageRef::parse(&caddy).ok()?;
+    proxy_image.require_digest().ok()?;
+    caddy_image.require_digest().ok()?;
+    Some(AttestationConfig {
+        proxy_image,
+        caddy_image,
+        acme_ca_url: std::env::var("TENANT_CADDY_ACME_CA")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
+        cloudflare_token_secret: std::env::var("CLOUDFLARE_TOKEN_SECRET")
+            .unwrap_or_else(|_| "cloudflare-api-token-enclava-dev".to_string()),
+        cloudflare_api_token: std::env::var("CLOUDFLARE_API_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty()),
+    })
+}
+
+async fn reapply_one(
+    pool: &PgPool,
+    app_id: Uuid,
+    attestation: &AttestationConfig,
+    api_signing_pubkey: &str,
+    api_url: &str,
+) -> anyhow::Result<()> {
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(pool)
+        .await?;
+    enclava_api::deploy::reapply_tenant_ingress(
+        pool,
+        &app,
+        Some(attestation),
+        api_signing_pubkey,
+        api_url,
+    )
+    .await?;
     Ok(())
 }
