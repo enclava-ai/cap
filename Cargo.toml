@@ -5,6 +5,7 @@ members = [
     "crates/enclava-engine",
     "crates/enclava-api",
     "crates/enclava-cli",
+    "crates/enclava-init",
 ]
 
 [workspace.package]
