@@ -27,8 +27,13 @@ const ORG_SLUG_LEN: usize = 8;
 const IMAGE_DIGEST_HEX_LEN: usize = 64;
 const IMAGE_DIGEST_PREFIX: &str = "sha256:";
 
-/// RFC 1123 DNS label (1–63 chars, `[a-z0-9-]`, no leading/trailing hyphen,
-/// not all-digits per Kubernetes-style restrictions).
+/// RFC 1123 DNS label (1–63 chars, `[a-z0-9-]`, no leading/trailing hyphen).
+///
+/// All-digit labels are valid here — RFC 1123 §2.1 dropped the
+/// "must contain at least one alpha" rule from RFC 952, and the platform's
+/// 8-hex `org_slug` may be all-digit (e.g. `12345678`) which must round-trip
+/// through `app_hostname()` cleanly. Stricter caller types (e.g. K8s service
+/// names) layer their own all-digit rejection on top.
 pub fn validate_dns_label(s: &str) -> Result<(), ValidateError> {
     if s.is_empty() {
         return Err(ValidateError::InvalidDnsLabel("empty"));
@@ -50,9 +55,6 @@ pub fn validate_dns_label(s: &str) -> Result<(), ValidateError> {
         return Err(ValidateError::InvalidDnsLabel(
             "must not start or end with '-'",
         ));
-    }
-    if s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ValidateError::InvalidDnsLabel("must not be all digits"));
     }
     Ok(())
 }
@@ -84,8 +86,12 @@ pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
         return Err(ValidateError::InvalidAppName("exceeds 32 characters"));
     }
     validate_dns_label(s).map_err(|_| ValidateError::InvalidAppName(
-        "must be a DNS-1123 label: [a-z0-9-], no leading/trailing '-', not all digits",
-    ))
+        "must be a DNS-1123 label: [a-z0-9-], no leading/trailing '-'",
+    ))?;
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ValidateError::InvalidAppName("must not be all digits"));
+    }
+    Ok(())
 }
 
 /// Every label valid, total length ≤ 253, no trailing dot.
@@ -196,9 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn dns_label_rejects_all_digits() {
-        assert!(validate_dns_label("123").is_err());
-        assert!(validate_dns_label("0").is_err());
+    fn dns_label_accepts_all_digits() {
+        // RFC 1123 dropped the "must contain at least one alpha" rule.
+        // The 8-hex org_slug field can be all-digit (e.g. `12345678`).
+        assert!(validate_dns_label("12345678").is_ok());
+        assert!(validate_dns_label("0").is_ok());
     }
 
     #[test]
@@ -280,10 +288,24 @@ mod tests {
         assert!(validate_app_name("My-App").is_err());
         assert!(validate_app_name("-app").is_err());
         assert!(validate_app_name("app-").is_err());
-        assert!(validate_app_name("123").is_err());
         assert!(validate_app_name("..").is_err());
         assert!(validate_app_name("a\0b").is_err());
         assert!(validate_app_name("café").is_err());
+    }
+
+    #[test]
+    fn app_name_rejects_all_digits() {
+        // Stricter than validate_dns_label: app names propagate to K8s
+        // service / SA names which must not be all-numeric.
+        assert!(validate_app_name("123").is_err());
+        assert!(validate_app_name("0").is_err());
+    }
+
+    #[test]
+    fn fqdn_accepts_all_digit_label() {
+        // The 8-hex org_slug position can be all-digit.
+        assert!(validate_fqdn("app.12345678.enclava.dev").is_ok());
+        assert!(validate_fqdn("app.00000000.enclava.dev").is_ok());
     }
 
     // -----------------------------------------------------------------
