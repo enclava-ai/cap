@@ -2,6 +2,15 @@ use serde_json::{Value, json};
 
 use crate::types::{ConfidentialApp, EgressRule};
 
+/// Platform-default FQDN egress allowlist.
+///
+/// Hardcoded so the operator cannot quietly drop these. Caddy needs ACME
+/// reachability to issue and renew TLS certs for tenant ingress.
+const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
+    "acme-v02.api.letsencrypt.org",
+    "acme-staging-v02.api.letsencrypt.org",
+];
+
 /// Generate a CiliumNetworkPolicy (cilium.io/v2 CRD).
 ///
 /// Default: no egress to `world`. The previous policy allowed unrestricted
@@ -9,7 +18,8 @@ use crate::types::{ConfidentialApp, EgressRule};
 /// exfiltrate plaintext to any host. Phase 11: per-app FQDN allowlist instead.
 ///
 /// Each `EgressRule` becomes a Cilium `toFQDNs` rule scoped to the listed ports.
-/// Apps with `egress_allowlist: []` get zero world-egress rules.
+/// The platform-default allowlist (DNS, KBS, ACME) is always present; per-app
+/// `egress_allowlist` adds on top.
 pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
     let mut egress = vec![
         // Rule: DNS to kube-dns
@@ -77,6 +87,13 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             ]
         }),
     ];
+
+    for fqdn in PLATFORM_DEFAULT_FQDNS {
+        egress.push(json!({
+            "toFQDNs": [{ "matchName": fqdn }],
+            "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }],
+        }));
+    }
 
     for rule in &app.egress_allowlist {
         egress.push(egress_rule_value(rule));
