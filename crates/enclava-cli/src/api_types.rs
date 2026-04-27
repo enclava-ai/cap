@@ -153,15 +153,30 @@ pub struct ConfigKeyMeta {
 // --- Domains ---
 
 #[derive(Debug, Serialize)]
-pub struct SetDomainRequest {
+pub struct CreateChallengeRequest {
     pub domain: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChallengeResponse {
+    pub domain: String,
+    pub txt_record_name: String,
+    pub txt_record_value: String,
+    pub expires_at: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyResponse {
+    pub domain: String,
+    pub verified_at: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DomainResponse {
     pub platform_domain: String,
+    pub tee_domain: Option<String>,
     pub custom_domain: Option<String>,
-    pub dns_instructions: Option<String>,
 }
 
 // --- Rollback ---

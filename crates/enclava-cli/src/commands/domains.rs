@@ -1,15 +1,23 @@
 use clap::Subcommand;
 
 use enclava_cli::api_client::ApiClient;
-use enclava_cli::api_types::SetDomainRequest;
+use enclava_cli::api_types::CreateChallengeRequest;
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
 
 #[derive(Subcommand)]
 pub enum DomainsCommand {
-    /// Add a custom domain
+    /// Request a TXT verification challenge for a custom domain
     Add {
         /// Domain name (e.g., app.example.com)
+        domain: String,
+        /// App name (defaults to enclava.toml app.name)
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Verify a previously-added domain after publishing the TXT record
+    Verify {
+        /// Domain name to verify
         domain: String,
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
@@ -52,19 +60,32 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             let app_name = resolve_app_name(&app)?;
             let api = build_api_client()?;
 
-            let req = SetDomainRequest {
+            let req = CreateChallengeRequest {
                 domain: domain.clone(),
             };
-            let resp = api.set_domain(&app_name, &req).await?;
+            let resp = api.create_domain_challenge(&app_name, &req).await?;
 
-            println!("Custom domain added: {domain}");
+            println!("Domain challenge created for: {domain}");
             println!();
-            println!("Platform domain: {}", resp.platform_domain);
-            if let Some(instructions) = &resp.dns_instructions {
-                println!();
-                println!("DNS setup required:");
-                println!("{instructions}");
-            }
+            println!("Publish this TXT record at your DNS provider:");
+            println!("  Name:  {}", resp.txt_record_name);
+            println!("  Value: {}", resp.txt_record_value);
+            println!();
+            println!("Expires at: {}", resp.expires_at);
+            println!();
+            println!("Once published, run:");
+            println!("  enclava domains verify {domain} --app {app_name}");
+        }
+
+        DomainsCommand::Verify { domain, app } => {
+            let app_name = resolve_app_name(&app)?;
+            let api = build_api_client()?;
+
+            let resp = api.verify_domain(&app_name, &domain).await?;
+            println!(
+                "Domain '{}' verified for {app_name} at {}.",
+                resp.domain, resp.verified_at,
+            );
         }
 
         DomainsCommand::List { app } => {
@@ -75,6 +96,9 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
 
             println!("Domains for {app_name}:");
             println!("  Platform: https://{}", resp.platform_domain);
+            if let Some(tee) = &resp.tee_domain {
+                println!("  TEE:      https://{tee}");
+            }
             if let Some(custom) = &resp.custom_domain {
                 println!("  Custom:   https://{custom}");
             }
@@ -84,7 +108,7 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             let app_name = resolve_app_name(&app)?;
             let api = build_api_client()?;
 
-            api.delete_domain(&app_name).await?;
+            api.delete_custom_domain(&app_name, &domain).await?;
             println!("Custom domain '{domain}' removed from {app_name}.");
         }
     }

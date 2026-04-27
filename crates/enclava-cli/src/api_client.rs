@@ -266,16 +266,31 @@ impl ApiClient {
 
     // --- Domains ---
 
-    pub async fn set_domain(
+    pub async fn create_domain_challenge(
         &self,
         app_name: &str,
-        req: &SetDomainRequest,
-    ) -> Result<DomainResponse, ApiError> {
+        req: &CreateChallengeRequest,
+    ) -> Result<ChallengeResponse, ApiError> {
         let resp = self
             .http
-            .put(self.url(&format!("/apps/{app_name}/domain")))
+            .post(self.url(&format!("/apps/{app_name}/domains")))
             .headers(self.auth_headers()?)
             .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn verify_domain(
+        &self,
+        app_name: &str,
+        domain: &str,
+    ) -> Result<VerifyResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/domains/{domain}/verify")))
+            .headers(self.auth_headers()?)
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
@@ -293,10 +308,14 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn delete_domain(&self, app_name: &str) -> Result<(), ApiError> {
+    pub async fn delete_custom_domain(
+        &self,
+        app_name: &str,
+        domain: &str,
+    ) -> Result<(), ApiError> {
         let resp = self
             .http
-            .delete(self.url(&format!("/apps/{app_name}/domain")))
+            .delete(self.url(&format!("/apps/{app_name}/domains/{domain}")))
             .headers(self.auth_headers()?)
             .send()
             .await?;
