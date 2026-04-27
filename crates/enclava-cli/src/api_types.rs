@@ -52,6 +52,18 @@ pub struct CreateAppRequest {
     pub health_path: Option<String>,
     pub health_interval: Option<u32>,
     pub health_timeout: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_identity_subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_identity_issuer: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetSignerRequest {
+    pub subject: String,
+    pub issuer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_confirmation_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

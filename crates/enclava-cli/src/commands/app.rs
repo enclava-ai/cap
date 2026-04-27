@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use clap::Subcommand;
 use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::*;
 use enclava_cli::app_config::AppConfig;
@@ -49,6 +50,19 @@ pub struct CreateArgs {
     /// Container image to deploy (tag resolved to digest automatically)
     #[arg(long)]
     pub image: Option<String>,
+    /// Cosign Fulcio identity subject for image-signature verification.
+    /// Examples: GitHub Actions OIDC subject
+    /// (`https://github.com/<org>/<repo>/.github/workflows/<wf>.yml@refs/heads/<branch>`),
+    /// or a maintainer email tied to the keyless OIDC issuer.
+    #[arg(long = "signer-subject")]
+    pub signer_subject: Option<String>,
+    /// Cosign Fulcio issuer URL for the signer identity. Defaults to
+    /// the GitHub Actions OIDC issuer when omitted.
+    #[arg(
+        long = "signer-issuer",
+        default_value = "https://token.actions.githubusercontent.com"
+    )]
+    pub signer_issuer: String,
 }
 
 pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -83,6 +97,11 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         })
         .collect();
 
+    let signer_identity_subject = args.signer_subject.clone();
+    let signer_identity_issuer = signer_identity_subject
+        .as_ref()
+        .map(|_| args.signer_issuer.clone());
+
     let req = CreateAppRequest {
         name: app_config.app.name.clone(),
         port: app_config.app.port,
@@ -100,6 +119,8 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         health_path: app_config.health.as_ref().map(|h| h.path.clone()),
         health_interval: app_config.health.as_ref().map(|h| h.interval),
         health_timeout: app_config.health.as_ref().map(|h| h.timeout),
+        signer_identity_subject,
+        signer_identity_issuer,
     };
 
     let spinner = ProgressBar::new_spinner();
@@ -550,6 +571,76 @@ pub async fn rollback(args: RollbackArgs) -> Result<(), Box<dyn std::error::Erro
     spinner.finish_with_message(format!("Rolled back to deployment {}", resp.rolled_back_to));
     println!("New deployment: {}", resp.deployment_id);
 
+    Ok(())
+}
+
+// ---- Signer identity (set / rotate) ----
+
+#[derive(Subcommand)]
+pub enum SignerCommand {
+    /// Set the signer identity for an app that has none yet (initial set).
+    /// No email confirmation token is required for the first set.
+    Set {
+        /// Cosign Fulcio identity subject. Examples:
+        /// `repo:<org>/<repo>:ref:refs/heads/main` or an email.
+        subject: String,
+        /// App name (defaults to enclava.toml app.name)
+        #[arg(long)]
+        app: Option<String>,
+        /// Cosign Fulcio issuer URL.
+        #[arg(long, default_value = "https://token.actions.githubusercontent.com")]
+        issuer: String,
+    },
+    /// Rotate an existing signer identity. Requires an email confirmation
+    /// token tied to the requesting user's verified email.
+    Rotate {
+        /// New cosign Fulcio identity subject.
+        subject: String,
+        /// Email confirmation token issued by the platform.
+        #[arg(long = "confirmation-token")]
+        confirmation_token: String,
+        /// App name (defaults to enclava.toml app.name)
+        #[arg(long)]
+        app: Option<String>,
+        /// Cosign Fulcio issuer URL.
+        #[arg(long, default_value = "https://token.actions.githubusercontent.com")]
+        issuer: String,
+    },
+}
+
+pub async fn signer(cmd: SignerCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let (api, _paths, _cli_config) = build_api_client()?;
+    match cmd {
+        SignerCommand::Set { subject, issuer, app } => {
+            let app_name = resolve_app_name(&app)?;
+            let req = SetSignerRequest {
+                subject: subject.clone(),
+                issuer: issuer.clone(),
+                email_confirmation_token: None,
+            };
+            let _ = api.set_signer(&app_name, &req).await?;
+            println!("Signer identity set for {app_name}.");
+            println!("  Subject: {subject}");
+            println!("  Issuer:  {issuer}");
+        }
+        SignerCommand::Rotate {
+            subject,
+            issuer,
+            confirmation_token,
+            app,
+        } => {
+            let app_name = resolve_app_name(&app)?;
+            let req = SetSignerRequest {
+                subject: subject.clone(),
+                issuer: issuer.clone(),
+                email_confirmation_token: Some(confirmation_token),
+            };
+            let _ = api.set_signer(&app_name, &req).await?;
+            println!("Signer identity rotated for {app_name}.");
+            println!("  Subject: {subject}");
+            println!("  Issuer:  {issuer}");
+        }
+    }
     Ok(())
 }
 

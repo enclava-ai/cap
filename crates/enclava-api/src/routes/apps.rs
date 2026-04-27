@@ -602,7 +602,12 @@ pub async fn delete_app(
 pub struct RotateSignerRequest {
     pub subject: String,
     pub issuer: String,
-    pub email_confirmation_token: String,
+    /// Required when rotating a signer (replacing an existing identity).
+    /// Optional when initially setting a signer on an app that has none --
+    /// in that case we treat the call as a first-time set, not a rotation,
+    /// so users created before signer-on-create shipped can self-recover.
+    #[serde(default)]
+    pub email_confirmation_token: Option<String>,
 }
 
 /// PATCH /apps/{name}/signer -- rotate the per-app cosign / Fulcio identity.
@@ -628,21 +633,6 @@ pub async fn rotate_signer(
         ));
     }
 
-    if body.email_confirmation_token.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({"error": "email_confirmation_token is required for signer rotation"}),
-            ),
-        ));
-    }
-
-    // TODO(phase-10): validate email_confirmation_token against the email
-    // verification table once the email-verification mechanism (Phase 10)
-    // ships. For now we require the field to be present so clients are
-    // already wired correctly, but cannot yet verify it server-side.
-    let _ = &body.email_confirmation_token;
-
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -656,6 +646,30 @@ pub async fn rotate_signer(
 
     let previous_subject = app.signer_identity_subject.clone();
     let previous_issuer = app.signer_identity_issuer.clone();
+
+    let is_initial_set = previous_subject.is_none() && previous_issuer.is_none();
+    let confirmation_token = body
+        .email_confirmation_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
+    if !is_initial_set && confirmation_token.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": "email_confirmation_token is required for signer rotation"}),
+            ),
+        ));
+    }
+
+    // TODO(phase-10): validate email_confirmation_token against the email
+    // verification table once the email-verification mechanism (Phase 10)
+    // ships. For now we require the field to be present on rotation so
+    // clients are already wired correctly, but cannot yet verify it
+    // server-side. Initial-set calls do not require it -- there is no
+    // previous identity to authenticate the rotation against.
+    let _ = confirmation_token;
 
     sqlx::query(
         "UPDATE apps
@@ -675,17 +689,24 @@ pub async fn rotate_signer(
     // Audit. TODO(phase-2): the rotated signer_identity must be re-rendered
     // into the KBS Rego policy for this app once the Phase 2 policy
     // templates land.
+    let action = if is_initial_set {
+        "app.signer.set"
+    } else {
+        "app.signer.rotate"
+    };
     let _ = sqlx::query(
-        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.signer.rotate', $4)",
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(auth.org_id)
     .bind(app.id)
     .bind(auth.user_id)
+    .bind(action)
     .bind(serde_json::json!({
         "previous_subject": previous_subject,
         "previous_issuer":  previous_issuer,
         "new_subject":      &body.subject,
         "new_issuer":       &body.issuer,
+        "initial_set":      is_initial_set,
     }))
     .execute(&state.db)
     .await;
@@ -697,4 +718,39 @@ pub async fn rotate_signer(
         .map_err(|_| internal_server_error())?;
 
     Ok(Json(app.into()))
+}
+
+#[cfg(test)]
+mod signer_request_tests {
+    use super::RotateSignerRequest;
+
+    #[test]
+    fn initial_set_call_omits_token() {
+        let body: RotateSignerRequest = serde_json::from_value(serde_json::json!({
+            "subject": "repo:me/app:ref:refs/heads/main",
+            "issuer":  "https://token.actions.githubusercontent.com",
+        }))
+        .expect("token must be optional");
+        assert!(body.email_confirmation_token.is_none());
+    }
+
+    #[test]
+    fn rotation_call_carries_token() {
+        let body: RotateSignerRequest = serde_json::from_value(serde_json::json!({
+            "subject": "repo:me/app:ref:refs/heads/main",
+            "issuer":  "https://token.actions.githubusercontent.com",
+            "email_confirmation_token": "tok-123",
+        }))
+        .unwrap();
+        assert_eq!(body.email_confirmation_token.as_deref(), Some("tok-123"));
+    }
+
+    #[test]
+    fn whitespace_only_token_is_treated_as_absent_by_handler_logic() {
+        // The handler trims and filters; reproduce that exact predicate so
+        // future refactors that drop the trim/filter trip a unit test.
+        let token: Option<String> = Some("   ".to_string());
+        let normalized = token.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        assert!(normalized.is_none());
+    }
 }

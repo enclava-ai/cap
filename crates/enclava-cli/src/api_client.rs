@@ -141,6 +141,22 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn set_signer(
+        &self,
+        app_name: &str,
+        req: &SetSignerRequest,
+    ) -> Result<serde_json::Value, ApiError> {
+        let resp = self
+            .http
+            .patch(self.url(&format!("/apps/{app_name}/signer")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn delete_app(&self, name: &str) -> Result<(), ApiError> {
         let resp = self
             .http
