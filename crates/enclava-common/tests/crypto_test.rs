@@ -1,13 +1,20 @@
+//! Cross-crate sanity check that the CE-v1 identity hash is callable from
+//! consumers. Per-record property tests live alongside the implementation
+//! in `crates/enclava-common/src/crypto.rs`.
+
+use enclava_common::canonical::ce_v1_hash;
 use enclava_common::crypto::compute_identity_hash;
 
 #[test]
-fn identity_hash_matches_python_implementation() {
-    // Verified: python3 -c "import hashlib; print(hashlib.sha256(b'tenant-1:instance-a:aabbccdd').hexdigest())"
+fn identity_hash_matches_explicit_ce_v1_construction() {
     let hash = compute_identity_hash("tenant-1", "instance-a", "aabbccdd");
-    assert_eq!(
-        hash,
-        "61d6db7a790e5aec89d6ff87bd1ac02868cb5725bf9be8eea71c522d8f5e3c26"
-    );
+    let expected = hex::encode(ce_v1_hash(&[
+        ("purpose", b"enclava-identity-v1"),
+        ("tenant_id", b"tenant-1"),
+        ("instance_id", b"instance-a"),
+        ("bootstrap_owner_pubkey", b"aabbccdd"),
+    ]));
+    assert_eq!(hash, expected);
 }
 
 #[test]
@@ -19,16 +26,10 @@ fn identity_hash_is_lowercase_hex_64_chars() {
 }
 
 #[test]
-fn identity_hash_deterministic() {
-    let a = compute_identity_hash("x", "y", "z");
-    let b = compute_identity_hash("x", "y", "z");
-    assert_eq!(a, b);
-}
-
-#[test]
-fn identity_hash_sensitive_to_all_inputs() {
-    let base = compute_identity_hash("t", "i", "p");
-    assert_ne!(base, compute_identity_hash("T", "i", "p"));
-    assert_ne!(base, compute_identity_hash("t", "I", "p"));
-    assert_ne!(base, compute_identity_hash("t", "i", "P"));
+fn identity_hash_resists_boundary_collision() {
+    // Plain concat ("a"+"bc"+"x" vs "ab"+"c"+"x") would collide on
+    // the unprefixed bytes "abcx". CE-v1's length-prefixed records prevent it.
+    let a = compute_identity_hash("a", "bc", "x");
+    let b = compute_identity_hash("ab", "c", "x");
+    assert_ne!(a, b);
 }
