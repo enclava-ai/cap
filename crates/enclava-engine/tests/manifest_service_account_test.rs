@@ -28,3 +28,9 @@ fn service_account_has_managed_by_label() {
         Some(&"enclava-platform".to_string())
     );
 }
+
+#[test]
+fn service_account_disables_automount_token() {
+    let sa = generate_service_account(&sample_app());
+    assert_eq!(sa.automount_service_account_token, Some(false));
+}

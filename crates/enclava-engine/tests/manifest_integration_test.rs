@@ -50,7 +50,7 @@ fn generate_all_manifests_returns_all_resources() {
     let sni_data = m.sni_route_configmap.data.as_ref().unwrap();
     assert_eq!(
         sni_data.get("host").map(|s| s.as_str()),
-        Some("test-app.enclava.dev")
+        Some("test-app.abcd1234.enclava.dev")
     );
     assert_eq!(
         sni_data.get("backend_tls").map(|s| s.as_str()),
@@ -68,7 +68,10 @@ fn generate_all_manifests_returns_all_resources() {
         m.tls_route["metadata"]["name"],
         "tenant-passthrough-test-app"
     );
-    assert_eq!(m.tls_route["spec"]["hostnames"][0], "test-app.enclava.dev");
+    assert_eq!(
+        m.tls_route["spec"]["hostnames"][0],
+        "test-app.abcd1234.enclava.dev"
+    );
     assert_eq!(
         m.tls_route["spec"]["rules"][0]["backendRefs"][0]["name"],
         "test-app"

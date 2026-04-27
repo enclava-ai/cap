@@ -30,7 +30,7 @@ fn owner_resource_path_uses_namespace_and_app_name() {
 #[test]
 fn primary_domain_returns_platform_domain() {
     let app = sample_app();
-    assert_eq!(app.primary_domain(), "test-app.enclava.dev");
+    assert_eq!(app.primary_domain(), "test-app.abcd1234.enclava.dev");
 }
 
 #[test]

@@ -37,6 +37,7 @@ async fn setup_test_state() -> (AppState, PgPool) {
         btcpay_url: "http://localhost:23001".to_string(),
         btcpay_api_key: "test-key".to_string(),
         platform_domain: "enclava.dev".to_string(),
+        tee_domain_suffix: "tee.enclava.dev".to_string(),
         http_client: reqwest::Client::new(),
         tee_http_client: reqwest::Client::new(),
         btcpay_webhook_secret: "test-secret".to_string(),

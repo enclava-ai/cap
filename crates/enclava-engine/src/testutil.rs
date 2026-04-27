@@ -43,7 +43,8 @@ pub fn sample_app() -> ConfidentialApp {
         storage: StorageSpec::new("10Gi", "2Gi"),
         unlock_mode: UnlockMode::Auto,
         domain: DomainSpec {
-            platform_domain: "test-app.enclava.dev".to_string(),
+            platform_domain: "test-app.abcd1234.enclava.dev".to_string(),
+            tee_domain: "test-app.abcd1234.tee.enclava.dev".to_string(),
             custom_domain: None,
         },
         api_signing_pubkey: "test-pubkey-placeholder".to_string(),

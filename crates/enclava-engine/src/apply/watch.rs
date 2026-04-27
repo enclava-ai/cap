@@ -140,12 +140,19 @@ pub async fn watch_rollout(
 
         // Check if StatefulSet reports all replicas ready
         let sts_status = sts.status.as_ref();
+        let generation = sts.metadata.generation.unwrap_or(0);
+        let observed_generation = sts_status.and_then(|s| s.observed_generation).unwrap_or(0);
         let desired = sts.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
         let ready = sts_status.and_then(|s| s.ready_replicas).unwrap_or(0);
         let current = sts_status.and_then(|s| s.current_replicas).unwrap_or(0);
         let updated = sts_status.and_then(|s| s.updated_replicas).unwrap_or(0);
 
-        if ready >= desired && current >= desired && updated >= desired && desired > 0 {
+        if observed_generation >= generation
+            && ready >= desired
+            && current >= desired
+            && updated >= desired
+            && desired > 0
+        {
             tracing::info!(
                 namespace = %namespace,
                 statefulset = %statefulset_name,

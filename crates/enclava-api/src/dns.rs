@@ -37,6 +37,8 @@ pub enum DnsError {
     NotConfigured,
     #[error("hostname '{0}' is outside managed Cloudflare zone")]
     OutsideManagedZone(String),
+    #[error("hostname '{hostname}' is already assigned to another app")]
+    HostnameInUse { hostname: String },
     #[error("Cloudflare API error: {0}")]
     Cloudflare(String),
     #[error("Cloudflare request failed: {0}")]
@@ -291,11 +293,7 @@ pub async fn delete_dns_record(
     app_id: Uuid,
     hostname: &str,
 ) -> Result<(), DnsError> {
-    let Some(config) = config else {
-        return Ok(());
-    };
-
-    let row: Option<(String, String)> = sqlx::query_as(
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT zone_id, record_id FROM dns_records WHERE app_id = $1 AND hostname = $2",
     )
     .bind(app_id)
@@ -307,23 +305,44 @@ pub async fn delete_dns_record(
         return Ok(());
     };
 
-    let response = client
-        .delete(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-        ))
-        .bearer_auth(&config.cloudflare_api_token)
-        .send()
-        .await?;
+    // Custom (user-owned) rows have no Cloudflare handle; delete the local row
+    // only. Platform-zone rows need a Cloudflare delete first.
+    if let (Some(zone_id), Some(record_id)) = (zone_id.as_deref(), record_id.as_deref()) {
+        let Some(config) = config else {
+            return Ok(());
+        };
 
-    if response.status() != StatusCode::NOT_FOUND {
-        let status = response.status();
-        let body: CloudflareSingle<serde_json::Value> = response.json().await?;
-        if !status.is_success() || !body.success {
-            return Err(DnsError::Cloudflare(format!(
-                "delete record for '{hostname}' failed: {}",
-                cloudflare_error(&body.errors)
-            )));
+        let response = client
+            .delete(format!(
+                "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+            ))
+            .bearer_auth(&config.cloudflare_api_token)
+            .send()
+            .await?;
+
+        if response.status() != StatusCode::NOT_FOUND {
+            let status = response.status();
+            let body: CloudflareSingle<serde_json::Value> = response.json().await?;
+            if !status.is_success() || !body.success {
+                return Err(DnsError::Cloudflare(format!(
+                    "delete record for '{hostname}' failed: {}",
+                    cloudflare_error(&body.errors)
+                )));
+            }
         }
+
+        tracing::info!(
+            app_id = %app_id,
+            hostname = %hostname,
+            record_id = %record_id,
+            "DNS record deleted"
+        );
+    } else {
+        tracing::info!(
+            app_id = %app_id,
+            hostname = %hostname,
+            "custom DNS record forgotten (user-owned, no cloudflare delete)"
+        );
     }
 
     sqlx::query("DELETE FROM dns_records WHERE app_id = $1 AND hostname = $2")
@@ -332,14 +351,112 @@ pub async fn delete_dns_record(
         .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+/// Record a user-owned custom domain in `dns_records` without touching
+/// Cloudflare. The user controls this DNS, so we only track it for cleanup
+/// and audit. Idempotent for the same app, but refuses to transfer a hostname
+/// away from another app because the old app may still have DB and HAProxy
+/// state for that domain.
+pub async fn record_custom_domain(
+    pool: &PgPool,
+    app_id: Uuid,
+    hostname: &str,
+) -> Result<(), DnsError> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "INSERT INTO dns_records (id, app_id, hostname, zone_id, record_id, record_type, target, is_custom, provider)
+         VALUES ($1, $2, $3, NULL, NULL, 'CUSTOM', '', true, 'user')
+         ON CONFLICT (hostname) DO UPDATE SET
+             app_id = EXCLUDED.app_id,
+             zone_id = NULL,
+             record_id = NULL,
+             record_type = EXCLUDED.record_type,
+             target = EXCLUDED.target,
+             is_custom = EXCLUDED.is_custom,
+             provider = EXCLUDED.provider,
+             updated_at = now()
+         WHERE dns_records.app_id = EXCLUDED.app_id
+         RETURNING app_id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(hostname)
+    .fetch_optional(pool)
+    .await?;
+
+    if row.is_none() {
+        return Err(DnsError::HostnameInUse {
+            hostname: hostname.to_string(),
+        });
+    }
+
     tracing::info!(
         app_id = %app_id,
         hostname = %hostname,
-        record_id = %record_id,
-        "DNS record deleted"
+        "custom DNS hostname tracked (user-owned)"
     );
 
     Ok(())
+}
+
+/// Atomically ensure DNS records for both the user-facing app hostname and
+/// the TEE hostname. If any record creation fails, the records that were
+/// successfully created in this call are deleted before returning the error
+/// (best-effort rollback). Existing records (created in a prior successful
+/// call) are not touched on failure -- the operation is idempotent so a
+/// retry will reconcile.
+pub async fn ensure_dns_pair(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    config: Option<&DnsConfig>,
+    app_id: Uuid,
+    app_host: &str,
+    tee_host: &str,
+) -> Result<(), DnsError> {
+    if config.is_none() {
+        return Ok(());
+    }
+
+    let mut created: Vec<String> = Vec::new();
+
+    // Track whether each hostname existed already so that rollback only
+    // removes records that this call created.
+    let app_existed = dns_record_exists(pool, app_id, app_host).await?;
+    ensure_dns_record(pool, client, config, app_id, app_host, false).await?;
+    if !app_existed {
+        created.push(app_host.to_string());
+    }
+
+    let tee_existed = dns_record_exists(pool, app_id, tee_host).await?;
+    if let Err(e) = ensure_dns_record(pool, client, config, app_id, tee_host, false).await {
+        for host in created {
+            if let Err(rb_err) = delete_dns_record(pool, client, config, app_id, &host).await {
+                tracing::error!(
+                    app_id = %app_id,
+                    hostname = %host,
+                    error = %rb_err,
+                    "rollback delete failed during ensure_dns_pair"
+                );
+            }
+        }
+        return Err(e);
+    }
+    if !tee_existed {
+        created.push(tee_host.to_string());
+    }
+
+    Ok(())
+}
+
+async fn dns_record_exists(pool: &PgPool, app_id: Uuid, hostname: &str) -> Result<bool, DnsError> {
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2")
+            .bind(app_id)
+            .bind(hostname)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
 }
 
 pub async fn delete_all_dns_records_for_app(

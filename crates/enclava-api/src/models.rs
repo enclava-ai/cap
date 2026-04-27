@@ -101,6 +101,7 @@ pub struct Organization {
     pub display_name: Option<String>,
     pub tier: Tier,
     pub is_personal: bool,
+    pub cust_slug: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -146,8 +147,12 @@ pub struct App {
     pub tenant_instance_identity_hash: String,
     pub unlock_mode: UnlockMode,
     pub domain: String,
+    pub tee_domain: Option<String>,
     pub custom_domain: Option<String>,
     pub status: AppStatus,
+    pub signer_identity_subject: Option<String>,
+    pub signer_identity_issuer: Option<String>,
+    pub signer_identity_set_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -125,6 +125,20 @@ jobs:
         run: |
           curl -sSL https://get.enclava.dev | sh
 
+      # First-time setup only: pin the cosign Fulcio signer identity to
+      # this workflow's GitHub Actions OIDC URI subject. Subsequent runs
+      # are idempotent on the platform side -- if the signer is already
+      # set this call is rejected with the rotation guard, which is the
+      # intended behavior.
+      - name: Set signer identity (first deploy only)
+        continue-on-error: true
+        run: |
+          enclava signer set \
+            "https://github.com/${{{{ github.workflow_ref }}}}" \
+            --issuer "https://token.actions.githubusercontent.com"
+        env:
+          ENCLAVA_API_KEY: ${{{{ secrets.ENCLAVA_API_KEY }}}}
+
       - name: Deploy
         run: |
           enclava deploy \

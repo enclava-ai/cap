@@ -147,11 +147,15 @@ pub struct BindMount {
     pub destination: String,
 }
 
-/// Domain configuration for an app.
+/// Domain configuration for an app. Per D1 (two-hostname model) every app
+/// has both a user-facing app hostname and a TEE-facing hostname.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainSpec {
-    /// Platform-assigned subdomain (e.g., "myapp.enclava.dev").
+    /// App hostname `<app>.<orgSlug>.<platform_domain>`.
     pub platform_domain: String,
+    /// TEE hostname `<app>.<orgSlug>.<tee_domain_suffix>`.
+    #[serde(default)]
+    pub tee_domain: String,
     /// Optional custom domain (e.g., "app.example.com").
     pub custom_domain: Option<String>,
 }

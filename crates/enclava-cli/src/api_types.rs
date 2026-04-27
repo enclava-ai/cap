@@ -52,6 +52,18 @@ pub struct CreateAppRequest {
     pub health_path: Option<String>,
     pub health_interval: Option<u32>,
     pub health_timeout: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_identity_subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_identity_issuer: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetSignerRequest {
+    pub subject: String,
+    pub issuer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_confirmation_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,15 +165,30 @@ pub struct ConfigKeyMeta {
 // --- Domains ---
 
 #[derive(Debug, Serialize)]
-pub struct SetDomainRequest {
+pub struct CreateChallengeRequest {
     pub domain: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChallengeResponse {
+    pub domain: String,
+    pub txt_record_name: String,
+    pub txt_record_value: String,
+    pub expires_at: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyResponse {
+    pub domain: String,
+    pub verified_at: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DomainResponse {
     pub platform_domain: String,
+    pub tee_domain: Option<String>,
     pub custom_domain: Option<String>,
-    pub dns_instructions: Option<String>,
 }
 
 // --- Rollback ---

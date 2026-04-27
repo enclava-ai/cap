@@ -57,6 +57,9 @@ pub enum Command {
     Rollback(app::RollbackArgs),
     /// Destroy an app with confirmation
     Destroy(app::DestroyArgs),
+    /// Manage the per-app cosign Fulcio signer identity
+    #[command(subcommand)]
+    Signer(app::SignerCommand),
     /// Manage subscription tier and payments
     #[command(subcommand)]
     Tier(tier::TierCommand),
@@ -83,6 +86,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::AutoUnlock(cmd) => ownership::auto_unlock(cmd).await,
         Command::Rollback(args) => app::rollback(args).await,
         Command::Destroy(args) => app::destroy(args).await,
+        Command::Signer(cmd) => app::signer(cmd).await,
         Command::Tier(cmd) => tier::run(cmd).await,
         Command::Org(cmd) => org::run(cmd).await,
     }

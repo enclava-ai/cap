@@ -22,6 +22,9 @@ pub struct AppState {
     pub btcpay_api_key: String,
     /// Platform domain suffix (e.g., "enclava.dev").
     pub platform_domain: String,
+    /// TEE domain suffix (e.g., "tee.enclava.dev"). Per D1 the TEE-facing
+    /// hostname is `<app>.<orgSlug>.<tee_domain_suffix>`.
+    pub tee_domain_suffix: String,
     /// HTTP client for outbound requests.
     pub http_client: reqwest::Client,
     /// HTTP client for tenant TEE endpoints. Test environments may use staging

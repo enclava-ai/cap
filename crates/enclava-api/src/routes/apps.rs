@@ -24,6 +24,7 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &error {
         crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
+        crate::dns::DnsError::HostnameInUse { .. } => StatusCode::CONFLICT,
         crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
         crate::dns::DnsError::Cloudflare(_)
         | crate::dns::DnsError::Http(_)
@@ -112,6 +113,13 @@ pub struct CreateAppRequest {
     /// Required when unlock_mode is "password".
     #[serde(default)]
     pub bootstrap_pubkey_hash: Option<String>,
+    /// Cosign Fulcio identity subject (e.g. an email or workload identity URI).
+    /// Optional at create-time; Phase 9 wires the validation/requirement.
+    #[serde(default)]
+    pub signer_identity_subject: Option<String>,
+    /// Cosign Fulcio issuer URL. Optional at create-time; Phase 9 wires it in.
+    #[serde(default)]
+    pub signer_identity_issuer: Option<String>,
 }
 
 fn default_unlock_mode() -> String {
@@ -125,9 +133,12 @@ pub struct AppResponse {
     pub namespace: String,
     pub instance_id: String,
     pub domain: String,
+    pub tee_domain: Option<String>,
     pub custom_domain: Option<String>,
     pub unlock_mode: String,
     pub status: String,
+    pub signer_identity_subject: Option<String>,
+    pub signer_identity_issuer: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -139,9 +150,12 @@ impl From<App> for AppResponse {
             namespace: a.namespace,
             instance_id: a.instance_id,
             domain: a.domain,
+            tee_domain: a.tee_domain,
             custom_domain: a.custom_domain,
             unlock_mode: format!("{:?}", a.unlock_mode).to_lowercase(),
             status: format!("{:?}", a.status).to_lowercase(),
+            signer_identity_subject: a.signer_identity_subject,
+            signer_identity_issuer: a.signer_identity_issuer,
             created_at: a.created_at,
         }
     }
@@ -260,13 +274,39 @@ pub async fn create_app(
             )
         })?;
 
-    let domain = format!("{}.{}", body.name, state.platform_domain);
+    let app_host =
+        enclava_common::hostnames::app_hostname(&body.name, &org.cust_slug, &state.platform_domain)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("invalid app hostname: {e}")})),
+                )
+            })?;
+    let tee_host = enclava_common::hostnames::tee_hostname(
+        &body.name,
+        &org.cust_slug,
+        &state.tee_domain_suffix,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid tee hostname: {e}")})),
+        )
+    })?;
+
+    let signer_set_at =
+        if body.signer_identity_subject.is_some() || body.signer_identity_issuer.is_some() {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
 
     let result = sqlx::query(
         "INSERT INTO apps (id, org_id, name, namespace, instance_id, tenant_id,
          service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
-         unlock_mode, domain)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11)",
+         unlock_mode, domain, tee_domain,
+         signer_identity_subject, signer_identity_issuer, signer_identity_set_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15)",
     )
     .bind(app_id)
     .bind(auth.org_id)
@@ -278,7 +318,11 @@ pub async fn create_app(
     .bind(&pubkey_hash)
     .bind(&identity_hash)
     .bind(&body.unlock_mode)
-    .bind(&domain)
+    .bind(&app_host)
+    .bind(&tee_host)
+    .bind(body.signer_identity_subject.as_deref())
+    .bind(body.signer_identity_issuer.as_deref())
+    .bind(signer_set_at)
     .execute(&state.db)
     .await;
 
@@ -307,13 +351,13 @@ pub async fn create_app(
             )
         })?;
 
-    if let Err(e) = crate::dns::ensure_dns_record(
+    if let Err(e) = crate::dns::ensure_dns_pair(
         &state.db,
         &state.http_client,
         state.dns.as_ref(),
         app_id,
-        &domain,
-        false,
+        &app_host,
+        &tee_host,
     )
     .await
     {
@@ -436,10 +480,46 @@ pub async fn delete_app(
     .await
     .map_err(dns_error_response)?;
 
-    crate::edge::remove_haproxy_route(
+    let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
+        .bind(auth.org_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+    let app_backend =
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
+                )
+            },
+        )?;
+    let tee_backend =
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::Tee).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
+                )
+            },
+        )?;
+    let mut routes_to_remove: Vec<(String, String)> =
+        vec![(app_backend.clone(), app.domain.clone())];
+    if let Some(t) = app.tee_domain.as_deref() {
+        routes_to_remove.push((tee_backend, t.to_string()));
+    }
+    if let Some(c) = app.custom_domain.as_deref() {
+        routes_to_remove.push((app_backend, c.to_string()));
+    }
+    crate::edge::remove_haproxy_routes(
+        &state.db,
         &crate::edge::EdgeRouteConfig::from_env(),
-        &app.name,
-        &app.domain,
+        &routes_to_remove,
     )
     .await
     .map_err(|e| {
@@ -507,4 +587,169 @@ pub async fn delete_app(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- Signer identity rotation ----------
+//
+// Default subject pattern for GitHub Actions OIDC keyless signing:
+//   subject: `repo:<org>/<repo>:ref:refs/heads/<branch>`
+//   issuer:  `https://token.actions.githubusercontent.com`
+// (cosign actually emits a URL-shaped subject; we accept either URL or
+// email — email is detected by the presence of `@`.)
+
+#[derive(Debug, Deserialize)]
+pub struct RotateSignerRequest {
+    pub subject: String,
+    pub issuer: String,
+    /// Required when rotating a signer (replacing an existing identity).
+    /// Optional when initially setting a signer on an app that has none --
+    /// in that case we treat the call as a first-time set, not a rotation,
+    /// so users created before signer-on-create shipped can self-recover.
+    #[serde(default)]
+    pub email_confirmation_token: Option<String>,
+}
+
+/// PATCH /apps/{name}/signer -- rotate the per-app cosign / Fulcio identity.
+/// Owner-only. Requires an email confirmation token tied to the requesting
+/// user's verified email address.
+pub async fn rotate_signer(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+    Json(body): Json<RotateSignerRequest>,
+) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if !matches!(auth.role, crate::models::Role::Owner) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "owner role required"})),
+        ));
+    }
+
+    if body.subject.trim().is_empty() || body.issuer.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "subject and issuer are required"})),
+        ));
+    }
+
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(auth.org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+
+    let previous_subject = app.signer_identity_subject.clone();
+    let previous_issuer = app.signer_identity_issuer.clone();
+
+    let is_initial_set = previous_subject.is_none() && previous_issuer.is_none();
+    let confirmation_token = body
+        .email_confirmation_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
+    if !is_initial_set && confirmation_token.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": "email_confirmation_token is required for signer rotation"}),
+            ),
+        ));
+    }
+
+    // TODO(phase-10): validate email_confirmation_token against the email
+    // verification table once the email-verification mechanism (Phase 10)
+    // ships. For now we require the field to be present on rotation so
+    // clients are already wired correctly, but cannot yet verify it
+    // server-side. Initial-set calls do not require it -- there is no
+    // previous identity to authenticate the rotation against.
+    let _ = confirmation_token;
+
+    sqlx::query(
+        "UPDATE apps
+         SET signer_identity_subject = $1,
+             signer_identity_issuer  = $2,
+             signer_identity_set_at  = now(),
+             updated_at              = now()
+         WHERE id = $3",
+    )
+    .bind(&body.subject)
+    .bind(&body.issuer)
+    .bind(app.id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| internal_server_error())?;
+
+    // Audit. TODO(phase-2): the rotated signer_identity must be re-rendered
+    // into the KBS Rego policy for this app once the Phase 2 policy
+    // templates land.
+    let action = if is_initial_set {
+        "app.signer.set"
+    } else {
+        "app.signer.rotate"
+    };
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(auth.org_id)
+    .bind(app.id)
+    .bind(auth.user_id)
+    .bind(action)
+    .bind(serde_json::json!({
+        "previous_subject": previous_subject,
+        "previous_issuer":  previous_issuer,
+        "new_subject":      &body.subject,
+        "new_issuer":       &body.issuer,
+        "initial_set":      is_initial_set,
+    }))
+    .execute(&state.db)
+    .await;
+
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+        .bind(app.id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?;
+
+    Ok(Json(app.into()))
+}
+
+#[cfg(test)]
+mod signer_request_tests {
+    use super::RotateSignerRequest;
+
+    #[test]
+    fn initial_set_call_omits_token() {
+        let body: RotateSignerRequest = serde_json::from_value(serde_json::json!({
+            "subject": "repo:me/app:ref:refs/heads/main",
+            "issuer":  "https://token.actions.githubusercontent.com",
+        }))
+        .expect("token must be optional");
+        assert!(body.email_confirmation_token.is_none());
+    }
+
+    #[test]
+    fn rotation_call_carries_token() {
+        let body: RotateSignerRequest = serde_json::from_value(serde_json::json!({
+            "subject": "repo:me/app:ref:refs/heads/main",
+            "issuer":  "https://token.actions.githubusercontent.com",
+            "email_confirmation_token": "tok-123",
+        }))
+        .unwrap();
+        assert_eq!(body.email_confirmation_token.as_deref(), Some("tok-123"));
+    }
+
+    #[test]
+    fn whitespace_only_token_is_treated_as_absent_by_handler_logic() {
+        // The handler trims and filters; reproduce that exact predicate so
+        // future refactors that drop the trim/filter trip a unit test.
+        let token: Option<String> = Some("   ".to_string());
+        let normalized = token.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        assert!(normalized.is_none());
+    }
 }

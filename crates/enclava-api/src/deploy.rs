@@ -35,6 +35,8 @@ pub enum DeployError {
     MissingAttestationConfig,
     #[error("Kubernetes apply error: {0}")]
     Apply(#[from] enclava_engine::apply::engine::ApplyError),
+    #[error("app is not deployed: {0}")]
+    NotDeployed(String),
     #[error("KBS policy error: {0}")]
     KbsPolicy(#[from] crate::kbs::KbsPolicyError),
     #[error("edge route error: {0}")]
@@ -130,6 +132,7 @@ pub async fn build_confidential_app(
         unlock_mode,
         domain: DomainSpec {
             platform_domain: app.domain.clone(),
+            tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
             custom_domain: app.custom_domain.clone(),
         },
         api_signing_pubkey: api_signing_pubkey.to_string(),
@@ -205,6 +208,104 @@ pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result
     Ok(())
 }
 
+/// Re-render and SSA-apply only the tenant-ingress ConfigMap for an app.
+///
+/// Used when domain-only state changes (e.g. a custom-domain verification)
+/// must reach the running pod's Caddyfile without a full redeploy. Caddy
+/// inside the pod runs `caddy run` with no live config-watch sidecar, so this
+/// function applies the new Caddyfile, triggers a StatefulSet rollout restart,
+/// and waits for the replacement pod to become ready before returning.
+///
+/// Returns `DeployError::NotDeployed` when the app has no live StatefulSet yet.
+pub async fn reapply_tenant_ingress(
+    pool: &PgPool,
+    app: &App,
+    attestation_config: Option<&AttestationConfig>,
+    api_signing_pubkey: &str,
+    api_url: &str,
+) -> Result<(), DeployError> {
+    let Some(attestation_config) = attestation_config else {
+        return Err(DeployError::MissingAttestationConfig);
+    };
+
+    let app_spec =
+        build_confidential_app(pool, app, attestation_config, api_signing_pubkey, api_url).await?;
+    enclava_engine::validate::validate_app(&app_spec)
+        .map_err(|e| DeployError::Validation(e.to_string()))?;
+
+    let cm = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
+
+    let engine = ApplyEngine::try_default().await?;
+    ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
+    enclava_engine::apply::resources::apply_namespaced_resource(&engine, &app_spec.namespace, &cm)
+        .await?;
+    restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name).await?;
+
+    let status = watch_rollout(&engine, &app_spec.namespace, &app_spec.name).await?;
+    if status.phase != DeployPhase::Running {
+        return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
+            status
+                .message
+                .unwrap_or_else(|| format!("tenant ingress rollout ended in {:?}", status.phase)),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+async fn ensure_statefulset_exists(
+    engine: &ApplyEngine,
+    namespace: &str,
+    name: &str,
+) -> Result<(), DeployError> {
+    use k8s_openapi::api::apps::v1::StatefulSet;
+    use kube::Api;
+
+    let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
+    match api.get(name).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Err(DeployError::NotDeployed(format!(
+            "StatefulSet {namespace}/{name} not found"
+        ))),
+        Err(e) => Err(enclava_engine::apply::engine::ApplyError::Kube(e).into()),
+    }
+}
+
+async fn restart_statefulset_for_ingress(
+    engine: &ApplyEngine,
+    namespace: &str,
+    name: &str,
+) -> Result<(), DeployError> {
+    use k8s_openapi::api::apps::v1::StatefulSet;
+    use kube::Api;
+    use kube::api::{Patch, PatchParams};
+
+    let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
+    let patch = serde_json::json!({
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "cap.enclava.dev/tenant-ingress-restarted-at": chrono::Utc::now().to_rfc3339(),
+                    }
+                }
+            }
+        }
+    });
+    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(enclava_engine::apply::engine::ApplyError::Kube)?;
+
+    tracing::info!(
+        namespace = %namespace,
+        statefulset = %name,
+        "triggered tenant ingress rollout restart"
+    );
+
+    Ok(())
+}
+
 /// Apply manifests before returning the deploy response, then continue rollout
 /// monitoring in the background so CLI/API calls are not held for TEE boot.
 pub async fn apply_deployment_manifests(
@@ -241,7 +342,32 @@ pub async fn apply_deployment_manifests(
     let engine = ApplyEngine::try_default().await?;
     apply_all(&engine, &manifests).await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
-    crate::edge::ensure_haproxy_route(&edge_config, &app_spec).await?;
+    let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .fetch_one(&pool)
+        .await?;
+    let app_target =
+        crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 443).await?;
+    let tee_target =
+        crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 8081).await?;
+    let app_backend =
+        crate::edge::backend_name_for(&org_slug, &app_spec.name, crate::edge::BackendTag::App)?;
+    let tee_backend =
+        crate::edge::backend_name_for(&org_slug, &app_spec.name, crate::edge::BackendTag::Tee)?;
+    let mut routes = vec![
+        crate::edge::SniRoute::new(&app_spec.domain.platform_domain, &app_backend, &app_target)?,
+        crate::edge::SniRoute::new(&app_spec.domain.tee_domain, &tee_backend, &tee_target)?,
+    ];
+    if let Some(custom) = app_spec.domain.custom_domain.as_deref()
+        && !custom.is_empty()
+    {
+        routes.push(crate::edge::SniRoute::new(
+            custom,
+            &app_backend,
+            &app_target,
+        )?);
+    }
+    crate::edge::ensure_haproxy_routes(&pool, &edge_config, &routes).await?;
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
 
     tokio::spawn(async move {

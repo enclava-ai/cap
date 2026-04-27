@@ -304,33 +304,63 @@ pub async fn btcpay_webhook(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    // Verify BTCPay HMAC signature (BILL-02)
+    // Verify BTCPay HMAC signature (BILL-02 / Phase 0 item G).
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
+
+    if state.btcpay_webhook_secret.is_empty() {
+        // Defence in depth: env_gates already refuses to start with an empty
+        // secret, but bail early here in case state is built directly (tests).
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     let sig_header = headers
         .get("BTCPay-Sig")
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let expected_sig = sig_header
+    let expected_sig_hex = sig_header
         .strip_prefix("sha256=")
         .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let expected_sig = hex::decode(expected_sig_hex).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     let mut mac = HmacSha256::new_from_slice(state.btcpay_webhook_secret.as_bytes())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     mac.update(&body);
-
-    let computed = hex::encode(mac.finalize().into_bytes());
-    if computed != expected_sig {
+    // Constant-time MAC compare via the underlying CtOutput.
+    if mac.verify_slice(&expected_sig).is_err() {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     // Parse the verified payload
     let payload: crate::billing::btcpay::WebhookPayload =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Replay protection: reject duplicates by event_id (which BTCPay
+    // increments per delivery). delivery_id, when present, is recorded for
+    // operator forensics.
+    let delivery_id = headers
+        .get("BTCPay-Delivery")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let event_id = format!("{}:{}", payload.invoice_id, payload.event_type);
+    let inserted = sqlx::query(
+        "INSERT INTO processed_webhooks (delivery_id, event_id) VALUES ($1, $2)
+         ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(&delivery_id)
+    .bind(&event_id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if inserted.rows_affected() == 0 {
+        tracing::info!(event_id = %event_id, "btcpay webhook replay ignored");
+        return Ok(StatusCode::OK);
+    }
 
     if payload.event_type == "InvoiceSettled" || payload.event_type == "InvoicePaymentSettled" {
         // Mark payment as confirmed

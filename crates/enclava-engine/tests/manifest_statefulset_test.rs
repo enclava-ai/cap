@@ -58,6 +58,14 @@ fn statefulset_service_account() {
 }
 
 #[test]
+fn statefulset_pod_spec_disables_automount() {
+    let app = sample_app();
+    let sts = generate_statefulset(&app);
+    let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    assert_eq!(pod_spec.automount_service_account_token, Some(false));
+}
+
+#[test]
 fn statefulset_has_kata_runtime_annotation() {
     let app = sample_app();
     let sts = generate_statefulset(&app);

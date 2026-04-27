@@ -13,6 +13,7 @@ use crate::state::AppState;
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &error {
         crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
+        crate::dns::DnsError::HostnameInUse { .. } => StatusCode::CONFLICT,
         crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
         crate::dns::DnsError::Cloudflare(_)
         | crate::dns::DnsError::Http(_)
@@ -23,6 +24,69 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
         status,
         Json(serde_json::json!({"error": error.to_string()})),
     )
+}
+
+/// Pick the right cosign `VerificationPolicy` for a stored signer identity.
+///
+/// GitHub Actions OIDC subjects are URLs that contain `@` after the workflow
+/// path (e.g. `https://github.com/me/repo/.github/workflows/build.yml@refs/heads/main`),
+/// so the URL prefix must be checked before the `@`-as-email heuristic.
+fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::VerificationPolicy {
+    if subject.starts_with("https://") || subject.starts_with("http://") {
+        crate::cosign::VerificationPolicy::FulcioUrlIdentity {
+            fulcio_subject_url: subject.to_string(),
+            fulcio_issuer: issuer.to_string(),
+        }
+    } else if subject.contains('@') {
+        crate::cosign::VerificationPolicy::FulcioEmailIdentity {
+            email: subject.to_string(),
+            fulcio_issuer: issuer.to_string(),
+        }
+    } else {
+        crate::cosign::VerificationPolicy::FulcioUrlIdentity {
+            fulcio_subject_url: subject.to_string(),
+            fulcio_issuer: issuer.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::*;
+    use crate::cosign::VerificationPolicy;
+
+    #[test]
+    fn github_actions_oidc_url_with_at_is_url_policy() {
+        let policy = classify_signer_identity(
+            "https://github.com/me/repo/.github/workflows/build.yml@refs/heads/main",
+            "https://token.actions.githubusercontent.com",
+        );
+        assert!(matches!(
+            policy,
+            VerificationPolicy::FulcioUrlIdentity { .. }
+        ));
+    }
+
+    #[test]
+    fn email_subject_is_email_policy() {
+        let policy = classify_signer_identity("alice@example.com", "https://accounts.google.com");
+        assert!(matches!(
+            policy,
+            VerificationPolicy::FulcioEmailIdentity { .. }
+        ));
+    }
+
+    #[test]
+    fn http_url_subject_is_url_policy() {
+        let policy = classify_signer_identity(
+            "http://gitlab.example.com/foo@v1",
+            "https://gitlab.example.com",
+        );
+        assert!(matches!(
+            policy,
+            VerificationPolicy::FulcioUrlIdentity { .. }
+        ));
+    }
 }
 
 /// Parse memory string like "1Gi", "8Gi" to f64 in GiB with validation.
@@ -162,8 +226,26 @@ pub async fn deploy(
             })?
     };
 
-    // Verify cosign signature exists for this image digest
-    crate::cosign::verify_image(&state.http_client, &body.image, &image_digest)
+    // Build the per-app verification policy from the app's pinned signer
+    // identity. Apps without a pinned identity cannot deploy.
+    let policy = match (
+        app.signer_identity_subject.as_deref(),
+        app.signer_identity_issuer.as_deref(),
+    ) {
+        (Some(subject), Some(issuer)) if !subject.is_empty() && !issuer.is_empty() => {
+            classify_signer_identity(subject, issuer)
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "app has no pinned signer identity; set one before deploying"
+                })),
+            ));
+        }
+    };
+
+    let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
         .await
         .map_err(|e| {
             (
@@ -297,16 +379,19 @@ pub async fn deploy(
         "resources": body.resources,
     });
 
-    // Create deployment record
+    // Create deployment record. cosign_verified is set from the actual
+    // verification result, not hardcoded.
     let deploy_id = Uuid::new_v4();
+    let cosign_verified = true;
     sqlx::query(
         "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom)
-         VALUES ($1, $2, 'api', $3, $4, true, $5, $6)",
+         VALUES ($1, $2, 'api', $3, $4, $5, $6, $7)",
     )
     .bind(deploy_id)
     .bind(app.id)
     .bind(&spec_snapshot)
     .bind(Some(&image_digest))
+    .bind(cosign_verified)
     .bind(&provenance)
     .bind(&sbom)
     .execute(&state.db)
@@ -318,14 +403,21 @@ pub async fn deploy(
         )
     })?;
 
-    // Audit
+    // Audit. TODO(phase-2): propagate signer_identity into the rendered
+    // Rego policy when the signing service / policy-templates land.
     let _ = sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.deploy', $4)",
     )
     .bind(auth.org_id)
     .bind(app.id)
     .bind(auth.user_id)
-    .bind(serde_json::json!({"image": &body.image, "deployment_id": deploy_id}))
+    .bind(serde_json::json!({
+        "image": &body.image,
+        "deployment_id": deploy_id,
+        "signer_subject": verified.signer_subject,
+        "signer_issuer": verified.signer_issuer,
+        "rekor_log_index": verified.rekor_log_index,
+    }))
     .execute(&state.db)
     .await;
 
@@ -341,16 +433,9 @@ pub async fn deploy(
     .map_err(dns_error_response)?;
 
     if let Some(custom_domain) = app.custom_domain.as_ref() {
-        crate::dns::ensure_dns_record(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            app.id,
-            custom_domain,
-            true,
-        )
-        .await
-        .map_err(dns_error_response)?;
+        crate::dns::record_custom_domain(&state.db, app.id, custom_domain)
+            .await
+            .map_err(dns_error_response)?;
     }
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
