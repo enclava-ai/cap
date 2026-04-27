@@ -19,10 +19,19 @@ const DEBUG_ONLY_FLAGS: &[&str] = &[
     "ENCLAVA_TEE_ACCEPT_INVALID_CERTS",
 ];
 
-const ALWAYS_REQUIRED: &[&str] = &["BTCPAY_WEBHOOK_SECRET", "KBS_RESOURCE_WRITER_TOKEN"];
+const ALWAYS_REQUIRED: &[&str] = &["BTCPAY_WEBHOOK_SECRET"];
+
+// Mirrors the precedence in `kbs::config_from_env`: REQUIRED implies enabled.
+const KBS_TOGGLES: &[&str] = &["KBS_POLICY_MANAGEMENT_ENABLED", "KBS_POLICY_MANAGEMENT_REQUIRED"];
 
 fn flag_is_truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES")
+}
+
+fn kbs_management_enabled(lookup: &impl Fn(&str) -> Option<String>) -> bool {
+    KBS_TOGGLES
+        .iter()
+        .any(|name| lookup(name).is_some_and(|v| flag_is_truthy(&v)))
 }
 
 fn debug_assertions_on() -> bool {
@@ -62,6 +71,13 @@ fn enforce_with(
         }
     }
 
+    if kbs_management_enabled(&lookup) {
+        match lookup("KBS_RESOURCE_WRITER_TOKEN") {
+            Some(value) if !value.trim().is_empty() => {}
+            _ => return Err(EnvGateError::MissingRequired("KBS_RESOURCE_WRITER_TOKEN")),
+        }
+    }
+
     Ok(())
 }
 
@@ -73,6 +89,12 @@ mod tests {
     fn ok_required() -> HashMap<&'static str, &'static str> {
         let mut m = HashMap::new();
         m.insert("BTCPAY_WEBHOOK_SECRET", "secret");
+        m
+    }
+
+    fn ok_required_with_kbs() -> HashMap<&'static str, &'static str> {
+        let mut m = ok_required();
+        m.insert("KBS_POLICY_MANAGEMENT_ENABLED", "1");
         m.insert("KBS_RESOURCE_WRITER_TOKEN", "token");
         m
     }
@@ -121,8 +143,7 @@ mod tests {
 
     #[test]
     fn missing_btcpay_secret_rejected_in_debug() {
-        let mut env = HashMap::new();
-        env.insert("KBS_RESOURCE_WRITER_TOKEN", "token");
+        let env = HashMap::new();
         assert!(matches!(
             run(env, true).unwrap_err(),
             EnvGateError::MissingRequired("BTCPAY_WEBHOOK_SECRET")
@@ -130,14 +151,53 @@ mod tests {
     }
 
     #[test]
-    fn empty_kbs_writer_token_rejected() {
-        let mut env = HashMap::new();
-        env.insert("BTCPAY_WEBHOOK_SECRET", "secret");
+    fn kbs_writer_token_not_required_when_management_disabled() {
+        let env = ok_required();
+        run(env, false).expect("kbs token is irrelevant when management is off");
+    }
+
+    #[test]
+    fn kbs_writer_token_required_when_management_enabled() {
+        let mut env = ok_required();
+        env.insert("KBS_POLICY_MANAGEMENT_ENABLED", "true");
+        assert!(matches!(
+            run(env, false).unwrap_err(),
+            EnvGateError::MissingRequired("KBS_RESOURCE_WRITER_TOKEN")
+        ));
+    }
+
+    #[test]
+    fn kbs_writer_token_required_when_management_required() {
+        let mut env = ok_required();
+        env.insert("KBS_POLICY_MANAGEMENT_REQUIRED", "1");
+        assert!(matches!(
+            run(env, false).unwrap_err(),
+            EnvGateError::MissingRequired("KBS_RESOURCE_WRITER_TOKEN")
+        ));
+    }
+
+    #[test]
+    fn empty_kbs_writer_token_rejected_when_enabled() {
+        let mut env = ok_required();
+        env.insert("KBS_POLICY_MANAGEMENT_ENABLED", "1");
         env.insert("KBS_RESOURCE_WRITER_TOKEN", "   ");
         assert!(matches!(
             run(env, false).unwrap_err(),
             EnvGateError::MissingRequired("KBS_RESOURCE_WRITER_TOKEN")
         ));
+    }
+
+    #[test]
+    fn kbs_writer_token_accepted_when_enabled() {
+        let env = ok_required_with_kbs();
+        run(env, false).expect("kbs token present should pass");
+    }
+
+    #[test]
+    fn falsy_kbs_management_toggle_does_not_require_token() {
+        let mut env = ok_required();
+        env.insert("KBS_POLICY_MANAGEMENT_ENABLED", "0");
+        run(env, false).expect("falsy toggle should not require kbs token");
     }
 
     #[test]
