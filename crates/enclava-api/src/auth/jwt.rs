@@ -168,10 +168,11 @@ pub fn verify_config_token(
     let validation = config_validator();
     let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifying_key.to_bytes());
     let key = DecodingKey::from_ed_components(&x).map_err(JwtError::Encode)?;
-    let data = decode::<ConfigTokenClaims>(token, &key, &validation).map_err(|e| match e.kind() {
-        jsonwebtoken::errors::ErrorKind::ExpiredSignature => JwtError::Expired,
-        _ => JwtError::Invalid,
-    })?;
+    let data =
+        decode::<ConfigTokenClaims>(token, &key, &validation).map_err(|e| match e.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => JwtError::Expired,
+            _ => JwtError::Invalid,
+        })?;
 
     if data.claims.typ != CONFIG_TYP {
         return Err(JwtError::Invalid);

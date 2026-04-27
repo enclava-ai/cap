@@ -203,8 +203,8 @@ async fn main() {
     let btcpay_webhook_secret = std::env::var("BTCPAY_WEBHOOK_SECRET").unwrap_or_default();
     let platform_domain =
         std::env::var("PLATFORM_DOMAIN").unwrap_or_else(|_| "enclava.dev".to_string());
-    let tee_domain_suffix = std::env::var("TEE_DOMAIN_SUFFIX")
-        .unwrap_or_else(|_| format!("tee.{}", platform_domain));
+    let tee_domain_suffix =
+        std::env::var("TEE_DOMAIN_SUFFIX").unwrap_or_else(|_| format!("tee.{}", platform_domain));
 
     let pool = enclava_api::db::pool::create_pool(&database_url)
         .await

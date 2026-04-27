@@ -39,7 +39,9 @@ impl TrustedProxyMatcher {
                 continue;
             }
             if let Some((addr, bits)) = entry.split_once('/') {
-                if let (Ok(ip), Ok(bits)) = (addr.trim().parse::<IpAddr>(), bits.trim().parse::<u8>()) {
+                if let (Ok(ip), Ok(bits)) =
+                    (addr.trim().parse::<IpAddr>(), bits.trim().parse::<u8>())
+                {
                     cidrs.push((ip, bits));
                     continue;
                 }
@@ -138,7 +140,8 @@ impl KeyExtractor for TrustedProxyKeyExtractor {
     type Key = IpAddr;
 
     fn extract<B>(&self, req: &Request<B>) -> Result<Self::Key, GovernorError> {
-        self.extract_ip(req).ok_or(GovernorError::UnableToExtractKey)
+        self.extract_ip(req)
+            .ok_or(GovernorError::UnableToExtractKey)
     }
 }
 
@@ -202,8 +205,7 @@ mod tests {
 
     #[test]
     fn single_address_trusted_entry() {
-        let extractor =
-            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.0.0.5"));
+        let extractor = TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.0.0.5"));
         assert!(extractor.trusted.is_trusted("10.0.0.5".parse().unwrap()));
         assert!(!extractor.trusted.is_trusted("10.0.0.6".parse().unwrap()));
     }

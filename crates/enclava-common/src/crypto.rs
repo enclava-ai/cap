@@ -19,7 +19,10 @@ pub fn compute_identity_hash(
         ("purpose", b"enclava-identity-v1"),
         ("tenant_id", tenant_id.as_bytes()),
         ("instance_id", instance_id.as_bytes()),
-        ("bootstrap_owner_pubkey", bootstrap_owner_pubkey_hash.as_bytes()),
+        (
+            "bootstrap_owner_pubkey",
+            bootstrap_owner_pubkey_hash.as_bytes(),
+        ),
     ]);
     hex::encode(hash)
 }

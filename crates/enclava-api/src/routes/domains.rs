@@ -8,8 +8,9 @@
 //! 2. `POST /apps/{name}/domains/{domain}/verify` — caller asks us to
 //!    verify the proof. We resolve the TXT record (via `hickory-resolver`
 //!    so the operator-side cache cannot lie to us), match the live TXT
-//!    against the stored token in constant time, and only on success
-//!    create the A/AAAA records and update the app row.
+//!    against the stored token in constant time, and only on success track the
+//!    user-owned hostname, regenerate tenant ingress, publish HAProxy routing,
+//!    and update the app row.
 //! 3. `DELETE /apps/{name}/domains/{domain}` — remove a custom domain.
 
 use axum::{
@@ -36,12 +37,16 @@ const CHALLENGE_PREFIX: &str = "_enclava-challenge.";
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &error {
         crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
+        crate::dns::DnsError::HostnameInUse { .. } => StatusCode::CONFLICT,
         crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
         crate::dns::DnsError::Cloudflare(_)
         | crate::dns::DnsError::Http(_)
         | crate::dns::DnsError::Db(_) => StatusCode::BAD_GATEWAY,
     };
-    (status, Json(serde_json::json!({"error": error.to_string()})))
+    (
+        status,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
 }
 
 fn internal_error() -> (StatusCode, Json<serde_json::Value>) {
@@ -70,8 +75,9 @@ pub enum DomainError {
 impl DomainError {
     fn status(&self) -> StatusCode {
         match self {
-            DomainError::InvalidDomain(_)
-            | DomainError::InsidePlatformZone(_) => StatusCode::BAD_REQUEST,
+            DomainError::InvalidDomain(_) | DomainError::InsidePlatformZone(_) => {
+                StatusCode::BAD_REQUEST
+            }
             DomainError::NoChallenge | DomainError::Expired => StatusCode::CONFLICT,
             DomainError::MismatchedToken(_) => StatusCode::PRECONDITION_FAILED,
             DomainError::Lookup(_) => StatusCode::BAD_GATEWAY,
@@ -140,8 +146,17 @@ pub async fn create_challenge(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    let domain = validate_custom_domain(&body.domain, &state.platform_domain, &state.tee_domain_suffix)
-        .map_err(|e| (e.status(), Json(serde_json::json!({"error": e.to_string()}))))?;
+    let domain = validate_custom_domain(
+        &body.domain,
+        &state.platform_domain,
+        &state.tee_domain_suffix,
+    )
+    .map_err(|e| {
+        (
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
 
     let token = mint_challenge_token();
     let expires_at = Utc::now() + Duration::hours(CHALLENGE_LIFETIME_HOURS);
@@ -195,30 +210,46 @@ pub async fn verify_challenge(
         ))?;
 
     let domain = validate_custom_domain(&domain, &state.platform_domain, &state.tee_domain_suffix)
-        .map_err(|e| (e.status(), Json(serde_json::json!({"error": e.to_string()}))))?;
+        .map_err(|e| {
+            (
+                e.status(),
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
 
-    type ChallengeRow = (Uuid, String, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>);
+    type ChallengeRow = (
+        Uuid,
+        String,
+        chrono::DateTime<Utc>,
+        Option<chrono::DateTime<Utc>>,
+    );
     let row: Option<ChallengeRow> = sqlx::query_as(
-            "SELECT id, challenge_token, expires_at, verified_at
+        "SELECT id, challenge_token, expires_at, verified_at
              FROM custom_domain_challenges
              WHERE app_id = $1 AND domain = $2
              ORDER BY created_at DESC
              LIMIT 1",
-        )
-        .bind(app.id)
-        .bind(&domain)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|_| internal_error())?;
+    )
+    .bind(app.id)
+    .bind(&domain)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| internal_error())?;
 
     let (challenge_id, token, expires_at, _) = row.ok_or_else(|| {
         let e = DomainError::NoChallenge;
-        (e.status(), Json(serde_json::json!({"error": e.to_string()})))
+        (
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
     })?;
 
     if Utc::now() > expires_at {
         let e = DomainError::Expired;
-        return Err((e.status(), Json(serde_json::json!({"error": e.to_string()}))));
+        return Err((
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
     }
 
     let txt_name = format!("{}{}", CHALLENGE_PREFIX, domain);
@@ -226,7 +257,10 @@ pub async fn verify_challenge(
 
     let live = lookup_txt(&txt_name).await.map_err(|e| {
         let de = DomainError::Lookup(e.to_string());
-        (de.status(), Json(serde_json::json!({"error": de.to_string()})))
+        (
+            de.status(),
+            Json(serde_json::json!({"error": de.to_string()})),
+        )
     })?;
 
     let mut matched = false;
@@ -238,18 +272,19 @@ pub async fn verify_challenge(
     }
     if !matched {
         let e = DomainError::MismatchedToken(txt_name);
-        return Err((e.status(), Json(serde_json::json!({"error": e.to_string()}))));
+        return Err((
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
     }
 
     let verified_at = Utc::now();
-    sqlx::query(
-        "UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2",
-    )
-    .bind(verified_at)
-    .bind(challenge_id)
-    .execute(&state.db)
-    .await
-    .map_err(|_| internal_error())?;
+    sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
+        .bind(verified_at)
+        .bind(challenge_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| internal_error())?;
 
     let previous_custom = app.custom_domain.clone();
 
@@ -261,75 +296,34 @@ pub async fn verify_challenge(
         .await
         .map_err(dns_error_response)?;
 
-    sqlx::query("UPDATE apps SET custom_domain = $1, updated_at = now() WHERE id = $2")
-        .bind(&domain)
-        .bind(app.id)
-        .execute(&state.db)
-        .await
-        .map_err(|_| internal_error())?;
-
-    let org_slug: String = sqlx::query_scalar(
-        "SELECT cust_slug FROM organizations WHERE id = $1",
-    )
-    .bind(auth.org_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| internal_error())?;
-    let app_backend =
-        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App)
-            .map_err(|e| (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
-            ))?;
-    let app_target =
-        crate::edge::resolve_backend_target(&app.name, &app.namespace, 443)
-            .await
-            .map_err(|e| (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("resolve backend: {e}")})),
-            ))?;
-    let route = crate::edge::SniRoute::new(&domain, &app_backend, &app_target).map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": format!("sni route: {e}")})),
-    ))?;
-    let edge_config = crate::edge::EdgeRouteConfig::from_env();
-    crate::edge::ensure_haproxy_routes(&state.db, &edge_config, &[route])
-        .await
-        .map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("haproxy update: {e}")})),
-        ))?;
-
-    // Re-render the tenant-ingress ConfigMap so Caddy serves the new custom
-    // hostname. Caddy in the pod runs `caddy run` (no live config-watch), so
-    // the new Caddyfile takes effect on the next pod restart -- log a warning
-    // for the user. If the app has never been deployed (no namespace yet),
-    // SSA-apply still succeeds (creates the ConfigMap in the existing
-    // namespace) but if the namespace is missing we treat it as a no-op.
+    // Re-render the tenant-ingress ConfigMap before publishing the HAProxy
+    // route. Caddy does not watch its ConfigMap, so reapply_tenant_ingress
+    // also restarts the StatefulSet and waits for the new pod to become ready.
+    // If the app has not been deployed yet, persist the verified custom domain
+    // and let the first deploy publish the route.
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    match crate::deploy::reapply_tenant_ingress(
+    let next_app = App {
+        custom_domain: Some(domain.clone()),
+        ..app.clone()
+    };
+    let ingress_ready = match crate::deploy::reapply_tenant_ingress(
         &state.db,
-        &App { custom_domain: Some(domain.clone()), ..app.clone() },
+        &next_app,
         state.attestation.as_ref(),
         &api_signing_pubkey,
         &state.api_url,
     )
     .await
     {
-        Ok(()) => {
-            tracing::warn!(
-                app_id = %app.id,
-                %domain,
-                "tenant ingress regenerated for new custom domain; redeploy or restart pod for Caddy to pick up the change"
-            );
-        }
-        Err(crate::deploy::DeployError::MissingAttestationConfig)
-        | Err(crate::deploy::DeployError::NoContainers) => {
+        Ok(()) => true,
+        Err(crate::deploy::DeployError::NoContainers)
+        | Err(crate::deploy::DeployError::NotDeployed(_)) => {
             tracing::info!(
                 app_id = %app.id,
                 %domain,
                 "tenant ingress regeneration skipped: app not yet deployed"
             );
+            false
         }
         Err(e) => {
             tracing::error!(
@@ -338,7 +332,60 @@ pub async fn verify_challenge(
                 error = %e,
                 "failed to regenerate tenant ingress for verified custom domain"
             );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("tenant ingress update failed: {e}")})),
+            ));
         }
+    };
+
+    let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
+        .bind(auth.org_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| internal_error())?;
+    let app_backend =
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
+                )
+            },
+        )?;
+    let edge_config = crate::edge::EdgeRouteConfig::from_env();
+
+    sqlx::query("UPDATE apps SET custom_domain = $1, updated_at = now() WHERE id = $2")
+        .bind(&domain)
+        .bind(app.id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| internal_error())?;
+
+    if ingress_ready {
+        let app_target = crate::edge::resolve_backend_target(&app.name, &app.namespace, 443)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("resolve backend: {e}")})),
+                )
+            })?;
+        let route =
+            crate::edge::SniRoute::new(&domain, &app_backend, &app_target).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("sni route: {e}")})),
+                )
+            })?;
+        crate::edge::ensure_haproxy_routes(&state.db, &edge_config, &[route])
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("haproxy update: {e}")})),
+                )
+            })?;
     }
 
     if let Some(old) = previous_custom.as_deref()
@@ -366,7 +413,10 @@ pub async fn verify_challenge(
         }
     }
 
-    Ok(Json(VerifyResponse { domain, verified_at }))
+    Ok(Json(VerifyResponse {
+        domain,
+        verified_at,
+    }))
 }
 
 /// DELETE /apps/{name}/domains/{domain} -- remove the custom domain.
@@ -387,7 +437,12 @@ pub async fn remove_custom_domain(
         ))?;
 
     let domain = validate_custom_domain(&domain, &state.platform_domain, &state.tee_domain_suffix)
-        .map_err(|e| (e.status(), Json(serde_json::json!({"error": e.to_string()}))))?;
+        .map_err(|e| {
+            (
+                e.status(),
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
 
     crate::dns::delete_dns_record(
         &state.db,
@@ -399,19 +454,20 @@ pub async fn remove_custom_domain(
     .await
     .map_err(dns_error_response)?;
 
-    let org_slug: String = sqlx::query_scalar(
-        "SELECT cust_slug FROM organizations WHERE id = $1",
-    )
-    .bind(auth.org_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| internal_error())?;
+    let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
+        .bind(auth.org_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| internal_error())?;
     let app_backend =
-        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App)
-            .map_err(|e| (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
-            ))?;
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
+                )
+            },
+        )?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
     if let Err(e) = crate::edge::remove_haproxy_routes(
         &state.db,
@@ -472,10 +528,7 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
         Ok(r) => r,
         Err(_) => TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()),
     };
-    let response = resolver
-        .txt_lookup(name)
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = resolver.txt_lookup(name).await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for rdata in response.iter() {
         for chunk in rdata.iter() {
@@ -509,17 +562,21 @@ mod tests {
 
     #[test]
     fn accepts_third_party_domain() {
-        let d = validate_custom_domain("app.example.com", "enclava.dev", "tee.enclava.dev").unwrap();
+        let d =
+            validate_custom_domain("app.example.com", "enclava.dev", "tee.enclava.dev").unwrap();
         assert_eq!(d, "app.example.com");
     }
 
     #[test]
     fn rejects_invalid_fqdn() {
         for bad in ["", "a..b.com", "App.Example.com", "xn--bad.com", "a b.com"] {
-            assert!(matches!(
-                validate_custom_domain(bad, "enclava.dev", "tee.enclava.dev"),
-                Err(DomainError::InvalidDomain(_))
-            ), "expected invalid for {bad:?}");
+            assert!(
+                matches!(
+                    validate_custom_domain(bad, "enclava.dev", "tee.enclava.dev"),
+                    Err(DomainError::InvalidDomain(_))
+                ),
+                "expected invalid for {bad:?}"
+            );
         }
     }
 }

@@ -21,7 +21,7 @@
 
 use enclava_api::dns::DnsConfig;
 use enclava_api::edge::{
-    backend_name_for, ensure_haproxy_routes, BackendTag, EdgeRouteConfig, SniRoute,
+    BackendTag, EdgeRouteConfig, SniRoute, backend_name_for, ensure_haproxy_routes,
 };
 use enclava_api::models::App;
 use enclava_engine::types::AttestationConfig;
@@ -45,8 +45,8 @@ async fn main() -> anyhow::Result<()> {
     let database_url = std::env::var("DATABASE_URL")?;
     let platform_domain =
         std::env::var("PLATFORM_DOMAIN").unwrap_or_else(|_| "enclava.dev".to_string());
-    let tee_domain_suffix = std::env::var("TEE_DOMAIN_SUFFIX")
-        .unwrap_or_else(|_| format!("tee.{platform_domain}"));
+    let tee_domain_suffix =
+        std::env::var("TEE_DOMAIN_SUFFIX").unwrap_or_else(|_| format!("tee.{platform_domain}"));
 
     let pool = PgPool::connect(&database_url).await?;
     let http = reqwest::Client::new();
@@ -57,7 +57,9 @@ async fn main() -> anyhow::Result<()> {
     ) {
         (Ok(t), Ok(target)) if !t.is_empty() && !target.is_empty() => Some(DnsConfig {
             cloudflare_api_token: t,
-            cloudflare_zone_id: std::env::var("CLOUDFLARE_ZONE_ID").ok().filter(|v| !v.is_empty()),
+            cloudflare_zone_id: std::env::var("CLOUDFLARE_ZONE_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
             cloudflare_zone_name: std::env::var("CLOUDFLARE_ZONE_NAME")
                 .unwrap_or_else(|_| platform_domain.clone()),
             target,
@@ -118,12 +120,14 @@ async fn main() -> anyhow::Result<()> {
         ensure_haproxy_routes(&pool, &edge, &routes).await?;
 
         // Update DB row to point at the new hostnames.
-        sqlx::query("UPDATE apps SET domain = $1, tee_domain = $2, updated_at = now() WHERE id = $3")
-            .bind(&app_host)
-            .bind(&tee_host)
-            .bind(app.id)
-            .execute(&pool)
-            .await?;
+        sqlx::query(
+            "UPDATE apps SET domain = $1, tee_domain = $2, updated_at = now() WHERE id = $3",
+        )
+        .bind(&app_host)
+        .bind(&tee_host)
+        .bind(app.id)
+        .execute(&pool)
+        .await?;
 
         if app.domain != app_host {
             tracing::info!(old = %app.domain, new = %app_host, "rewrote app.domain");
@@ -133,8 +137,8 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Re-render and SSA-apply the tenant-ingress ConfigMap so Caddy serves
-        // the new hostname pair. Existing pods need a restart for Caddy to
-        // pick up the new Caddyfile (no live config-watch sidecar).
+        // the new hostname pair. The helper also restarts the tenant
+        // StatefulSet and waits for the replacement pod to become ready.
         match attestation.as_ref() {
             Some(att) => {
                 match reapply_one(&pool, app.id, att, &api_signing_pubkey, &api_url).await {
@@ -153,9 +157,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             None => {
-                tracing::warn!(
+                failed += 1;
+                tracing::error!(
                     app = %app.name,
-                    "ATTESTATION_PROXY_IMAGE/CADDY_INGRESS_IMAGE unset; tenant ingress NOT regenerated -- redeploy app manually"
+                    "ATTESTATION_PROXY_IMAGE/CADDY_INGRESS_IMAGE unset; tenant ingress NOT regenerated"
                 );
             }
         }

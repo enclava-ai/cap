@@ -26,4 +26,3 @@ pub fn generate_service_account(app: &ConfidentialApp) -> ServiceAccount {
         ..Default::default()
     }
 }
-

@@ -1,5 +1,7 @@
 use chrono::Utc;
-use enclava_common::validate::{validate_app_name, validate_fqdn, validate_org_slug, ValidateError};
+use enclava_common::validate::{
+    ValidateError, validate_app_name, validate_fqdn, validate_org_slug,
+};
 use k8s_openapi::api::{
     apps::v1::DaemonSet,
     core::v1::{ConfigMap, Service},
@@ -87,7 +89,11 @@ impl SniRoute {
         }
         // Target is constructed from a Service ClusterIP / DNS name + a
         // numeric port; we still strict-validate to keep the contract clear.
-        if target.is_empty() || target.bytes().any(|b| !b.is_ascii() || b.is_ascii_whitespace()) {
+        if target.is_empty()
+            || target
+                .bytes()
+                .any(|b| !b.is_ascii() || b.is_ascii_whitespace())
+        {
             return Err(EdgeRouteError::InvalidAppName(format!(
                 "invalid backend target: {target}"
             )));
@@ -417,27 +423,30 @@ mod tests {
             "host`whoami`",
             "host\nuse_backend evil",
         ] {
-            assert!(SniRoute::new(bad, "be_cap_a_app", "10.0.0.1:443").is_err(), "expected error for {bad}");
+            assert!(
+                SniRoute::new(bad, "be_cap_a_app", "10.0.0.1:443").is_err(),
+                "expected error for {bad}"
+            );
         }
     }
 
     #[test]
     fn sni_route_rejects_injection_in_backend_name() {
-        for bad in [
-            "be cap",
-            "be-cap",
-            "be;evil",
-            "be\nevil",
-            "",
-        ] {
+        for bad in ["be cap", "be-cap", "be;evil", "be\nevil", ""] {
             assert!(SniRoute::new("a.b.c", bad, "10.0.0.1:443").is_err());
         }
     }
 
     #[test]
     fn render_inserts_use_backend_before_default() {
-        let cfg = "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
-        let r = SniRoute::new("test-app.abcd1234.enclava.dev", "be_cap_test_app_app", "10.43.1.2:443").unwrap();
+        let cfg =
+            "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
+        let r = SniRoute::new(
+            "test-app.abcd1234.enclava.dev",
+            "be_cap_test_app_app",
+            "10.43.1.2:443",
+        )
+        .unwrap();
         let rendered = render_route_into(cfg, &r);
         let use_idx = rendered.find("use_backend be_cap_test_app_app").unwrap();
         let def_idx = rendered.find("default_backend be_reject").unwrap();
@@ -448,8 +457,14 @@ mod tests {
 
     #[test]
     fn render_is_idempotent() {
-        let cfg = "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
-        let r = SniRoute::new("test-app.abcd1234.enclava.dev", "be_cap_test_app_app", "10.43.1.2:443").unwrap();
+        let cfg =
+            "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
+        let r = SniRoute::new(
+            "test-app.abcd1234.enclava.dev",
+            "be_cap_test_app_app",
+            "10.43.1.2:443",
+        )
+        .unwrap();
         let once = render_route_into(cfg, &r);
         let twice = render_route_into(&once, &r);
         assert_eq!(once, twice);
@@ -457,14 +472,27 @@ mod tests {
 
     #[test]
     fn render_two_routes_app_and_tee() {
-        let cfg = "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
-        let app = SniRoute::new("api.abcd1234.enclava.dev", "be_cap_api_app", "10.0.0.1:443").unwrap();
-        let tee = SniRoute::new("api.abcd1234.tee.enclava.dev", "be_cap_api_tee", "10.0.0.1:8081").unwrap();
+        let cfg =
+            "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n";
+        let app =
+            SniRoute::new("api.abcd1234.enclava.dev", "be_cap_api_app", "10.0.0.1:443").unwrap();
+        let tee = SniRoute::new(
+            "api.abcd1234.tee.enclava.dev",
+            "be_cap_api_tee",
+            "10.0.0.1:8081",
+        )
+        .unwrap();
         let mut out = cfg.to_string();
         out = render_route_into(&out, &app);
         out = render_route_into(&out, &tee);
-        assert!(out.contains("use_backend be_cap_api_app if { req.ssl_sni -i api.abcd1234.enclava.dev }"));
-        assert!(out.contains("use_backend be_cap_api_tee if { req.ssl_sni -i api.abcd1234.tee.enclava.dev }"));
+        assert!(
+            out.contains(
+                "use_backend be_cap_api_app if { req.ssl_sni -i api.abcd1234.enclava.dev }"
+            )
+        );
+        assert!(out.contains(
+            "use_backend be_cap_api_tee if { req.ssl_sni -i api.abcd1234.tee.enclava.dev }"
+        ));
         assert!(out.contains("server tenant 10.0.0.1:443 check"));
         assert!(out.contains("server tenant 10.0.0.1:8081 check"));
     }

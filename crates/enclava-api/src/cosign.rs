@@ -191,10 +191,10 @@ fn build_constraints(
             })]
         }
         VerificationPolicy::PublicKey { pem } => {
-            let verifier =
-                PublicKeyVerifier::new(pem.as_bytes(), &SigningScheme::default()).map_err(
-                    |e| CosignError::InvalidPolicy(format!("invalid public key PEM: {}", e)),
-                )?;
+            let verifier = PublicKeyVerifier::new(pem.as_bytes(), &SigningScheme::default())
+                .map_err(|e| {
+                    CosignError::InvalidPolicy(format!("invalid public key PEM: {}", e))
+                })?;
             vec![Box::new(verifier)]
         }
     };

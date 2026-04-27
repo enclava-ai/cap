@@ -37,6 +37,8 @@ pub enum DnsError {
     NotConfigured,
     #[error("hostname '{0}' is outside managed Cloudflare zone")]
     OutsideManagedZone(String),
+    #[error("hostname '{hostname}' is already assigned to another app")]
+    HostnameInUse { hostname: String },
     #[error("Cloudflare API error: {0}")]
     Cloudflare(String),
     #[error("Cloudflare request failed: {0}")]
@@ -354,13 +356,15 @@ pub async fn delete_dns_record(
 
 /// Record a user-owned custom domain in `dns_records` without touching
 /// Cloudflare. The user controls this DNS, so we only track it for cleanup
-/// and audit. Idempotent on (hostname).
+/// and audit. Idempotent for the same app, but refuses to transfer a hostname
+/// away from another app because the old app may still have DB and HAProxy
+/// state for that domain.
 pub async fn record_custom_domain(
     pool: &PgPool,
     app_id: Uuid,
     hostname: &str,
 ) -> Result<(), DnsError> {
-    sqlx::query(
+    let row: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO dns_records (id, app_id, hostname, zone_id, record_id, record_type, target, is_custom, provider)
          VALUES ($1, $2, $3, NULL, NULL, 'CUSTOM', '', true, 'user')
          ON CONFLICT (hostname) DO UPDATE SET
@@ -371,13 +375,21 @@ pub async fn record_custom_domain(
              target = EXCLUDED.target,
              is_custom = EXCLUDED.is_custom,
              provider = EXCLUDED.provider,
-             updated_at = now()",
+             updated_at = now()
+         WHERE dns_records.app_id = EXCLUDED.app_id
+         RETURNING app_id",
     )
     .bind(Uuid::new_v4())
     .bind(app_id)
     .bind(hostname)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
+
+    if row.is_none() {
+        return Err(DnsError::HostnameInUse {
+            hostname: hostname.to_string(),
+        });
+    }
 
     tracing::info!(
         app_id = %app_id,
@@ -437,18 +449,13 @@ pub async fn ensure_dns_pair(
     Ok(())
 }
 
-async fn dns_record_exists(
-    pool: &PgPool,
-    app_id: Uuid,
-    hostname: &str,
-) -> Result<bool, DnsError> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2",
-    )
-    .bind(app_id)
-    .bind(hostname)
-    .fetch_optional(pool)
-    .await?;
+async fn dns_record_exists(pool: &PgPool, app_id: Uuid, hostname: &str) -> Result<bool, DnsError> {
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2")
+            .bind(app_id)
+            .bind(hostname)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.is_some())
 }
 

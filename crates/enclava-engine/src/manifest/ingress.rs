@@ -12,7 +12,7 @@
 //! `format!("{user_input}")` of caller-supplied strings; that closes the
 //! Caddyfile-injection vector flagged in the security review.
 
-use enclava_common::validate::{validate_fqdn, ValidateError};
+use enclava_common::validate::{ValidateError, validate_fqdn};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
@@ -80,7 +80,13 @@ fn validate_https_url(url: &str) -> Result<(), IngressRenderError> {
         ));
     }
     if url.bytes().any(|b| {
-        b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' || b == 0 || b == b'`' || b == b'"'
+        b == b'\n'
+            || b == b'\r'
+            || b == b' '
+            || b == b'\t'
+            || b == 0
+            || b == b'`'
+            || b == b'"'
             || b == b'\''
             || b == b'{'
             || b == b'}'
@@ -104,8 +110,16 @@ fn validate_email(s: &str) -> Result<(), IngressRenderError> {
     if !s.is_ascii() {
         return Err(IngressRenderError::InvalidEmail("must be ASCII".into()));
     }
-    if s.bytes().any(|b| b.is_ascii_whitespace() || b == 0 || b == b'`'
-        || b == b'\'' || b == b'"' || b == b'{' || b == b'}' || b == b';') {
+    if s.bytes().any(|b| {
+        b.is_ascii_whitespace()
+            || b == 0
+            || b == b'`'
+            || b == b'\''
+            || b == b'"'
+            || b == b'{'
+            || b == b'}'
+            || b == b';'
+    }) {
         return Err(IngressRenderError::InvalidEmail(
             "contains forbidden character".into(),
         ));
@@ -128,8 +142,8 @@ pub fn generate_ingress_configmap(app: &ConfidentialApp) -> ConfigMap {
     // builders. Validation failures here mean the app object never should
     // have been built — they indicate a bug, not a user error — so we panic
     // with a clear message that's always caught in tests.
-    let caddyfile = render_caddyfile(app)
-        .expect("Caddyfile inputs must validate before manifest generation");
+    let caddyfile =
+        render_caddyfile(app).expect("Caddyfile inputs must validate before manifest generation");
 
     let mut labels = BTreeMap::new();
     labels.insert(

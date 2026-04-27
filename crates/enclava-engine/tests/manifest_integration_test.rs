@@ -68,7 +68,10 @@ fn generate_all_manifests_returns_all_resources() {
         m.tls_route["metadata"]["name"],
         "tenant-passthrough-test-app"
     );
-    assert_eq!(m.tls_route["spec"]["hostnames"][0], "test-app.abcd1234.enclava.dev");
+    assert_eq!(
+        m.tls_route["spec"]["hostnames"][0],
+        "test-app.abcd1234.enclava.dev"
+    );
     assert_eq!(
         m.tls_route["spec"]["rules"][0]["backendRefs"][0]["name"],
         "test-app"

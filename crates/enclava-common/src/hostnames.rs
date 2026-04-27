@@ -6,7 +6,7 @@
 //! returned hostname is always RFC-1123 compliant and free of injection
 //! vectors.
 
-use crate::validate::{validate_app_name, validate_fqdn, validate_org_slug, ValidateError};
+use crate::validate::{ValidateError, validate_app_name, validate_fqdn, validate_org_slug};
 
 /// Build the user-facing hostname for an app: `<app>.<orgSlug>.<platform_domain>`.
 pub fn app_hostname(

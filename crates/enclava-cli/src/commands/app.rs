@@ -582,7 +582,8 @@ pub enum SignerCommand {
     /// No email confirmation token is required for the first set.
     Set {
         /// Cosign Fulcio identity subject. Examples:
-        /// `repo:<org>/<repo>:ref:refs/heads/main` or an email.
+        /// `https://github.com/<org>/<repo>/.github/workflows/deploy.yml@refs/heads/main`
+        /// or an email.
         subject: String,
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
@@ -611,7 +612,11 @@ pub enum SignerCommand {
 pub async fn signer(cmd: SignerCommand) -> Result<(), Box<dyn std::error::Error>> {
     let (api, _paths, _cli_config) = build_api_client()?;
     match cmd {
-        SignerCommand::Set { subject, issuer, app } => {
+        SignerCommand::Set {
+            subject,
+            issuer,
+            app,
+        } => {
             let app_name = resolve_app_name(&app)?;
             let req = SetSignerRequest {
                 subject: subject.clone(),

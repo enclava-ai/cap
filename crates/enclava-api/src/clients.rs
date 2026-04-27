@@ -72,7 +72,10 @@ impl BlockedNetworks {
             match parse_cidr(cidr.as_ref()) {
                 Some(Cidr::V4(net, bits)) => self.v4.push((net, bits)),
                 Some(Cidr::V6(net, bits)) => self.v6.push((net, bits)),
-                None => tracing::warn!("ignoring invalid CIDR in cluster blocklist: {}", cidr.as_ref()),
+                None => tracing::warn!(
+                    "ignoring invalid CIDR in cluster blocklist: {}",
+                    cidr.as_ref()
+                ),
             }
         }
     }
@@ -166,7 +169,11 @@ pub struct AllowList {
 
 impl AllowList {
     pub fn from_env_or_default(env_value: Option<String>) -> Self {
-        match env_value.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match env_value
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(value) => Self::parse(value),
             None => Self {
                 exact: DEFAULT_REGISTRY_ALLOWLIST
@@ -297,7 +304,8 @@ impl RegistryClient {
 
     /// Validate a URL is allowed before issuing a request.
     pub fn check_url(&self, url: &str) -> Result<(), ClientError> {
-        let parsed = reqwest::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+        let parsed =
+            reqwest::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
         if parsed.scheme() != "https" {
             return Err(ClientError::SchemeNotAllowed(parsed.scheme().to_string()));
         }
@@ -390,7 +398,8 @@ mod tests {
 
     #[test]
     fn allowlist_from_env_value_overrides_default() {
-        let allow = AllowList::from_env_or_default(Some("internal.registry.test, *.corp.example".into()));
+        let allow =
+            AllowList::from_env_or_default(Some("internal.registry.test, *.corp.example".into()));
         assert!(allow.allows("internal.registry.test"));
         assert!(allow.allows("foo.corp.example"));
         assert!(!allow.allows("ghcr.io"));

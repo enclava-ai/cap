@@ -13,6 +13,7 @@ use crate::state::AppState;
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &error {
         crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
+        crate::dns::DnsError::HostnameInUse { .. } => StatusCode::CONFLICT,
         crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
         crate::dns::DnsError::Cloudflare(_)
         | crate::dns::DnsError::Http(_)
@@ -60,16 +61,19 @@ mod classifier_tests {
             "https://github.com/me/repo/.github/workflows/build.yml@refs/heads/main",
             "https://token.actions.githubusercontent.com",
         );
-        assert!(matches!(policy, VerificationPolicy::FulcioUrlIdentity { .. }));
+        assert!(matches!(
+            policy,
+            VerificationPolicy::FulcioUrlIdentity { .. }
+        ));
     }
 
     #[test]
     fn email_subject_is_email_policy() {
-        let policy = classify_signer_identity(
-            "alice@example.com",
-            "https://accounts.google.com",
-        );
-        assert!(matches!(policy, VerificationPolicy::FulcioEmailIdentity { .. }));
+        let policy = classify_signer_identity("alice@example.com", "https://accounts.google.com");
+        assert!(matches!(
+            policy,
+            VerificationPolicy::FulcioEmailIdentity { .. }
+        ));
     }
 
     #[test]
@@ -78,7 +82,10 @@ mod classifier_tests {
             "http://gitlab.example.com/foo@v1",
             "https://gitlab.example.com",
         );
-        assert!(matches!(policy, VerificationPolicy::FulcioUrlIdentity { .. }));
+        assert!(matches!(
+            policy,
+            VerificationPolicy::FulcioUrlIdentity { .. }
+        ));
     }
 }
 

@@ -24,6 +24,7 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &error {
         crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
+        crate::dns::DnsError::HostnameInUse { .. } => StatusCode::CONFLICT,
         crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
         crate::dns::DnsError::Cloudflare(_)
         | crate::dns::DnsError::Http(_)
@@ -273,17 +274,14 @@ pub async fn create_app(
             )
         })?;
 
-    let app_host = enclava_common::hostnames::app_hostname(
-        &body.name,
-        &org.cust_slug,
-        &state.platform_domain,
-    )
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid app hostname: {e}")})),
-        )
-    })?;
+    let app_host =
+        enclava_common::hostnames::app_hostname(&body.name, &org.cust_slug, &state.platform_domain)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("invalid app hostname: {e}")})),
+                )
+            })?;
     let tee_host = enclava_common::hostnames::tee_hostname(
         &body.name,
         &org.cust_slug,
@@ -296,13 +294,12 @@ pub async fn create_app(
         )
     })?;
 
-    let signer_set_at = if body.signer_identity_subject.is_some()
-        || body.signer_identity_issuer.is_some()
-    {
-        Some(chrono::Utc::now())
-    } else {
-        None
-    };
+    let signer_set_at =
+        if body.signer_identity_subject.is_some() || body.signer_identity_issuer.is_some() {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
 
     let result = sqlx::query(
         "INSERT INTO apps (id, org_id, name, namespace, instance_id, tenant_id,
@@ -483,32 +480,34 @@ pub async fn delete_app(
     .await
     .map_err(dns_error_response)?;
 
-    let org_slug: String = sqlx::query_scalar(
-        "SELECT cust_slug FROM organizations WHERE id = $1",
-    )
-    .bind(auth.org_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": "database error"})),
-    ))?;
+    let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
+        .bind(auth.org_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
     let app_backend =
-        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App)
-            .map_err(|e| {
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App).map_err(
+            |e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
                 )
-            })?;
+            },
+        )?;
     let tee_backend =
-        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::Tee)
-            .map_err(|e| {
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::Tee).map_err(
+            |e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
                 )
-            })?;
+            },
+        )?;
     let mut routes_to_remove: Vec<(String, String)> =
         vec![(app_backend.clone(), app.domain.clone())];
     if let Some(t) = app.tee_domain.as_deref() {

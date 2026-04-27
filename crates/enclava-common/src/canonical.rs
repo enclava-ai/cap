@@ -17,10 +17,7 @@ use sha2::{Digest, Sha256};
 /// which internally hashes with SHA-512). Pre-hashing with SHA-256 would be
 /// wasteful and ambiguous.
 pub fn ce_v1_bytes(records: &[(&str, &[u8])]) -> Vec<u8> {
-    let total: usize = records
-        .iter()
-        .map(|(l, v)| 2 + l.len() + 4 + v.len())
-        .sum();
+    let total: usize = records.iter().map(|(l, v)| 2 + l.len() + 4 + v.len()).sum();
     let mut out = Vec::with_capacity(total);
     for (label, value) in records {
         let label_len = u16::try_from(label.len()).expect("CE-v1 label exceeds u16::MAX");
@@ -56,7 +53,10 @@ mod tests {
     fn single_record_layout_is_length_prefixed_tlv() {
         let bytes = ce_v1_bytes(&[("ab", b"cd")]);
         // 2 bytes label_len (BE) + label + 4 bytes value_len (BE) + value
-        assert_eq!(bytes, vec![0x00, 0x02, b'a', b'b', 0x00, 0x00, 0x00, 0x02, b'c', b'd']);
+        assert_eq!(
+            bytes,
+            vec![0x00, 0x02, b'a', b'b', 0x00, 0x00, 0x00, 0x02, b'c', b'd']
+        );
     }
 
     #[test]

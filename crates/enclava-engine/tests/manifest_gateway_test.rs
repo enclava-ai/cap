@@ -66,7 +66,10 @@ fn tls_route_routes_domain_to_tenant_service() {
     let route = generate_tls_route(&app);
 
     assert_eq!(route["apiVersion"], "gateway.networking.k8s.io/v1alpha3");
-    assert_eq!(route["spec"]["hostnames"][0], "test-app.abcd1234.enclava.dev");
+    assert_eq!(
+        route["spec"]["hostnames"][0],
+        "test-app.abcd1234.enclava.dev"
+    );
     assert_eq!(
         route["spec"]["parentRefs"][0]["name"],
         "tenant-gateway-test-app"

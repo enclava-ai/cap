@@ -14,8 +14,8 @@ pub mod registry;
 pub mod routes;
 pub mod state;
 
-use axum::http::{HeaderValue, Method, header};
 use axum::Router;
+use axum::http::{HeaderValue, Method, header};
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
@@ -191,8 +191,7 @@ pub fn build_router(state: AppState) -> Router {
     // Health check (unauthenticated)
     let health = Router::new().route("/health", axum::routing::get(|| async { "ok" }));
 
-    Router::new()
-        .merge(health)
+    let api_routes = Router::new()
         .merge(auth_routes)
         .merge(org_routes)
         .merge(app_routes)
@@ -202,7 +201,11 @@ pub fn build_router(state: AppState) -> Router {
         .merge(status_routes)
         .merge(unlock_routes)
         .merge(billing_routes)
-        .layer(GovernorLayer::new(api_governor_conf))
+        .layer(GovernorLayer::new(api_governor_conf));
+
+    Router::new()
+        .merge(health)
+        .merge(api_routes)
         .layer(TraceLayer::new_for_http())
         .layer(build_cors_layer())
         .with_state(state)

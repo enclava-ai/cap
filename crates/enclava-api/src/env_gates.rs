@@ -22,7 +22,10 @@ const DEBUG_ONLY_FLAGS: &[&str] = &[
 const ALWAYS_REQUIRED: &[&str] = &["BTCPAY_WEBHOOK_SECRET"];
 
 // Mirrors the precedence in `kbs::config_from_env`: REQUIRED implies enabled.
-const KBS_TOGGLES: &[&str] = &["KBS_POLICY_MANAGEMENT_ENABLED", "KBS_POLICY_MANAGEMENT_REQUIRED"];
+const KBS_TOGGLES: &[&str] = &[
+    "KBS_POLICY_MANAGEMENT_ENABLED",
+    "KBS_POLICY_MANAGEMENT_REQUIRED",
+];
 
 fn flag_is_truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES")

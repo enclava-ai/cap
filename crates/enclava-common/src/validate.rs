@@ -39,9 +39,7 @@ pub fn validate_dns_label(s: &str) -> Result<(), ValidateError> {
         return Err(ValidateError::InvalidDnsLabel("empty"));
     }
     if s.len() > MAX_DNS_LABEL_LEN {
-        return Err(ValidateError::InvalidDnsLabel(
-            "exceeds 63 characters",
-        ));
+        return Err(ValidateError::InvalidDnsLabel("exceeds 63 characters"));
     }
     if !s
         .bytes()
@@ -85,9 +83,11 @@ pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
     if s.len() > MAX_APP_NAME_LEN {
         return Err(ValidateError::InvalidAppName("exceeds 32 characters"));
     }
-    validate_dns_label(s).map_err(|_| ValidateError::InvalidAppName(
-        "must be a DNS-1123 label: [a-z0-9-], no leading/trailing '-'",
-    ))?;
+    validate_dns_label(s).map_err(|_| {
+        ValidateError::InvalidAppName(
+            "must be a DNS-1123 label: [a-z0-9-], no leading/trailing '-'",
+        )
+    })?;
     if s.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ValidateError::InvalidAppName("must not be all digits"));
     }

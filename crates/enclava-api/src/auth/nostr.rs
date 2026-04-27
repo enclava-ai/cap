@@ -202,7 +202,14 @@ pub async fn signup_or_login(
     .execute(&mut *tx)
     .await?;
 
-    crate::db::orgs::insert_org_conn(&mut tx, org_id, &org_name, Some(&identity.display_name), true).await?;
+    crate::db::orgs::insert_org_conn(
+        &mut tx,
+        org_id,
+        &org_name,
+        Some(&identity.display_name),
+        true,
+    )
+    .await?;
 
     sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
         .bind(user_id)
@@ -272,8 +279,7 @@ mod tests {
             .tag(Tag::parse(["u".to_string(), url.to_string()]).unwrap())
             .tag(Tag::parse(["method".to_string(), method.to_string()]).unwrap());
         if let Some(p) = payload_hex {
-            builder =
-                builder.tag(Tag::parse(["payload".to_string(), p.to_string()]).unwrap());
+            builder = builder.tag(Tag::parse(["payload".to_string(), p.to_string()]).unwrap());
         }
         let event = builder.sign_with_keys(&keys).unwrap();
         JsonUtil::as_json(&event)

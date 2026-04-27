@@ -324,11 +324,7 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn delete_custom_domain(
-        &self,
-        app_name: &str,
-        domain: &str,
-    ) -> Result<(), ApiError> {
+    pub async fn delete_custom_domain(&self, app_name: &str, domain: &str) -> Result<(), ApiError> {
         let resp = self
             .http
             .delete(self.url(&format!("/apps/{app_name}/domains/{domain}")))

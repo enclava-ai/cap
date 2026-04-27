@@ -3,7 +3,7 @@
 //! Confirms the structured Caddyfile builder rejects every known injection
 //! vector before any output is rendered.
 
-use enclava_engine::manifest::ingress::{render_caddyfile, IngressRenderError};
+use enclava_engine::manifest::ingress::{IngressRenderError, render_caddyfile};
 use enclava_engine::testutil::sample_app;
 
 #[test]
