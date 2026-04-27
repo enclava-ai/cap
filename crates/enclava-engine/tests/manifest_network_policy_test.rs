@@ -94,14 +94,46 @@ fn network_policy_egress_has_kbs_service() {
 }
 
 #[test]
-fn network_policy_egress_has_world_http_https() {
+fn default_app_has_no_world_egress() {
     let app = sample_app();
     let val = generate_network_policy(&app);
-    let egress = &val["spec"]["egress"];
-    assert_eq!(egress[4]["toEntities"][0], "world");
-    let ports = &egress[4]["toPorts"][0]["ports"];
-    assert_eq!(ports[0]["port"], "80");
-    assert_eq!(ports[0]["protocol"], "TCP");
-    assert_eq!(ports[1]["port"], "443");
-    assert_eq!(ports[1]["protocol"], "TCP");
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    assert_eq!(egress.len(), 4, "default has DNS + same-ns + KBS x2 only");
+    for rule in egress {
+        assert!(
+            rule.get("toEntities").is_none(),
+            "no rule may use toEntities (world): {rule}"
+        );
+    }
+}
+
+#[test]
+fn empty_egress_allowlist_renders_zero_extra_rules() {
+    let mut app = sample_app();
+    app.egress_allowlist = Vec::new();
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    assert_eq!(egress.len(), 4);
+}
+
+#[test]
+fn egress_allowlist_renders_one_rule_per_entry() {
+    use enclava_engine::types::EgressRule;
+    let mut app = sample_app();
+    app.egress_allowlist = vec![
+        EgressRule {
+            host: "api.stripe.com".to_string(),
+            ports: vec![443],
+        },
+        EgressRule {
+            host: "hooks.slack.com".to_string(),
+            ports: vec![443],
+        },
+    ];
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    assert_eq!(egress.len(), 6);
+    assert_eq!(egress[4]["toFQDNs"][0]["matchName"], "api.stripe.com");
+    assert_eq!(egress[4]["toPorts"][0]["ports"][0]["port"], "443");
+    assert_eq!(egress[5]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }

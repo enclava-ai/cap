@@ -68,7 +68,6 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
     let env_vars = vec![
         env("CRYPTSETUP_DEVICE", &app.storage.app_data.device_path),
         env("VOLUME_MOUNT_POINT", &app.storage.app_data.mount_path),
-        env("SECURE_PV_ALLOW_RUNTIME_INSTALL", "false"),
         env("SECURE_PV_STRIP_RUNTIME_CAPS", "true"),
         env("SECURE_PV_LUKS_INTEGRITY", "hmac-sha256"),
         env("SECURE_PV_BIND_MOUNTS", &bind_mounts_str),
@@ -299,7 +298,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         env_field_ref("POD_NAMESPACE", "metadata.namespace"),
         env("CRYPTSETUP_DEVICE", &app.storage.tls_data.device_path),
         env("VOLUME_MOUNT_POINT", &app.storage.tls_data.mount_path),
-        env("SECURE_PV_ALLOW_RUNTIME_INSTALL", "false"),
         env("SECURE_PV_STRIP_RUNTIME_CAPS", "false"),
         env("SECURE_PV_LUKS_INTEGRITY", "hmac-sha256"),
         env("WORKLOAD_SECRET_SOURCE", "kbs"),

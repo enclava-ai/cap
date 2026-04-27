@@ -133,6 +133,11 @@ pub async fn apply_and_watch(
     // Generate manifests
     let manifests = generate_all_manifests(app);
 
+    // Phase 11: cc_init_data binds runtime_class. Refuse to deploy if the
+    // rendered Pod's runtimeClassName diverges from what cc_init_data committed.
+    crate::manifest::cc_init_data::verify_runtime_class_binding(&manifests.statefulset)
+        .map_err(ApplyError::ManifestGeneration)?;
+
     // Apply all
     apply_all(engine, &manifests).await?;
 

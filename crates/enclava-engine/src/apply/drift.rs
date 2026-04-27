@@ -108,13 +108,11 @@ pub async fn check_drift(
     }
 }
 
-/// Check drift and re-apply if needed.
-///
-/// Intended to be called periodically (every 5-10 minutes per app).
-/// Only re-applies when drift is detected, making it safe to call frequently.
-///
-/// Returns the drift result. If drift was detected and corrected, `has_drift`
-/// will be true (reflecting the pre-correction state).
+/// Drift check is advisory only (Phase 11). Auto-revert is removed: the
+/// manifest hash annotation is operator-writable and an attacker with cluster
+/// access could roll back to a "clean" hash to suppress detection. Until an
+/// attested controller can sign + verify desired state we do not act on
+/// drift, only log it. Operators investigate manually.
 pub async fn check_and_reconcile(
     engine: &ApplyEngine,
     app: &ConfidentialApp,
@@ -123,16 +121,13 @@ pub async fn check_and_reconcile(
     let result = check_drift(engine, app, manifests).await?;
 
     if result.has_drift {
-        tracing::info!(
+        tracing::warn!(
             app = %app.name,
             namespace = %app.namespace,
-            "reconciling drift -- re-applying manifests"
-        );
-        super::orchestrator::apply_all(engine, manifests).await?;
-        tracing::info!(
-            app = %app.name,
-            namespace = %app.namespace,
-            "drift reconciled"
+            desired = %result.desired_hash,
+            live = ?result.live_hash,
+            "drift detected (advisory) -- manifest-hash annotation is operator-writable; \
+             auto-revert disabled until an attested controller can verify desired state"
         );
     }
 

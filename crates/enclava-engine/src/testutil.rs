@@ -65,6 +65,7 @@ pub fn sample_app() -> ConfidentialApp {
             cloudflare_token_secret: "cloudflare-api-token-enclava-dev".to_string(),
             cloudflare_api_token: Some("test-cloudflare-token".to_string()),
         },
+        egress_allowlist: Vec::new(),
     }
 }
 
