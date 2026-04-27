@@ -303,30 +303,48 @@ fn render_route_into(config: &str, route: &SniRoute) -> String {
 }
 
 fn remove_route_from(config: &str, backend_name: &str, domain: &str) -> String {
+    // First pass: remove only the SNI mapping line for this (backend, host).
+    // Other hostnames may still route to the same backend (e.g. the platform
+    // hostname keeps its mapping when only the custom domain is removed), so
+    // tearing down the backend block here unconditionally would leave dangling
+    // `use_backend` references.
     let use_backend = format!("use_backend {backend_name} if {{ req.ssl_sni -i {domain} }}");
-    let mut out = Vec::new();
-    let mut skipping_backend = false;
+    let pruned_lines: Vec<&str> = config
+        .lines()
+        .filter(|line| line.trim() != use_backend)
+        .collect();
 
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if trimmed == use_backend {
-            continue;
-        }
-        if trimmed == format!("backend {backend_name}") {
-            skipping_backend = true;
-            continue;
-        }
-        if skipping_backend {
-            if trimmed.starts_with("backend ") {
-                skipping_backend = false;
-            } else {
+    // Second pass: only drop the `backend {name}` block if no remaining
+    // `use_backend {name} ...` line references it.
+    let backend_use_prefix = format!("use_backend {backend_name} ");
+    let still_referenced = pruned_lines
+        .iter()
+        .any(|line| line.trim().starts_with(&backend_use_prefix));
+
+    let final_lines: Vec<&str> = if still_referenced {
+        pruned_lines
+    } else {
+        let mut out = Vec::with_capacity(pruned_lines.len());
+        let mut skipping_backend = false;
+        for line in pruned_lines {
+            let trimmed = line.trim();
+            if trimmed == format!("backend {backend_name}") {
+                skipping_backend = true;
                 continue;
             }
+            if skipping_backend {
+                if trimmed.starts_with("backend ") {
+                    skipping_backend = false;
+                } else {
+                    continue;
+                }
+            }
+            out.push(line);
         }
-        out.push(line);
-    }
+        out
+    };
 
-    let mut rendered = out.join("\n");
+    let mut rendered = final_lines.join("\n");
     if config.ends_with('\n') {
         rendered.push('\n');
     }
@@ -457,5 +475,36 @@ mod tests {
         let out = remove_route_from(cfg, "be_cap_x_app", "x.y.z");
         assert!(!out.contains("be_cap_x_app"));
         assert!(out.contains("backend be_reject"));
+    }
+
+    #[test]
+    fn remove_route_keeps_shared_backend_when_other_hosts_use_it() {
+        // Custom domain and platform hostname both target the same app
+        // backend. Removing only the custom domain mapping must leave the
+        // backend block intact so the platform hostname's `use_backend`
+        // still resolves.
+        let cfg = "frontend fe_443\n  bind :443\n\
+            \x20\x20use_backend be_cap_x_app if { req.ssl_sni -i app.abcd1234.enclava.dev }\n\
+            \x20\x20use_backend be_cap_x_app if { req.ssl_sni -i custom.example.com }\n\
+            \x20\x20default_backend be_reject\n\nbackend be_cap_x_app\n  server tenant 1.2.3.4:443 check\n\nbackend be_reject\n";
+        let out = remove_route_from(cfg, "be_cap_x_app", "custom.example.com");
+        assert!(
+            out.contains("backend be_cap_x_app"),
+            "shared backend block must be preserved while another host still references it: {out}",
+        );
+        assert!(!out.contains("custom.example.com"));
+        assert!(out.contains("app.abcd1234.enclava.dev"));
+    }
+
+    #[test]
+    fn remove_route_drops_backend_only_when_last_reference_goes() {
+        let cfg = "frontend fe_443\n  bind :443\n\
+            \x20\x20use_backend be_cap_x_app if { req.ssl_sni -i a.host }\n\
+            \x20\x20use_backend be_cap_x_app if { req.ssl_sni -i b.host }\n\
+            \x20\x20default_backend be_reject\n\nbackend be_cap_x_app\n  server tenant 1.2.3.4:443 check\n\nbackend be_reject\n";
+        let after_first = remove_route_from(cfg, "be_cap_x_app", "a.host");
+        assert!(after_first.contains("backend be_cap_x_app"));
+        let after_second = remove_route_from(&after_first, "be_cap_x_app", "b.host");
+        assert!(!after_second.contains("be_cap_x_app"));
     }
 }
