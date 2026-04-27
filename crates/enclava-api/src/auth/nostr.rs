@@ -202,14 +202,7 @@ pub async fn signup_or_login(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
-        "INSERT INTO organizations (id, name, display_name, is_personal) VALUES ($1, $2, $3, true)",
-    )
-    .bind(org_id)
-    .bind(&org_name)
-    .bind(&identity.display_name)
-    .execute(&mut *tx)
-    .await?;
+    crate::db::orgs::insert_org_conn(&mut tx, org_id, &org_name, Some(&identity.display_name), true).await?;
 
     sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
         .bind(user_id)

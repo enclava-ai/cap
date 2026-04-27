@@ -45,16 +45,15 @@ pub async fn create_org(
 ) -> Result<(StatusCode, Json<OrgResponse>), (StatusCode, Json<serde_json::Value>)> {
     let org_id = Uuid::new_v4();
 
-    let result = sqlx::query(
-        "INSERT INTO organizations (id, name, display_name, is_personal) VALUES ($1, $2, $3, false)",
+    if let Err(e) = crate::db::orgs::insert_org_pool(
+        &state.db,
+        org_id,
+        &body.name,
+        body.display_name.as_deref(),
+        false,
     )
-    .bind(org_id)
-    .bind(&body.name)
-    .bind(&body.display_name)
-    .execute(&state.db)
-    .await;
-
-    if let Err(e) = result {
+    .await
+    {
         if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
             return Err((
                 StatusCode::CONFLICT,
