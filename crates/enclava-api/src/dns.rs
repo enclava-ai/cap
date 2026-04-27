@@ -291,11 +291,7 @@ pub async fn delete_dns_record(
     app_id: Uuid,
     hostname: &str,
 ) -> Result<(), DnsError> {
-    let Some(config) = config else {
-        return Ok(());
-    };
-
-    let row: Option<(String, String)> = sqlx::query_as(
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT zone_id, record_id FROM dns_records WHERE app_id = $1 AND hostname = $2",
     )
     .bind(app_id)
@@ -307,23 +303,44 @@ pub async fn delete_dns_record(
         return Ok(());
     };
 
-    let response = client
-        .delete(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-        ))
-        .bearer_auth(&config.cloudflare_api_token)
-        .send()
-        .await?;
+    // Custom (user-owned) rows have no Cloudflare handle; delete the local row
+    // only. Platform-zone rows need a Cloudflare delete first.
+    if let (Some(zone_id), Some(record_id)) = (zone_id.as_deref(), record_id.as_deref()) {
+        let Some(config) = config else {
+            return Ok(());
+        };
 
-    if response.status() != StatusCode::NOT_FOUND {
-        let status = response.status();
-        let body: CloudflareSingle<serde_json::Value> = response.json().await?;
-        if !status.is_success() || !body.success {
-            return Err(DnsError::Cloudflare(format!(
-                "delete record for '{hostname}' failed: {}",
-                cloudflare_error(&body.errors)
-            )));
+        let response = client
+            .delete(format!(
+                "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+            ))
+            .bearer_auth(&config.cloudflare_api_token)
+            .send()
+            .await?;
+
+        if response.status() != StatusCode::NOT_FOUND {
+            let status = response.status();
+            let body: CloudflareSingle<serde_json::Value> = response.json().await?;
+            if !status.is_success() || !body.success {
+                return Err(DnsError::Cloudflare(format!(
+                    "delete record for '{hostname}' failed: {}",
+                    cloudflare_error(&body.errors)
+                )));
+            }
         }
+
+        tracing::info!(
+            app_id = %app_id,
+            hostname = %hostname,
+            record_id = %record_id,
+            "DNS record deleted"
+        );
+    } else {
+        tracing::info!(
+            app_id = %app_id,
+            hostname = %hostname,
+            "custom DNS record forgotten (user-owned, no cloudflare delete)"
+        );
     }
 
     sqlx::query("DELETE FROM dns_records WHERE app_id = $1 AND hostname = $2")
@@ -332,11 +349,40 @@ pub async fn delete_dns_record(
         .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+/// Record a user-owned custom domain in `dns_records` without touching
+/// Cloudflare. The user controls this DNS, so we only track it for cleanup
+/// and audit. Idempotent on (hostname).
+pub async fn record_custom_domain(
+    pool: &PgPool,
+    app_id: Uuid,
+    hostname: &str,
+) -> Result<(), DnsError> {
+    sqlx::query(
+        "INSERT INTO dns_records (id, app_id, hostname, zone_id, record_id, record_type, target, is_custom, provider)
+         VALUES ($1, $2, $3, NULL, NULL, 'CUSTOM', '', true, 'user')
+         ON CONFLICT (hostname) DO UPDATE SET
+             app_id = EXCLUDED.app_id,
+             zone_id = NULL,
+             record_id = NULL,
+             record_type = EXCLUDED.record_type,
+             target = EXCLUDED.target,
+             is_custom = EXCLUDED.is_custom,
+             provider = EXCLUDED.provider,
+             updated_at = now()",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(hostname)
+    .execute(pool)
+    .await?;
+
     tracing::info!(
         app_id = %app_id,
         hostname = %hostname,
-        record_id = %record_id,
-        "DNS record deleted"
+        "custom DNS hostname tracked (user-owned)"
     );
 
     Ok(())

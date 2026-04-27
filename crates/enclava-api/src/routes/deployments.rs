@@ -426,16 +426,9 @@ pub async fn deploy(
     .map_err(dns_error_response)?;
 
     if let Some(custom_domain) = app.custom_domain.as_ref() {
-        crate::dns::ensure_dns_record(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            app.id,
-            custom_domain,
-            true,
-        )
-        .await
-        .map_err(dns_error_response)?;
+        crate::dns::record_custom_domain(&state.db, app.id, custom_domain)
+            .await
+            .map_err(dns_error_response)?;
     }
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
