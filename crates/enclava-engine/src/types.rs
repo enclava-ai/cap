@@ -28,6 +28,9 @@ pub struct ConfidentialApp {
     pub tenant_instance_identity_hash: String,
     /// Kubernetes ServiceAccount name for this app.
     pub service_account: String,
+    /// Customer-controlled signer identity bound into KBS policy when present.
+    pub signer_identity_subject: Option<String>,
+    pub signer_identity_issuer: Option<String>,
     /// User's application containers.
     pub containers: Vec<Container>,
     /// Encrypted storage configuration (two volumes).

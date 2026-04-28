@@ -127,6 +127,8 @@ pub async fn build_confidential_app(
         bootstrap_owner_pubkey_hash: app.bootstrap_owner_pubkey_hash.clone(),
         tenant_instance_identity_hash: app.tenant_instance_identity_hash.clone(),
         service_account: app.service_account.clone(),
+        signer_identity_subject: app.signer_identity_subject.clone(),
+        signer_identity_issuer: app.signer_identity_issuer.clone(),
         containers,
         storage,
         unlock_mode,

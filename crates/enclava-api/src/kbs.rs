@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
+use enclava_engine::manifest::cc_init_data::compute_cc_init_data;
 use enclava_engine::types::ConfidentialApp;
 
 #[derive(Debug, Clone)]
@@ -72,6 +73,10 @@ struct KbsTlsBinding {
     binding_key: String,
     repository: String,
     tag: String,
+    image_digest: Option<String>,
+    init_data_hash: Option<Vec<u8>>,
+    signer_identity_subject: Option<String>,
+    signer_identity_issuer: Option<String>,
     namespace: String,
     service_account: String,
     tenant_instance_identity_hash: String,
@@ -124,12 +129,19 @@ pub async fn ensure_tls_binding(
     };
 
     let binding_key = app.tls_resource_type();
+    let primary = app
+        .primary_container()
+        .expect("app must have a primary container");
+    let (_encoded, init_data_hash_hex) = compute_cc_init_data(app);
+    let init_data_hash =
+        hex::decode(&init_data_hash_hex).expect("cc_init_data hash must be valid hex");
     sqlx::query(
         "INSERT INTO kbs_tls_bindings (
             app_id, binding_key, repository, tag, namespace, service_account,
-            tenant_instance_identity_hash, deleted_at
+            tenant_instance_identity_hash, image_digest, init_data_hash,
+            signer_identity_subject, signer_identity_issuer, deleted_at
          )
-         VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5, NULL)
+         VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5, $6, $7, $8, $9, NULL)
          ON CONFLICT (app_id) DO UPDATE
          SET binding_key = EXCLUDED.binding_key,
              repository = EXCLUDED.repository,
@@ -137,6 +149,10 @@ pub async fn ensure_tls_binding(
              namespace = EXCLUDED.namespace,
              service_account = EXCLUDED.service_account,
              tenant_instance_identity_hash = EXCLUDED.tenant_instance_identity_hash,
+             image_digest = EXCLUDED.image_digest,
+             init_data_hash = EXCLUDED.init_data_hash,
+             signer_identity_subject = EXCLUDED.signer_identity_subject,
+             signer_identity_issuer = EXCLUDED.signer_identity_issuer,
              deleted_at = NULL,
              updated_at = now()",
     )
@@ -145,6 +161,10 @@ pub async fn ensure_tls_binding(
     .bind(&app.namespace)
     .bind(&app.service_account)
     .bind(&app.tenant_instance_identity_hash)
+    .bind(primary.image.digest_ref())
+    .bind(init_data_hash)
+    .bind(app.signer_identity_subject.as_deref())
+    .bind(app.signer_identity_issuer.as_deref())
     .execute(db)
     .await?;
 
@@ -214,7 +234,8 @@ pub async fn reconcile_policy(
     .await?;
     let tls_bindings: Vec<KbsTlsBinding> = sqlx::query_as(
         "SELECT binding_key, repository, tag, namespace, service_account,
-                tenant_instance_identity_hash
+                tenant_instance_identity_hash, image_digest, init_data_hash,
+                signer_identity_subject, signer_identity_issuer
          FROM kbs_tls_bindings
          WHERE deleted_at IS NULL
          ORDER BY binding_key",
@@ -685,11 +706,27 @@ fn render_cap_tls_resource_bindings_section(bindings: &[KbsTlsBinding]) -> Strin
     let entries: Vec<String> = bindings
         .iter()
         .map(|binding| {
+            let allowed_images = optional_string_array(binding.image_digest.as_deref());
+            let allowed_init_data_hashes = optional_string_array(
+                binding
+                    .init_data_hash
+                    .as_ref()
+                    .map(hex::encode)
+                    .as_deref(),
+            );
+            let allowed_signer_identity_subjects =
+                optional_string_array(binding.signer_identity_subject.as_deref());
+            let allowed_signer_identity_issuers =
+                optional_string_array(binding.signer_identity_issuer.as_deref());
             format!(
-                "  {key}: {{\n    \"repository\": {repo},\n    \"tag\": {tag},\n    \"allowed_images\": [],\n    \"allowed_image_tag_prefixes\": [],\n    \"allowed_init_data_hashes\": [],\n    \"allowed_namespaces\": [{namespace}],\n    \"allowed_service_accounts\": [{service_account}],\n    \"allowed_identity_hashes\": [{identity_hash}]\n  }}",
+                "  {key}: {{\n    \"repository\": {repo},\n    \"tag\": {tag},\n    \"allowed_images\": {allowed_images},\n    \"allowed_image_tag_prefixes\": [],\n    \"allowed_init_data_hashes\": {allowed_init_data_hashes},\n    \"allowed_signer_identity_subjects\": {allowed_signer_identity_subjects},\n    \"allowed_signer_identity_issuers\": {allowed_signer_identity_issuers},\n    \"allowed_namespaces\": [{namespace}],\n    \"allowed_service_accounts\": [{service_account}],\n    \"allowed_identity_hashes\": [{identity_hash}]\n  }}",
                 key = json_string(&binding.binding_key),
                 repo = json_string(&binding.repository),
                 tag = json_string(&binding.tag),
+                allowed_images = allowed_images,
+                allowed_init_data_hashes = allowed_init_data_hashes,
+                allowed_signer_identity_subjects = allowed_signer_identity_subjects,
+                allowed_signer_identity_issuers = allowed_signer_identity_issuers,
                 namespace = json_string(&binding.namespace),
                 service_account = json_string(&binding.service_account),
                 identity_hash = json_string(&binding.tenant_instance_identity_hash),
@@ -736,6 +773,13 @@ fn json_string(value: &str) -> String {
 
 fn json_string_array(values: &[String]) -> String {
     serde_json::to_string(values).expect("string array serialization is infallible")
+}
+
+fn optional_string_array(value: Option<&str>) -> String {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| serde_json::to_string(&[v]).expect("string array serialization is infallible"))
+        .unwrap_or_else(|| "[]".to_string())
 }
 
 pub fn config_from_env() -> Option<KbsPolicyConfig> {
@@ -804,6 +848,16 @@ mod tests {
             binding_key: key.to_string(),
             repository: "default".to_string(),
             tag: "workload-secret-seed".to_string(),
+            image_digest: Some(
+                "ghcr.io/test/app@sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
+                    .to_string(),
+            ),
+            init_data_hash: Some(vec![0xab; 32]),
+            signer_identity_subject: Some(
+                "https://github.com/test/app/.github/workflows/build.yml@refs/heads/main"
+                    .to_string(),
+            ),
+            signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
             namespace: "cap-test".to_string(),
             service_account: "cap-test-sa".to_string(),
             tenant_instance_identity_hash: "abc123".to_string(),
@@ -880,6 +934,14 @@ owner_resource_bindings := {}
             .unwrap();
         assert!(next.contains("\"legacy\""));
         assert!(next.contains("\"cap-test-app-tls\""));
+        assert!(next.contains("\"allowed_images\": [\"ghcr.io/test/app@sha256:abcd"));
+        assert!(next.contains("\"allowed_init_data_hashes\": [\"abababab"));
+        assert!(
+            next.contains("\"allowed_signer_identity_subjects\": [\"https://github.com/test/app")
+        );
+        assert!(next.contains(
+            "\"allowed_signer_identity_issuers\": [\"https://token.actions.githubusercontent.com\"]"
+        ));
         assert!(next.contains("BEGIN CAP MANAGED TLS RESOURCE BINDINGS"));
         assert!(next.contains("owner_resource_bindings := {}"));
     }
