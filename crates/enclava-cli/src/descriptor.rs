@@ -176,7 +176,9 @@ mod hex_sig {
         use serde::de::Error;
         let s = String::deserialize(d)?;
         let bytes = hex::decode(&s).map_err(D::Error::custom)?;
-        let arr: [u8; 64] = bytes.try_into().map_err(|_| D::Error::custom("len != 64"))?;
+        let arr: [u8; 64] = bytes
+            .try_into()
+            .map_err(|_| D::Error::custom("len != 64"))?;
         Ok(Signature::from_bytes(&arr))
     }
 }
@@ -191,7 +193,9 @@ mod hex_pubkey {
         use serde::de::Error;
         let s = String::deserialize(d)?;
         let bytes = hex::decode(&s).map_err(D::Error::custom)?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| D::Error::custom("len != 32"))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| D::Error::custom("len != 32"))?;
         VerifyingKey::from_bytes(&arr).map_err(D::Error::custom)
     }
 }
@@ -319,7 +323,10 @@ pub fn canonical_oci_spec_bytes(o: &OciRuntimeSpec) -> [u8; 32] {
             "capabilities_drop",
             &canonical_string_list_bytes(&o.capabilities.drop),
         ),
-        ("security_context", &canonical_secctx_bytes(&o.security_context)),
+        (
+            "security_context",
+            &canonical_secctx_bytes(&o.security_context),
+        ),
         ("resources", &canonical_resources_bytes(&o.resources)),
     ])
 }
@@ -356,7 +363,10 @@ fn descriptor_records<'a>(
             "expected_firmware_measurement",
             &d.expected_firmware_measurement,
         ),
-        ("expected_runtime_class", d.expected_runtime_class.as_bytes()),
+        (
+            "expected_runtime_class",
+            d.expected_runtime_class.as_bytes(),
+        ),
         ("kbs_resource_path", d.kbs_resource_path.as_bytes()),
         ("policy_template_id", d.policy_template_id.as_bytes()),
         ("policy_template_sha256", &d.policy_template_sha256),
@@ -435,7 +445,9 @@ pub fn verify<'e>(
     expected_pubkey: &VerifyingKey,
 ) -> Result<&'e DeploymentDescriptor, DescriptorError> {
     if envelope.signing_pubkey.to_bytes() != expected_pubkey.to_bytes() {
-        return Err(DescriptorError::Verify("signing pubkey mismatch".to_string()));
+        return Err(DescriptorError::Verify(
+            "signing pubkey mismatch".to_string(),
+        ));
     }
     let bytes = descriptor_canonical_bytes(&envelope.descriptor);
     expected_pubkey
@@ -576,7 +588,10 @@ mod tests {
             security_context: SecurityContext::default(),
             resources: Resources::default(),
         });
-        assert_eq!(oci_a, oci_b, "env must canonicalize regardless of input order");
+        assert_eq!(
+            oci_a, oci_b,
+            "env must canonicalize regardless of input order"
+        );
     }
 
     #[test]

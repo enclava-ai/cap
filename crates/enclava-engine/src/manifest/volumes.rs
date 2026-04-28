@@ -1,8 +1,8 @@
 //! Volume and VolumeClaimTemplate builders for the StatefulSet.
 
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, EmptyDirVolumeSource, KeyToPath, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, SecretVolumeSource, Volume, VolumeResourceRequirements,
+    ConfigMapVolumeSource, EmptyDirVolumeSource, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Volume, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -49,20 +49,6 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             config_map: Some(ConfigMapVolumeSource {
                 name: format!("{}-tenant-ingress", app.name),
                 default_mode: Some(0o444),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        Volume {
-            name: "tls-cloudflare-token".to_string(),
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(app.attestation.cloudflare_token_secret.clone()),
-                items: Some(vec![KeyToPath {
-                    key: "api-token".to_string(),
-                    path: "token".to_string(),
-                    ..Default::default()
-                }]),
-                default_mode: Some(0o400),
                 ..Default::default()
             }),
             ..Default::default()

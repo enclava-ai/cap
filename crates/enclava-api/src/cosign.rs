@@ -507,9 +507,7 @@ fn build_pin_from_env(
         .split('@')
         .nth(1)
         .ok_or_else(|| {
-            CosignError::InvalidPolicy(format!(
-                "{label} image is not digest-pinned: {image_ref}"
-            ))
+            CosignError::InvalidPolicy(format!("{label} image is not digest-pinned: {image_ref}"))
         })?
         .to_string();
 
@@ -583,7 +581,10 @@ mod tests {
             "TEST_SIDECAR_ISSUER_URL",
         )
         .expect("pin");
-        assert!(matches!(pin.policy, VerificationPolicy::FulcioUrlIdentity { .. }));
+        assert!(matches!(
+            pin.policy,
+            VerificationPolicy::FulcioUrlIdentity { .. }
+        ));
         assert_eq!(
             pin.image_digest,
             "sha256:0000000000000000000000000000000000000000000000000000000000000000"

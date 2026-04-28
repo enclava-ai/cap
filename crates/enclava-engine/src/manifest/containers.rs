@@ -324,7 +324,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             "-c".to_string(),
             "LUKS_MAPPING_NAME=\"${LUKS_MAPPING_NAME}-tls\"\n\
              export LUKS_MAPPING_NAME\n\
-             export CF_API_TOKEN=$(cat /run/secrets/cloudflare/token)\n\
              caddy validate --config /etc/caddy/Caddyfile\n\
              exec /bin/sh /secure-pv/bootstrap.sh -- caddy run --config /etc/caddy/Caddyfile"
                 .to_string(),
@@ -349,12 +348,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             VolumeMount {
                 name: "tenant-ingress-caddyfile".to_string(),
                 mount_path: "/etc/caddy".to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "tls-cloudflare-token".to_string(),
-                mount_path: "/run/secrets/cloudflare".to_string(),
                 read_only: Some(true),
                 ..Default::default()
             },

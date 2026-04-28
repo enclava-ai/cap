@@ -81,10 +81,7 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     // descriptor can chain `expected_cc_init_data_hash` to the exact runtime
     // identity. enclava-init re-derives these and refuses to start on mismatch.
     toml.push('\n');
-    toml.push_str(&format!(
-        "runtime_class = \"{}\"\n",
-        DEFAULT_RUNTIME_CLASS
-    ));
+    toml.push_str(&format!("runtime_class = \"{}\"\n", DEFAULT_RUNTIME_CLASS));
     toml.push('\n');
     toml.push_str("[data.sidecar_digests]\n");
     toml.push_str(&format!(

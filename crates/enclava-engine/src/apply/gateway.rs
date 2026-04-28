@@ -83,14 +83,14 @@ async fn apply_dynamic_resource(
     let dyn_obj = value_to_dynamic_object(value, ar)?;
     let name = dyn_obj.metadata.name.as_deref().unwrap_or("<unnamed>");
     let api: Api<DynamicObject> = Api::namespaced_with(engine.client().clone(), namespace, ar);
-    let pp = PatchParams::apply(&engine.config().field_manager).force();
+    let pp = PatchParams::apply(&engine.config().field_manager);
     let patched = api.patch(name, &pp, &Patch::Apply(&dyn_obj)).await?;
 
     tracing::info!(
         namespace = %namespace,
         name = %name,
         kind = %ar.kind,
-        "Gateway resource applied via SSA"
+        "Gateway resource applied via SSA (no-force)"
     );
 
     Ok(patched)

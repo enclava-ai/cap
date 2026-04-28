@@ -292,6 +292,6 @@ fn caddy_container_has_required_volume_mounts() {
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().any(|m| m.name == "secure-pv-bootstrap"));
     assert!(vm.iter().any(|m| m.name == "tenant-ingress-caddyfile"));
-    assert!(vm.iter().any(|m| m.name == "tls-cloudflare-token"));
+    assert!(!vm.iter().any(|m| m.name == "tls-cloudflare-token"));
     assert!(vm.iter().any(|m| m.name == "ownership-signal"));
 }

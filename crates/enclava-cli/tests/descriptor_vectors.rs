@@ -11,7 +11,7 @@ use chrono::TimeZone;
 use chrono::Utc;
 use enclava_cli::descriptor::{
     Capabilities, DeploymentDescriptor, EnvVar, OciRuntimeSpec, Port, Resources, SecurityContext,
-    SignerIdentity, Sidecars, descriptor_canonical_bytes, descriptor_core_canonical_bytes,
+    Sidecars, SignerIdentity, descriptor_canonical_bytes, descriptor_core_canonical_bytes,
     descriptor_core_hash,
 };
 use std::path::PathBuf;

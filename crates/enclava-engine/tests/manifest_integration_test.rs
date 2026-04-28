@@ -95,16 +95,8 @@ fn generate_all_manifests_returns_all_resources() {
         Some("test-app-tenant-ingress")
     );
 
-    // Tenant Cloudflare token Secret
-    assert_eq!(
-        m.cloudflare_token_secret
-            .as_ref()
-            .unwrap()
-            .metadata
-            .name
-            .as_deref(),
-        Some("cloudflare-api-token-enclava-dev")
-    );
+    // TLS-ALPN-01 cutover: no tenant Cloudflare token Secret is generated.
+    assert!(m.cloudflare_token_secret.is_none());
 
     // StatefulSet
     assert_eq!(m.statefulset.metadata.name.as_deref(), Some("test-app"));
@@ -142,15 +134,7 @@ fn all_namespaced_resources_share_namespace() {
     );
     assert_eq!(m.startup_configmap.metadata.namespace.as_deref(), Some(ns));
     assert_eq!(m.ingress_configmap.metadata.namespace.as_deref(), Some(ns));
-    assert_eq!(
-        m.cloudflare_token_secret
-            .as_ref()
-            .unwrap()
-            .metadata
-            .namespace
-            .as_deref(),
-        Some(ns)
-    );
+    assert!(m.cloudflare_token_secret.is_none());
     assert_eq!(m.statefulset.metadata.namespace.as_deref(), Some(ns));
     assert_eq!(m.network_policy["metadata"]["namespace"].as_str(), Some(ns));
     assert_eq!(
@@ -221,20 +205,7 @@ fn all_managed_resources_have_managed_by_label() {
         Some(managed_by)
     );
 
-    let secret_labels = m
-        .cloudflare_token_secret
-        .as_ref()
-        .unwrap()
-        .metadata
-        .labels
-        .as_ref()
-        .unwrap();
-    assert_eq!(
-        secret_labels
-            .get("app.kubernetes.io/managed-by")
-            .map(|s| s.as_str()),
-        Some(managed_by)
-    );
+    assert!(m.cloudflare_token_secret.is_none());
 
     // CiliumNetworkPolicy
     assert_eq!(

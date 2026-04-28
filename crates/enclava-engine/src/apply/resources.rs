@@ -23,7 +23,7 @@ where
     let name = resource.meta().name.as_deref().unwrap_or("<unnamed>");
 
     let api: Api<K> = Api::namespaced(engine.client().clone(), namespace);
-    let pp = PatchParams::apply(&engine.config().field_manager).force();
+    let pp = PatchParams::apply(&engine.config().field_manager);
 
     let patched = api.patch(name, &pp, &Patch::Apply(resource)).await?;
 
@@ -31,7 +31,7 @@ where
         kind = %K::kind(&Default::default()),
         namespace = %namespace,
         name = %name,
-        "resource applied via SSA"
+        "resource applied via SSA (no-force)"
     );
 
     Ok(patched)
