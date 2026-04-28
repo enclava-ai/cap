@@ -31,25 +31,6 @@ ensure_secure_pv_tools() {
   if command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1; then
     return 0
   fi
-
-  if [ "${SECURE_PV_ALLOW_RUNTIME_INSTALL:-false}" = "true" ]; then
-    if command -v apt-get >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -qq
-      apt-get install -y -qq cryptsetup e2fsprogs >/dev/null
-      command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1
-      return $?
-    elif command -v apk >/dev/null 2>&1; then
-      apk add --no-cache cryptsetup e2fsprogs >/dev/null
-      command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1
-      return $?
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y cryptsetup e2fsprogs >/dev/null
-      command -v cryptsetup >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1
-      return $?
-    fi
-  fi
-
   echo "secure-pv: required tools missing (cryptsetup, mkfs.ext4). Build them into the image." >&2
   return 1
 }
@@ -58,25 +39,6 @@ ensure_kbs_fetch_tool() {
   if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
     return 0
   fi
-
-  if [ "${SECURE_PV_ALLOW_RUNTIME_INSTALL:-false}" = "true" ]; then
-    if command -v apt-get >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -qq
-      apt-get install -y -qq curl wget >/dev/null
-      command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
-      return $?
-    elif command -v apk >/dev/null 2>&1; then
-      apk add --no-cache curl wget >/dev/null
-      command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
-      return $?
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y curl wget >/dev/null
-      command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
-      return $?
-    fi
-  fi
-
   echo "secure-pv: required KBS fetch tool missing (curl, wget, or python). Build one into the image." >&2
   return 1
 }

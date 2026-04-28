@@ -94,14 +94,108 @@ fn network_policy_egress_has_kbs_service() {
 }
 
 #[test]
-fn network_policy_egress_has_world_http_https() {
+fn default_app_has_no_world_egress() {
     let app = sample_app();
     let val = generate_network_policy(&app);
-    let egress = &val["spec"]["egress"];
-    assert_eq!(egress[4]["toEntities"][0], "world");
-    let ports = &egress[4]["toPorts"][0]["ports"];
-    assert_eq!(ports[0]["port"], "80");
-    assert_eq!(ports[0]["protocol"], "TCP");
-    assert_eq!(ports[1]["port"], "443");
-    assert_eq!(ports[1]["protocol"], "TCP");
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    for rule in egress {
+        assert!(
+            rule.get("toEntities").is_none(),
+            "no rule may use toEntities (world): {rule}"
+        );
+    }
+}
+
+#[test]
+fn world_is_never_in_default_egress() {
+    let app = sample_app();
+    let val = generate_network_policy(&app);
+    let serialized = serde_json::to_string(&val).unwrap();
+    assert!(
+        !serialized.contains("\"world\""),
+        "platform default egress must never include world: {serialized}"
+    );
+    assert!(
+        !serialized.contains("toEntities"),
+        "platform default egress must never use toEntities: {serialized}"
+    );
+}
+
+#[test]
+fn default_egress_includes_acme_endpoints() {
+    let app = sample_app();
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    let fqdns: Vec<&str> = egress
+        .iter()
+        .filter_map(|r| r["toFQDNs"][0]["matchName"].as_str())
+        .collect();
+    assert!(
+        fqdns.contains(&"acme-v02.api.letsencrypt.org"),
+        "missing ACME prod endpoint in {fqdns:?}"
+    );
+    assert!(
+        fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"),
+        "missing ACME staging endpoint in {fqdns:?}"
+    );
+    for rule in egress {
+        if rule["toFQDNs"][0]["matchName"]
+            .as_str()
+            .map(|s| s.contains("letsencrypt.org"))
+            .unwrap_or(false)
+        {
+            assert_eq!(rule["toPorts"][0]["ports"][0]["port"], "443");
+            assert_eq!(rule["toPorts"][0]["ports"][0]["protocol"], "TCP");
+        }
+    }
+}
+
+#[test]
+fn empty_egress_allowlist_renders_zero_extra_rules() {
+    let mut app = sample_app();
+    app.egress_allowlist = Vec::new();
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    assert_eq!(egress.len(), 6, "DNS + same-ns + KBS x2 + ACME x2");
+}
+
+#[test]
+fn per_app_egress_extends_platform_default() {
+    use enclava_engine::types::EgressRule;
+    let mut app = sample_app();
+    app.egress_allowlist = vec![EgressRule {
+        host: "api.stripe.com".to_string(),
+        ports: vec![443],
+    }];
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    let fqdns: Vec<&str> = egress
+        .iter()
+        .filter_map(|r| r["toFQDNs"][0]["matchName"].as_str())
+        .collect();
+    assert!(fqdns.contains(&"acme-v02.api.letsencrypt.org"));
+    assert!(fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"));
+    assert!(fqdns.contains(&"api.stripe.com"));
+}
+
+#[test]
+fn egress_allowlist_renders_one_rule_per_entry() {
+    use enclava_engine::types::EgressRule;
+    let mut app = sample_app();
+    app.egress_allowlist = vec![
+        EgressRule {
+            host: "api.stripe.com".to_string(),
+            ports: vec![443],
+        },
+        EgressRule {
+            host: "hooks.slack.com".to_string(),
+            ports: vec![443],
+        },
+    ];
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    assert_eq!(egress.len(), 8, "4 cluster + 2 ACME + 2 user");
+    assert_eq!(egress[6]["toFQDNs"][0]["matchName"], "api.stripe.com");
+    assert_eq!(egress[6]["toPorts"][0]["ports"][0]["port"], "443");
+    assert_eq!(egress[7]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }

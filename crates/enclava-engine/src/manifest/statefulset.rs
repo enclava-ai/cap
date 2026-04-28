@@ -109,7 +109,9 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
-                    runtime_class_name: Some("kata-qemu-snp".to_string()),
+                    runtime_class_name: Some(
+                        super::cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
+                    ),
                     service_account_name: Some(app.service_account.clone()),
                     automount_service_account_token: Some(false),
                     node_selector: Some(node_selector),

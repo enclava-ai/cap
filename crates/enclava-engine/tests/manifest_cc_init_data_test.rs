@@ -152,3 +152,28 @@ fn toml_structure_matches_python_template() {
     let toml = build_toml(&app);
     assert!(toml.starts_with("version = \"0.1.0\"\nalgorithm = \"sha256\""));
 }
+
+#[test]
+fn toml_binds_runtime_class() {
+    let app = sample_app();
+    let toml = build_toml(&app);
+    assert!(toml.contains("runtime_class = \"kata-qemu-snp\""));
+}
+
+#[test]
+fn toml_binds_sidecar_digests() {
+    let app = sample_app();
+    let toml = build_toml(&app);
+    assert!(toml.contains("[data.sidecar_digests]"));
+    assert!(toml.contains("attestation_proxy = \"sha256:1111"));
+    assert!(toml.contains("caddy_ingress = \"sha256:2222"));
+}
+
+#[test]
+fn verify_runtime_class_binding_passes_for_default_render() {
+    use enclava_engine::manifest::cc_init_data::verify_runtime_class_binding;
+    let app = sample_app();
+    let manifests = enclava_engine::manifest::generate_all_manifests(&app);
+    verify_runtime_class_binding(&manifests.statefulset)
+        .expect("default app must bind runtime class");
+}

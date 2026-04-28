@@ -395,6 +395,148 @@ async fn fetch_attestation_tag(
     }
 }
 
+/// Per-sidecar pinned signer identity (Phase 11).
+#[derive(Debug, Clone)]
+pub struct SidecarPin {
+    pub label: &'static str,
+    pub image_ref: String,
+    pub image_digest: String,
+    pub policy: VerificationPolicy,
+}
+
+/// Verified sidecar digests, returned in fixed sidecar-name order so they can
+/// be bound into `cc_init_data.sidecar_digests` and the KBS Rego.
+#[derive(Debug, Clone)]
+pub struct VerifiedSidecars {
+    pub attestation_proxy: String,
+    pub caddy_ingress: String,
+}
+
+/// Verify the platform-controlled sidecar images at API startup. Refuses to
+/// return Ok unless every configured sidecar has a Rekor-attested cosign
+/// signature satisfying the pinned signer identity.
+///
+/// `SKIP_COSIGN_VERIFY` (debug builds only — release rejects via env_gates)
+/// short-circuits this check. Production must always verify.
+pub async fn verify_sidecars_at_startup(
+    pins: &[SidecarPin],
+) -> Result<VerifiedSidecars, CosignError> {
+    if std::env::var("SKIP_COSIGN_VERIFY")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+    {
+        tracing::warn!("SKIP_COSIGN_VERIFY: sidecar startup verification bypassed (debug only)");
+        let mut ap = String::new();
+        let mut ca = String::new();
+        for p in pins {
+            match p.label {
+                "attestation_proxy" => ap = p.image_digest.clone(),
+                "caddy_ingress" => ca = p.image_digest.clone(),
+                _ => {}
+            }
+        }
+        return Ok(VerifiedSidecars {
+            attestation_proxy: ap,
+            caddy_ingress: ca,
+        });
+    }
+
+    let mut ap = String::new();
+    let mut ca = String::new();
+    for pin in pins {
+        let v = verify_image(&pin.image_ref, &pin.image_digest, &pin.policy).await?;
+        tracing::info!(
+            sidecar = %pin.label,
+            digest = %v.digest,
+            subject = ?v.signer_subject,
+            issuer = ?v.signer_issuer,
+            "sidecar cosign verified at startup"
+        );
+        match pin.label {
+            "attestation_proxy" => ap = v.digest,
+            "caddy_ingress" => ca = v.digest,
+            _ => {}
+        }
+    }
+    if ap.is_empty() || ca.is_empty() {
+        return Err(CosignError::PolicyNotConfigured);
+    }
+    Ok(VerifiedSidecars {
+        attestation_proxy: ap,
+        caddy_ingress: ca,
+    })
+}
+
+/// Build sidecar pins from environment variables. Returns `None` if neither
+/// sidecar image is configured (developer mode); returns an error if the
+/// signer-identity vars are missing for a configured image.
+pub fn sidecar_pins_from_env() -> Result<Option<Vec<SidecarPin>>, CosignError> {
+    let proxy_image = std::env::var("ATTESTATION_PROXY_IMAGE").ok();
+    let caddy_image = std::env::var("CADDY_INGRESS_IMAGE").ok();
+    if proxy_image.is_none() && caddy_image.is_none() {
+        return Ok(None);
+    }
+
+    let mut pins = Vec::new();
+    if let Some(image) = proxy_image {
+        pins.push(build_pin_from_env(
+            "attestation_proxy",
+            &image,
+            "ATTESTATION_PROXY_SIGNER_SUBJECT",
+            "ATTESTATION_PROXY_SIGNER_ISSUER",
+        )?);
+    }
+    if let Some(image) = caddy_image {
+        pins.push(build_pin_from_env(
+            "caddy_ingress",
+            &image,
+            "CADDY_INGRESS_SIGNER_SUBJECT",
+            "CADDY_INGRESS_SIGNER_ISSUER",
+        )?);
+    }
+    Ok(Some(pins))
+}
+
+fn build_pin_from_env(
+    label: &'static str,
+    image_ref: &str,
+    subject_var: &str,
+    issuer_var: &str,
+) -> Result<SidecarPin, CosignError> {
+    let digest = image_ref
+        .split('@')
+        .nth(1)
+        .ok_or_else(|| {
+            CosignError::InvalidPolicy(format!("{label} image is not digest-pinned: {image_ref}"))
+        })?
+        .to_string();
+
+    let subject = std::env::var(subject_var).map_err(|_| {
+        CosignError::InvalidPolicy(format!("missing {subject_var} for sidecar {label}"))
+    })?;
+    let issuer = std::env::var(issuer_var).map_err(|_| {
+        CosignError::InvalidPolicy(format!("missing {issuer_var} for sidecar {label}"))
+    })?;
+
+    let policy = if subject.starts_with("https://") {
+        VerificationPolicy::FulcioUrlIdentity {
+            fulcio_subject_url: subject,
+            fulcio_issuer: issuer,
+        }
+    } else {
+        VerificationPolicy::FulcioEmailIdentity {
+            email: subject,
+            fulcio_issuer: issuer,
+        }
+    };
+    Ok(SidecarPin {
+        label,
+        image_ref: image_ref.to_string(),
+        image_digest: digest,
+        policy,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +548,47 @@ mod tests {
                     .to_string(),
             fulcio_issuer: "https://token.actions.githubusercontent.com".to_string(),
         }
+    }
+
+    #[test]
+    fn build_pin_from_env_rejects_non_digest_image() {
+        let err = build_pin_from_env(
+            "attestation_proxy",
+            "ghcr.io/x/y:tag",
+            "TEST_SUBJECT_VAR",
+            "TEST_ISSUER_VAR",
+        )
+        .unwrap_err();
+        assert!(matches!(err, CosignError::InvalidPolicy(msg) if msg.contains("digest-pinned")));
+    }
+
+    #[test]
+    fn build_pin_from_env_url_subject_picks_url_policy() {
+        unsafe {
+            std::env::set_var(
+                "TEST_SIDECAR_SUBJECT_URL",
+                "https://github.com/x/y/.github/workflows/build.yml@refs/heads/main",
+            );
+            std::env::set_var(
+                "TEST_SIDECAR_ISSUER_URL",
+                "https://token.actions.githubusercontent.com",
+            );
+        }
+        let pin = build_pin_from_env(
+            "attestation_proxy",
+            "ghcr.io/x/y@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "TEST_SIDECAR_SUBJECT_URL",
+            "TEST_SIDECAR_ISSUER_URL",
+        )
+        .expect("pin");
+        assert!(matches!(
+            pin.policy,
+            VerificationPolicy::FulcioUrlIdentity { .. }
+        ));
+        assert_eq!(
+            pin.image_digest,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]

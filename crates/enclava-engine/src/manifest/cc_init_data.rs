@@ -77,8 +77,28 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     toml.push_str(&identity_toml);
     toml.push_str("'''\n");
 
+    // Phase 11: bind runtime class and sidecar digests so the customer-signed
+    // descriptor can chain `expected_cc_init_data_hash` to the exact runtime
+    // identity. enclava-init re-derives these and refuses to start on mismatch.
+    toml.push('\n');
+    toml.push_str(&format!("runtime_class = \"{}\"\n", DEFAULT_RUNTIME_CLASS));
+    toml.push('\n');
+    toml.push_str("[data.sidecar_digests]\n");
+    toml.push_str(&format!(
+        "attestation_proxy = \"{}\"\n",
+        app.attestation.proxy_image.digest()
+    ));
+    toml.push_str(&format!(
+        "caddy_ingress = \"{}\"\n",
+        app.attestation.caddy_image.digest()
+    ));
+
     toml
 }
+
+/// The SNP runtime class CAP requires. enclava-init reads this from cc_init_data
+/// at boot and refuses to start if the rendered Pod's `runtimeClassName` differs.
+pub const DEFAULT_RUNTIME_CLASS: &str = "kata-qemu-snp";
 
 /// Build the identity.toml content.
 fn build_identity_toml(
@@ -125,4 +145,23 @@ pub fn compute_cc_init_data(app: &ConfidentialApp) -> (String, String) {
     let hash = sha256_hex(&toml);
     let encoded = encode_cc_init_data(&toml);
     (encoded, hash)
+}
+
+/// Verify that the rendered StatefulSet's `runtimeClassName` matches what
+/// cc_init_data binds. Phase 11: deploy fails fast if the chain breaks.
+pub fn verify_runtime_class_binding(
+    sts: &k8s_openapi::api::apps::v1::StatefulSet,
+) -> Result<(), String> {
+    let actual = sts
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.runtime_class_name.as_deref());
+    match actual {
+        Some(name) if name == DEFAULT_RUNTIME_CLASS => Ok(()),
+        Some(other) => Err(format!(
+            "rendered Pod runtimeClassName is `{other}`, expected `{DEFAULT_RUNTIME_CLASS}`"
+        )),
+        None => Err("rendered Pod has no runtimeClassName".to_string()),
+    }
 }

@@ -76,14 +76,14 @@ pub async fn apply_network_policy(
 
     let ar = cilium_api_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(engine.client().clone(), namespace, &ar);
-    let pp = PatchParams::apply(&engine.config().field_manager).force();
+    let pp = PatchParams::apply(&engine.config().field_manager);
 
     let patched = api.patch(name, &pp, &Patch::Apply(&dyn_obj)).await?;
 
     tracing::info!(
         namespace = %namespace,
         name = %name,
-        "CiliumNetworkPolicy applied via SSA (DynamicObject)"
+        "CiliumNetworkPolicy applied via SSA (DynamicObject, no-force)"
     );
 
     Ok(patched)

@@ -69,7 +69,9 @@ pub fn generate_all_manifests(app: &ConfidentialApp) -> GeneratedManifests {
         bootstrap_configmap: bootstrap::generate_bootstrap_configmap(app),
         startup_configmap: startup::generate_startup_configmap(app),
         ingress_configmap: ingress::generate_ingress_configmap(app),
-        cloudflare_token_secret: secrets::generate_cloudflare_token_secret(app),
+        // Phase 0/11 cutover: tenant Caddy now uses TLS-ALPN-01 only, so no
+        // Cloudflare DNS-01 token should be created in tenant namespaces.
+        cloudflare_token_secret: None,
         statefulset: statefulset::generate_statefulset(app),
         kbs_owner_binding: kbs_policy::generate_owner_binding_entry(app),
     }

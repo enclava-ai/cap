@@ -142,6 +142,7 @@ pub async fn build_confidential_app(
             memory: resources.memory_limit,
         },
         attestation: attestation_config.clone(),
+        egress_allowlist: Vec::new(),
     })
 }
 

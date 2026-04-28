@@ -44,6 +44,19 @@ pub struct ConfidentialApp {
     pub resources: ResourceLimits,
     /// Attestation proxy and ingress sidecar configuration.
     pub attestation: AttestationConfig,
+    /// Per-app world-egress allowlist (Phase 11). Default: empty -> no
+    /// world-egress rules emitted. Each rule is rendered as a Cilium `toFQDNs`
+    /// egress entry restricted to the listed TCP ports.
+    #[serde(default)]
+    pub egress_allowlist: Vec<EgressRule>,
+}
+
+/// One world-egress allowance. Hosts must validate as FQDNs (see
+/// `enclava_common::validate::validate_fqdn`); ports are TCP only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressRule {
+    pub host: String,
+    pub ports: Vec<u16>,
 }
 
 /// Attestation proxy configuration.

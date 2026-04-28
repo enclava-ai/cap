@@ -65,12 +65,15 @@ fn caddyfile_has_unlock_route() {
 }
 
 #[test]
-fn caddyfile_has_tls_cloudflare() {
+fn caddyfile_uses_tls_alpn_without_cloudflare_dns01() {
     let app = sample_app();
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
-    assert!(caddyfile.contains("dns cloudflare"));
+    assert!(caddyfile.contains("issuer acme"));
+    assert!(caddyfile.contains("disable_http_challenge"));
+    assert!(!caddyfile.contains("dns cloudflare"));
+    assert!(!caddyfile.contains("CF_API_TOKEN"));
 }
 
 #[test]

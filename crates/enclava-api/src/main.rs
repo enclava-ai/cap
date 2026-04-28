@@ -195,6 +195,32 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Phase 11: cosign-verify the platform-controlled sidecars before serving
+    // any deploy/unlock requests. Refusing to start prevents an operator who
+    // has swapped a sidecar image from booting CAP and minting cc_init_data
+    // that anchors the swapped digest.
+    match enclava_api::cosign::sidecar_pins_from_env() {
+        Ok(Some(pins)) => match enclava_api::cosign::verify_sidecars_at_startup(&pins).await {
+            Ok(v) => tracing::info!(
+                attestation_proxy = %v.attestation_proxy,
+                caddy_ingress = %v.caddy_ingress,
+                "platform sidecar images verified"
+            ),
+            Err(e) => {
+                eprintln!("startup refused: sidecar cosign verification failed: {e}");
+                std::process::exit(1);
+            }
+        },
+        Ok(None) => tracing::warn!(
+            "no sidecar images configured; deploy requests will fail until \
+             ATTESTATION_PROXY_IMAGE/CADDY_INGRESS_IMAGE are set"
+        ),
+        Err(e) => {
+            eprintln!("startup refused: invalid sidecar pin configuration: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let btcpay_url =

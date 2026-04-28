@@ -189,8 +189,9 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str(&spec.hosts.join(", "));
     out.push_str(" {\n");
     out.push_str("  tls {\n");
-    out.push_str("    dns cloudflare {env.CF_API_TOKEN}\n");
-    out.push_str("    resolvers 10.43.0.10\n");
+    out.push_str("    issuer acme {\n");
+    out.push_str("      disable_http_challenge\n");
+    out.push_str("    }\n");
     out.push_str("  }\n");
     out.push_str("  @attestation-proxy path /v1/attestation /v1/attestation/* /unlock\n");
     out.push_str("  handle @attestation-proxy {\n");

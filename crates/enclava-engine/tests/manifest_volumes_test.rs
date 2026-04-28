@@ -47,18 +47,10 @@ fn volumes_has_tenant_ingress_caddyfile() {
 }
 
 #[test]
-fn volumes_has_tls_cloudflare_token() {
+fn volumes_do_not_mount_tls_cloudflare_token() {
     let app = sample_app();
     let vols = build_volumes(&app);
-    let v = vols
-        .iter()
-        .find(|v| v.name == "tls-cloudflare-token")
-        .unwrap();
-    let sec = v.secret.as_ref().unwrap();
-    assert_eq!(
-        sec.secret_name.as_deref(),
-        Some("cloudflare-api-token-enclava-dev")
-    );
+    assert!(!vols.iter().any(|v| v.name == "tls-cloudflare-token"));
 }
 
 #[test]

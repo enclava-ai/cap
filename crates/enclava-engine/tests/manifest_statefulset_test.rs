@@ -229,7 +229,7 @@ fn statefulset_has_volumes() {
         .unwrap();
     assert!(volumes.iter().any(|v| v.name == "ownership-signal"));
     assert!(volumes.iter().any(|v| v.name == "secure-pv-bootstrap"));
-    assert!(volumes.iter().any(|v| v.name == "tls-cloudflare-token"));
+    assert!(!volumes.iter().any(|v| v.name == "tls-cloudflare-token"));
 }
 
 #[test]

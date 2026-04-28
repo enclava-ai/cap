@@ -68,7 +68,6 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
     let env_vars = vec![
         env("CRYPTSETUP_DEVICE", &app.storage.app_data.device_path),
         env("VOLUME_MOUNT_POINT", &app.storage.app_data.mount_path),
-        env("SECURE_PV_ALLOW_RUNTIME_INSTALL", "false"),
         env("SECURE_PV_STRIP_RUNTIME_CAPS", "true"),
         env("SECURE_PV_LUKS_INTEGRITY", "hmac-sha256"),
         env("SECURE_PV_BIND_MOUNTS", &bind_mounts_str),
@@ -299,7 +298,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         env_field_ref("POD_NAMESPACE", "metadata.namespace"),
         env("CRYPTSETUP_DEVICE", &app.storage.tls_data.device_path),
         env("VOLUME_MOUNT_POINT", &app.storage.tls_data.mount_path),
-        env("SECURE_PV_ALLOW_RUNTIME_INSTALL", "false"),
         env("SECURE_PV_STRIP_RUNTIME_CAPS", "false"),
         env("SECURE_PV_LUKS_INTEGRITY", "hmac-sha256"),
         env("WORKLOAD_SECRET_SOURCE", "kbs"),
@@ -326,7 +324,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             "-c".to_string(),
             "LUKS_MAPPING_NAME=\"${LUKS_MAPPING_NAME}-tls\"\n\
              export LUKS_MAPPING_NAME\n\
-             export CF_API_TOKEN=$(cat /run/secrets/cloudflare/token)\n\
              caddy validate --config /etc/caddy/Caddyfile\n\
              exec /bin/sh /secure-pv/bootstrap.sh -- caddy run --config /etc/caddy/Caddyfile"
                 .to_string(),
@@ -351,12 +348,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             VolumeMount {
                 name: "tenant-ingress-caddyfile".to_string(),
                 mount_path: "/etc/caddy".to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "tls-cloudflare-token".to_string(),
-                mount_path: "/run/secrets/cloudflare".to_string(),
                 read_only: Some(true),
                 ..Default::default()
             },
