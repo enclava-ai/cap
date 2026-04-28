@@ -72,9 +72,24 @@ pub fn chown(path: &Path, ident: ExecIdentity) -> Result<()> {
     Ok(())
 }
 
+pub fn chown_recursive(path: &Path, ident: ExecIdentity) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            chown_recursive(&entry.path(), ident)?;
+        }
+    }
+    chown(path, ident)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn resolve_numeric_uid_only() {
@@ -95,5 +110,22 @@ mod tests {
     #[test]
     fn resolve_invalid() {
         assert!(resolve_exec_identity("not-a-real-user-xyzzy:abc").is_err());
+    }
+
+    #[test]
+    fn chown_recursive_skips_symlinks() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let id = ExecIdentity {
+            uid: nix::unistd::Uid::current().as_raw(),
+            gid: nix::unistd::Gid::current().as_raw(),
+            kind: IdentityKind::Numeric,
+        };
+        chown_recursive(dir.path(), id).unwrap();
     }
 }

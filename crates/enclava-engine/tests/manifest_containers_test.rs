@@ -56,6 +56,29 @@ fn app_container_mounts_state_filesystem() {
     assert!(c.volume_devices.is_none());
 }
 
+#[test]
+fn app_container_preserves_declared_storage_paths_as_subpaths() {
+    let c = build_app_container(&sample_app());
+    let vm = c.volume_mounts.as_ref().unwrap();
+    let m = vm
+        .iter()
+        .find(|m| m.name == "state-mount" && m.mount_path == "/app/data")
+        .unwrap();
+    assert_eq!(m.sub_path.as_deref(), Some("app-data"));
+    assert_eq!(m.mount_propagation.as_deref(), Some("HostToContainer"));
+    assert_eq!(
+        c.env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "VOLUME_MOUNT_POINT")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state")
+    );
+}
+
 // === Attestation proxy ===
 
 #[test]

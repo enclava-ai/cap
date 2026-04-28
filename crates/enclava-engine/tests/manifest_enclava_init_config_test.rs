@@ -23,6 +23,19 @@ fn config_toml_has_both_volume_blocks() {
 }
 
 #[test]
+fn config_toml_has_runtime_ownership_and_app_bind_mounts() {
+    let cm = generate_enclava_init_configmap(&sample_app());
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+    assert!(toml_text.contains("app-uid = 10001"));
+    assert!(toml_text.contains("app-gid = 10001"));
+    assert!(toml_text.contains("caddy-uid = 10002"));
+    assert!(toml_text.contains("caddy-gid = 10002"));
+    assert!(toml_text.contains("[[app-bind-mounts]]"));
+    assert!(toml_text.contains("subdir = \"app-data\""));
+    assert!(toml_text.contains("mount-path = \"/app/data\""));
+}
+
+#[test]
 fn config_toml_has_required_unlock_inputs() {
     let cm = generate_enclava_init_configmap(&sample_app());
     let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();

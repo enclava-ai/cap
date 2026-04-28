@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow};
+use enclava_init::chown::{self, ExecIdentity, IdentityKind};
 use enclava_init::config::{Config, Mode, VolumeConfig};
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{kbs_fetch, luks, seeds, socket, trustee_verify, unlock, writes};
@@ -42,6 +43,7 @@ fn run() -> Result<()> {
     // load anything from /state for diagnostics; we just refuse to write the
     // per-component seeds in that case.
     open_luks_volumes(&cfg, &owner)?;
+    prepare_mount_ownership(&cfg)?;
 
     if !run_in_tee_verification(&cfg)? {
         // Skipped because Phase 3 Trustee patch isn't deployed yet. The
@@ -137,6 +139,69 @@ fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed) -> Result<()> {
         "opened luks volume"
     );
     Ok(())
+}
+
+fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
+    let app_identity = numeric_identity(cfg.app_uid, cfg.app_gid);
+    let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
+
+    let state_root = Path::new(&cfg.state.mount_path);
+    let tls_state_root = Path::new(&cfg.tls_state.mount_path);
+    std::fs::create_dir_all(state_root)
+        .with_context(|| format!("creating {}", state_root.display()))?;
+    std::fs::create_dir_all(tls_state_root)
+        .with_context(|| format!("creating {}", tls_state_root.display()))?;
+
+    chown::chown(state_root, app_identity)
+        .with_context(|| format!("chown {}", state_root.display()))?;
+    chown::chown_recursive(tls_state_root, caddy_identity)
+        .with_context(|| format!("chown {}", tls_state_root.display()))?;
+
+    let app_seed_dir = Path::new(&cfg.state_root).join("app");
+    std::fs::create_dir_all(&app_seed_dir)
+        .with_context(|| format!("creating {}", app_seed_dir.display()))?;
+    chown::chown_recursive(&app_seed_dir, app_identity)
+        .with_context(|| format!("chown {}", app_seed_dir.display()))?;
+
+    let caddy_seed_dir = Path::new(&cfg.state_root).join("caddy");
+    std::fs::create_dir_all(&caddy_seed_dir)
+        .with_context(|| format!("creating {}", caddy_seed_dir.display()))?;
+    chown::chown_recursive(&caddy_seed_dir, caddy_identity)
+        .with_context(|| format!("chown {}", caddy_seed_dir.display()))?;
+
+    for bind in &cfg.app_bind_mounts {
+        let dir = app_bind_mount_dir(state_root, &bind.subdir)?;
+        std::fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "creating app bind mount source {} for {}",
+                dir.display(),
+                bind.mount_path
+            )
+        })?;
+        chown::chown_recursive(&dir, app_identity)
+            .with_context(|| format!("chown {}", dir.display()))?;
+    }
+
+    Ok(())
+}
+
+fn app_bind_mount_dir(state_root: &Path, subdir: &str) -> Result<PathBuf> {
+    if subdir.is_empty() {
+        return Err(anyhow!("app bind mount subdir cannot be empty"));
+    }
+    let rel = Path::new(subdir);
+    if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(anyhow!("invalid app bind mount subdir: {subdir}"));
+    }
+    Ok(state_root.join(rel))
+}
+
+fn numeric_identity(uid: u32, gid: u32) -> ExecIdentity {
+    ExecIdentity {
+        uid,
+        gid,
+        kind: IdentityKind::Numeric,
+    }
 }
 
 fn derive_volume_key(owner: &OwnerSeed, info: &str) -> Result<DerivedSeed> {
@@ -243,6 +308,10 @@ fn write_per_component_seeds(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
 
     writes::atomic_write(&caddy_path, caddy_seed.as_bytes(), 0o600)?;
     writes::atomic_write(&app_path, app_seed.as_bytes(), 0o600)?;
+    chown::chown(&caddy_path, numeric_identity(cfg.caddy_uid, cfg.caddy_gid))
+        .with_context(|| format!("chown {}", caddy_path.display()))?;
+    chown::chown(&app_path, numeric_identity(cfg.app_uid, cfg.app_gid))
+        .with_context(|| format!("chown {}", app_path.display()))?;
 
     Ok(())
 }

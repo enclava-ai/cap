@@ -12,6 +12,10 @@ use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
 
 const LOCAL_CDH_RESOURCE_URL: &str = "http://127.0.0.1:8081/cdh/resource";
+const APP_UID: u32 = 10001;
+const APP_GID: u32 = 10001;
+const CADDY_UID: u32 = 10002;
+const CADDY_GID: u32 = 10002;
 
 pub fn configmap_name(app_name: &str) -> String {
     format!("{app_name}-enclava-init")
@@ -48,6 +52,10 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     let mut out = String::new();
     out.push_str(&format!("mode = \"{mode}\"\n"));
     out.push_str("state-root = \"/state\"\n");
+    out.push_str(&format!("app-uid = {APP_UID}\n"));
+    out.push_str(&format!("app-gid = {APP_GID}\n"));
+    out.push_str(&format!("caddy-uid = {CADDY_UID}\n"));
+    out.push_str(&format!("caddy-gid = {CADDY_GID}\n"));
     out.push_str(&format!("argon2-salt-hex = \"{}\"\n", argon2_salt_hex(app)));
     out.push_str("\n[state]\n");
     out.push_str(&format!(
@@ -78,6 +86,18 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out.push_str("\n# Phase 3 Trustee patches not yet deployed; in-TEE verification\n");
     out.push_str("# stays SKIPPED with a loud error log until this flips true.\n");
     out.push_str("trustee-policy-read-available = false\n");
+
+    if let Some(primary) = app.primary_container() {
+        for path in &primary.storage_paths {
+            out.push_str("\n[[app-bind-mounts]]\n");
+            out.push_str(&format!(
+                "subdir = {}\n",
+                toml_string(&storage_subdir(path))
+            ));
+            out.push_str(&format!("mount-path = {}\n", toml_string(path)));
+        }
+    }
+
     out
 }
 
@@ -91,4 +111,12 @@ fn argon2_salt_hex(app: &ConfidentialApp) -> String {
             app.tenant_instance_identity_hash.as_bytes(),
         ),
     ]))
+}
+
+fn storage_subdir(path: &str) -> String {
+    path.trim_start_matches('/').replace('/', "-")
+}
+
+fn toml_string(s: &str) -> String {
+    serde_json::to_string(s).expect("string serialization is infallible")
 }

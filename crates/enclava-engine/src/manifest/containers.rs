@@ -70,6 +70,10 @@ fn env_field_ref(name: &str, field_path: &str) -> EnvVar {
     }
 }
 
+fn storage_subdir(path: &str) -> String {
+    path.trim_start_matches('/').replace('/', "-")
+}
+
 /// Build the app container.
 ///
 /// Phase 5 default: unprivileged, drops ALL caps, reads its seed from
@@ -180,6 +184,13 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
+        volume_mounts.extend(primary.storage_paths.iter().map(|path| VolumeMount {
+            name: "state-mount".to_string(),
+            mount_path: path.clone(),
+            sub_path: Some(storage_subdir(path)),
+            mount_propagation: Some("HostToContainer".to_string()),
+            ..Default::default()
+        }));
     }
 
     let security_context = if legacy {

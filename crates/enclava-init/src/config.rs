@@ -26,6 +26,13 @@ pub struct VolumeConfig {
     pub hkdf_info: String,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct AppBindMountConfig {
+    pub subdir: String,
+    pub mount_path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
@@ -41,6 +48,21 @@ pub struct Config {
 
     #[serde(default = "default_attempts_path")]
     pub attempts_path: String,
+
+    #[serde(default = "default_app_uid")]
+    pub app_uid: u32,
+
+    #[serde(default = "default_app_gid")]
+    pub app_gid: u32,
+
+    #[serde(default = "default_caddy_uid")]
+    pub caddy_uid: u32,
+
+    #[serde(default = "default_caddy_gid")]
+    pub caddy_gid: u32,
+
+    #[serde(default)]
+    pub app_bind_mounts: Vec<AppBindMountConfig>,
 
     #[serde(default)]
     pub kbs_url: Option<String>,
@@ -80,6 +102,22 @@ fn default_state_root() -> String {
 
 fn default_attempts_path() -> String {
     "/run/enclava/unlock-attempts".to_string()
+}
+
+fn default_app_uid() -> u32 {
+    10001
+}
+
+fn default_app_gid() -> u32 {
+    10001
+}
+
+fn default_caddy_uid() -> u32 {
+    10002
+}
+
+fn default_caddy_gid() -> u32 {
+    10002
 }
 
 impl Config {
@@ -123,5 +161,55 @@ hkdf-info = "tls-state-luks-key"
         assert_eq!(c.mode, Mode::Autounlock);
         assert_eq!(c.state.device, "/dev/csi0");
         assert_eq!(c.tls_state.device, "/dev/csi1");
+        assert_eq!(c.app_uid, 10001);
+        assert_eq!(c.caddy_uid, 10002);
+        assert!(c.app_bind_mounts.is_empty());
+    }
+
+    #[test]
+    fn parses_ownership_and_bind_mounts() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+mode = "autounlock"
+app-uid = 20001
+app-gid = 20002
+caddy-uid = 20003
+caddy-gid = 20004
+kbs-url = "http://kbs"
+kbs-resource-path = "default/x/wrap-owner"
+
+[[app-bind-mounts]]
+subdir = "app-data"
+mount-path = "/app/data"
+
+[state]
+device = "/dev/csi0"
+mapping-name = "cap-state"
+mount-path = "/state"
+hkdf-info = "state-luks-key"
+
+[tls-state]
+device = "/dev/csi1"
+mapping-name = "cap-tls-state"
+mount-path = "/state/tls-state"
+hkdf-info = "tls-state-luks-key"
+"#,
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.app_uid, 20001);
+        assert_eq!(c.app_gid, 20002);
+        assert_eq!(c.caddy_uid, 20003);
+        assert_eq!(c.caddy_gid, 20004);
+        assert_eq!(
+            c.app_bind_mounts,
+            vec![AppBindMountConfig {
+                subdir: "app-data".to_string(),
+                mount_path: "/app/data".to_string(),
+            }]
+        );
     }
 }
