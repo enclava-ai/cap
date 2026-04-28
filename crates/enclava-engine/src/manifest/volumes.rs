@@ -1,4 +1,9 @@
 //! Volume and VolumeClaimTemplate builders for the StatefulSet.
+//!
+//! Phase 5 default: raw Block PVCs are passed only to enclava-init. The
+//! decrypted filesystems are mounted into shared EmptyDir mountpoint volumes
+//! (`state-mount`, `tls-state-mount`) that app/caddy consume with
+//! mountPropagation.
 
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, EmptyDirVolumeSource, PersistentVolumeClaim, PersistentVolumeClaimSpec,
@@ -8,11 +13,13 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
+use crate::manifest::containers::legacy_bootstrap_enabled;
+use crate::manifest::enclava_init_config;
 use crate::types::ConfidentialApp;
 
-/// Build all pod-level volumes.
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
-    vec![
+    let legacy = legacy_bootstrap_enabled();
+    let mut v = vec![
         Volume {
             name: "logs".to_string(),
             empty_dir: Some(EmptyDirVolumeSource::default()),
@@ -27,24 +34,6 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             ..Default::default()
         },
         Volume {
-            name: "secure-pv-bootstrap".to_string(),
-            config_map: Some(ConfigMapVolumeSource {
-                name: "secure-pv-bootstrap-script".to_string(),
-                default_mode: Some(0o555),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        Volume {
-            name: "startup".to_string(),
-            config_map: Some(ConfigMapVolumeSource {
-                name: format!("{}-startup", app.name),
-                default_mode: Some(0o755),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        Volume {
             name: "tenant-ingress-caddyfile".to_string(),
             config_map: Some(ConfigMapVolumeSource {
                 name: format!("{}-tenant-ingress", app.name),
@@ -53,14 +42,59 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             }),
             ..Default::default()
         },
-    ]
+    ];
+
+    if legacy {
+        v.push(Volume {
+            name: "secure-pv-bootstrap".to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: "secure-pv-bootstrap-script".to_string(),
+                default_mode: Some(0o555),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        v.push(Volume {
+            name: "startup".to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: format!("{}-startup", app.name),
+                default_mode: Some(0o755),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    } else {
+        v.push(Volume {
+            name: "unlock-socket".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("1Mi".to_string())),
+            }),
+            ..Default::default()
+        });
+        v.push(Volume {
+            name: "state-mount".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        v.push(Volume {
+            name: "tls-state-mount".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        v.push(Volume {
+            name: "enclava-init-config".to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: enclava_init_config::configmap_name(&app.name),
+                default_mode: Some(0o400),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    v
 }
 
-/// Build VolumeClaimTemplates for the StatefulSet.
-///
-/// Two block-mode PVCs on longhorn-wait:
-/// - state: app-data (durable)
-/// - tls-state: tls-data (disposable)
 pub fn build_volume_claim_templates(app: &ConfidentialApp) -> Vec<PersistentVolumeClaim> {
     vec![
         build_vct("state", &app.storage.app_data.size),

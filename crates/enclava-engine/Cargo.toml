@@ -34,3 +34,4 @@ enclava-engine = { path = ".", features = ["testutil"] }
 tokio = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+toml = { workspace = true }

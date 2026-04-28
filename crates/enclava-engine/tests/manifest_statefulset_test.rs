@@ -176,23 +176,50 @@ fn statefulset_has_kernel_params_annotation() {
 }
 
 #[test]
-fn statefulset_has_three_containers() {
+fn statefulset_phase5_split_init_and_steady_state_containers() {
+    // Phase 5: attestation-proxy is a native sidecar (initContainer with
+    // restartPolicy=Always) followed by the one-shot enclava-init; app and
+    // caddy run as steady-state containers.
     let app = sample_app();
     let sts = generate_statefulset(&app);
-    let containers = &sts
+    let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+
+    let init = pod.init_containers.as_ref().unwrap();
+    let init_names: Vec<&str> = init.iter().map(|c| c.name.as_str()).collect();
+    assert!(init_names.contains(&"attestation-proxy"));
+    assert!(init_names.contains(&"enclava-init"));
+
+    let proxy = init.iter().find(|c| c.name == "attestation-proxy").unwrap();
+    assert_eq!(proxy.restart_policy.as_deref(), Some("Always"));
+
+    let names: Vec<&str> = pod.containers.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"web"));
+    assert!(names.contains(&"tenant-ingress"));
+    assert!(!names.contains(&"attestation-proxy"));
+    assert!(!names.contains(&"enclava-init"));
+}
+
+#[test]
+fn statefulset_has_kernel_modules_annotation_for_dm_crypt() {
+    // B2 investigation: defense-in-depth annotation that fails loud if the
+    // Kata guest kernel image lacks dm_mod / dm_crypt.
+    let sts = generate_statefulset(&sample_app());
+    let annotations = sts
         .spec
         .as_ref()
         .unwrap()
         .template
-        .spec
+        .metadata
         .as_ref()
         .unwrap()
-        .containers;
-    assert_eq!(containers.len(), 3);
-    let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
-    assert!(names.contains(&"web"));
-    assert!(names.contains(&"attestation-proxy"));
-    assert!(names.contains(&"tenant-ingress"));
+        .annotations
+        .as_ref()
+        .unwrap();
+    let modules = annotations
+        .get("io.katacontainers.config.agent.kernel_modules")
+        .unwrap();
+    assert!(modules.contains("dm_mod"));
+    assert!(modules.contains("dm_crypt"));
 }
 
 #[test]
@@ -228,8 +255,11 @@ fn statefulset_has_volumes() {
         .as_ref()
         .unwrap();
     assert!(volumes.iter().any(|v| v.name == "ownership-signal"));
-    assert!(volumes.iter().any(|v| v.name == "secure-pv-bootstrap"));
-    assert!(!volumes.iter().any(|v| v.name == "tls-cloudflare-token"));
+    assert!(volumes.iter().any(|v| v.name == "unlock-socket"));
+    assert!(volumes.iter().any(|v| v.name == "enclava-init-config"));
+    // Phase 5 default does not mount Cloudflare DNS-01 token nor the legacy bootstrap script.
+    assert!(volumes.iter().all(|v| v.name != "tls-cloudflare-token"));
+    assert!(volumes.iter().all(|v| v.name != "secure-pv-bootstrap"));
 }
 
 #[test]
