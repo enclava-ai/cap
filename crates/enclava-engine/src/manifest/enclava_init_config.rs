@@ -8,7 +8,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 use crate::types::ConfidentialApp;
+use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
+
+const LOCAL_CDH_RESOURCE_URL: &str = "http://127.0.0.1:8081/cdh/resource";
 
 pub fn configmap_name(app_name: &str) -> String {
     format!("{app_name}-enclava-init")
@@ -44,13 +47,15 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     };
     let mut out = String::new();
     out.push_str(&format!("mode = \"{mode}\"\n"));
+    out.push_str("state-root = \"/state\"\n");
+    out.push_str(&format!("argon2-salt-hex = \"{}\"\n", argon2_salt_hex(app)));
     out.push_str("\n[state]\n");
-    out.push_str(&format!("device = \"{}\"\n", app.storage.app_data.device_path));
-    out.push_str("mapping-name = \"cap-state\"\n");
     out.push_str(&format!(
-        "mount-path = \"{}\"\n",
-        app.storage.app_data.mount_path
+        "device = \"{}\"\n",
+        app.storage.app_data.device_path
     ));
+    out.push_str("mapping-name = \"cap-state\"\n");
+    out.push_str("mount-path = \"/state\"\n");
     out.push_str("hkdf-info = \"state-luks-key\"\n");
     out.push_str("\n[tls-state]\n");
     out.push_str(&format!(
@@ -58,17 +63,15 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         app.storage.tls_data.device_path
     ));
     out.push_str("mapping-name = \"cap-tls-state\"\n");
-    out.push_str(&format!(
-        "mount-path = \"{}\"\n",
-        app.storage.tls_data.mount_path
-    ));
+    out.push_str("mount-path = \"/state/tls-state\"\n");
     out.push_str("hkdf-info = \"tls-state-luks-key\"\n");
 
     if app.unlock_mode == UnlockMode::Auto {
         out.push('\n');
+        out.push_str(&format!("kbs-url = \"{LOCAL_CDH_RESOURCE_URL}\"\n"));
         out.push_str(&format!(
             "kbs-resource-path = \"{}\"\n",
-            app.tls_resource_path()
+            app.owner_resource_path()
         ));
     }
 
@@ -78,3 +81,14 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out
 }
 
+fn argon2_salt_hex(app: &ConfidentialApp) -> String {
+    hex::encode(ce_v1_hash(&[
+        ("purpose", b"enclava-init-argon2-salt-v1"),
+        ("app_id", app.app_id.as_bytes().as_slice()),
+        ("namespace", app.namespace.as_bytes()),
+        (
+            "identity_hash",
+            app.tenant_instance_identity_hash.as_bytes(),
+        ),
+    ]))
+}

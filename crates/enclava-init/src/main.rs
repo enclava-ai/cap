@@ -118,21 +118,17 @@ fn open_luks_volumes(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
         tracing::warn!("ENCLAVA_INIT_DEV_NO_LUKS=true — skipping luks open (debug builds only)");
         return Ok(());
     }
-    open_one_volume(&cfg.state, owner, cfg.mode == Mode::Password)
+    open_one_volume(&cfg.state, owner)
         .with_context(|| format!("opening state volume {}", cfg.state.device))?;
-    open_one_volume(&cfg.tls_state, owner, cfg.mode == Mode::Password)
+    open_one_volume(&cfg.tls_state, owner)
         .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
     Ok(())
 }
 
-fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed, allow_format: bool) -> Result<()> {
+fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed) -> Result<()> {
     let key = derive_volume_key(owner, &vol.hkdf_info)?;
     let device = Path::new(&vol.device);
-    let opened = if allow_format {
-        luks::format_if_unformatted_then_open(device, &vol.mapping_name, &key)?
-    } else {
-        luks::open(device, &vol.mapping_name, &key)?
-    };
+    let opened = luks::format_if_unformatted_then_open(device, &vol.mapping_name, &key)?;
     luks::mount(&opened.mapper_path, Path::new(&vol.mount_path))?;
     tracing::info!(
         device = %vol.device,
@@ -153,10 +149,9 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
         return Ok(trustee_verify::verify_chain_or_skip(None)?);
     }
 
-    let workload_url = cfg
-        .workload_artifacts_url
-        .as_deref()
-        .ok_or_else(|| anyhow!("trustee_policy_read_available=true requires workload_artifacts_url"))?;
+    let workload_url = cfg.workload_artifacts_url.as_deref().ok_or_else(|| {
+        anyhow!("trustee_policy_read_available=true requires workload_artifacts_url")
+    })?;
     let policy_url = cfg
         .trustee_policy_url
         .as_deref()
@@ -174,8 +169,8 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
         .as_deref()
         .ok_or_else(|| anyhow!("verification requires signing_service_pubkey_hex"))?;
 
-    let cc_bytes = std::fs::read(cc_path)
-        .with_context(|| format!("reading cc_init_data from {cc_path}"))?;
+    let cc_bytes =
+        std::fs::read(cc_path).with_context(|| format!("reading cc_init_data from {cc_path}"))?;
     let cc_claims = parse_cc_init_data_claims(&cc_bytes)?;
     let signer_pk = parse_pubkey(signer_pk_hex)?;
     let signing_pk = parse_pubkey(signing_pk_hex)?;
@@ -210,7 +205,9 @@ fn parse_pubkey(hex_str: &str) -> Result<ed25519_dalek::VerifyingKey> {
 fn parse_cc_init_data_claims(toml_bytes: &[u8]) -> Result<trustee_verify::CcInitDataClaims> {
     let s = std::str::from_utf8(toml_bytes).context("cc_init_data not utf-8")?;
     let v: toml::Value = toml::from_str(s).context("cc_init_data parse")?;
-    let data = v.get("data").ok_or_else(|| anyhow!("cc_init_data missing [data] section"))?;
+    let data = v
+        .get("data")
+        .ok_or_else(|| anyhow!("cc_init_data missing [data] section"))?;
     let core_hash = read_hex32(data, "descriptor_core_hash")?;
     let signing_pk = read_hex32(data, "descriptor_signing_pubkey")?;
     let keyring_fp = read_hex32(data, "org_keyring_fingerprint")?;

@@ -1,7 +1,7 @@
 //! Container shape tests. Phase 5 default (no `LEGACY_BOOTSTRAP_SCRIPT`):
 //! enclava-init opens LUKS in an initContainer; app and caddy are unprivileged
-//! and read seeds from `/state/{app,caddy}/seed`. The tls-state volume is
-//! mounted as a filesystem at `/state/tls-state`.
+//! and read seeds from `/state/{app,caddy}/seed`. The app/caddy containers
+//! consume decrypted mountpoint volumes, not raw block PVCs.
 
 use enclava_engine::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
@@ -50,8 +50,9 @@ fn app_container_reads_seed_from_state_app() {
 fn app_container_mounts_state_filesystem() {
     let c = build_app_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    let m = vm.iter().find(|m| m.name == "state").unwrap();
+    let m = vm.iter().find(|m| m.name == "state-mount").unwrap();
     assert_eq!(m.mount_path, "/state");
+    assert_eq!(m.mount_propagation.as_deref(), Some("HostToContainer"));
     assert!(c.volume_devices.is_none());
 }
 
@@ -145,8 +146,9 @@ fn caddy_container_does_not_mount_cloudflare_token() {
 fn caddy_container_mounts_tls_state_filesystem() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    let m = vm.iter().find(|m| m.name == "tls-state").unwrap();
+    let m = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
     assert_eq!(m.mount_path, "/state/tls-state");
+    assert_eq!(m.mount_propagation.as_deref(), Some("HostToContainer"));
     assert!(c.volume_devices.is_none());
 }
 
@@ -165,8 +167,8 @@ fn enclava_init_container_drops_caps_and_keeps_only_sys_admin() {
     let c = build_enclava_init_container(&sample_app());
     assert_eq!(c.name, "enclava-init");
     let sc = c.security_context.as_ref().unwrap();
-    assert_eq!(sc.privileged, Some(false));
-    assert_eq!(sc.allow_privilege_escalation, Some(false));
+    assert_eq!(sc.privileged, Some(true));
+    assert_eq!(sc.allow_privilege_escalation, Some(true));
     let caps = sc.capabilities.as_ref().unwrap();
     assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
     assert_eq!(caps.add.as_deref(), Some(&["SYS_ADMIN".to_string()][..]));
@@ -181,4 +183,14 @@ fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().any(|m| m.name == "unlock-socket"));
     assert!(vm.iter().any(|m| m.name == "enclava-init-config"));
+    let state_mount = vm.iter().find(|m| m.name == "state-mount").unwrap();
+    let tls_mount = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
+    assert_eq!(
+        state_mount.mount_propagation.as_deref(),
+        Some("Bidirectional")
+    );
+    assert_eq!(
+        tls_mount.mount_propagation.as_deref(),
+        Some("Bidirectional")
+    );
 }

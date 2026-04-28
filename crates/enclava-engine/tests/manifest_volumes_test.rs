@@ -1,6 +1,6 @@
 //! Volume + VCT shape tests. Phase 5 default: unlock-socket emptyDir,
-//! enclava-init-config ConfigMap volume, no Cloudflare-token secret. PVCs
-//! are `volumeMode: Filesystem` (regression test for prototype P1).
+//! shared decrypted mountpoint EmptyDirs, enclava-init-config ConfigMap
+//! volume, no Cloudflare-token secret. PVCs stay raw Block devices for LUKS.
 
 use enclava_engine::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use enclava_engine::testutil::sample_app;
@@ -26,9 +26,19 @@ fn volumes_has_enclava_init_config_configmap() {
     // Regression for prototype P1: ConfigMap volume must be wired up by name.
     let app = sample_app();
     let vols = build_volumes(&app);
-    let v = vols.iter().find(|v| v.name == "enclava-init-config").unwrap();
+    let v = vols
+        .iter()
+        .find(|v| v.name == "enclava-init-config")
+        .unwrap();
     let cm = v.config_map.as_ref().unwrap();
     assert_eq!(cm.name, "test-app-enclava-init");
+}
+
+#[test]
+fn volumes_have_shared_decrypted_mountpoints() {
+    let vols = build_volumes(&sample_app());
+    assert!(vols.iter().any(|v| v.name == "state-mount"));
+    assert!(vols.iter().any(|v| v.name == "tls-state-mount"));
 }
 
 #[test]
@@ -50,27 +60,25 @@ fn volumes_does_not_mount_cloudflare_token_in_phase5_default() {
 }
 
 #[test]
-fn vcts_state_uses_filesystem_volume_mode() {
-    // Regression for prototype P1: must be Filesystem (not Block) — enclava-init
-    // mounts /dev/mapper/<name> as a filesystem at /state.
+fn vcts_state_uses_block_volume_mode() {
     let vcts = build_volume_claim_templates(&sample_app());
     let state = vcts
         .iter()
         .find(|v| v.metadata.name.as_deref() == Some("state"))
         .unwrap();
     let spec = state.spec.as_ref().unwrap();
-    assert_eq!(spec.volume_mode.as_deref(), Some("Filesystem"));
+    assert_eq!(spec.volume_mode.as_deref(), Some("Block"));
 }
 
 #[test]
-fn vcts_tls_state_uses_filesystem_volume_mode() {
+fn vcts_tls_state_uses_block_volume_mode() {
     let vcts = build_volume_claim_templates(&sample_app());
     let tls = vcts
         .iter()
         .find(|v| v.metadata.name.as_deref() == Some("tls-state"))
         .unwrap();
     let spec = tls.spec.as_ref().unwrap();
-    assert_eq!(spec.volume_mode.as_deref(), Some("Filesystem"));
+    assert_eq!(spec.volume_mode.as_deref(), Some("Block"));
 }
 
 #[test]

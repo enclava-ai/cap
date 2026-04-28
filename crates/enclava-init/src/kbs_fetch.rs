@@ -117,7 +117,10 @@ mod tests {
     fn fetch_wrap_key_401_attestation_rejected() {
         let port = spawn_server(401, vec![]);
         let c = KbsClient::new(format!("http://127.0.0.1:{port}"), "wrap".into());
-        let err = match c.fetch_wrap_key() { Ok(_) => panic!("expected error"), Err(e) => e };
+        let err = match c.fetch_wrap_key() {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
         assert!(matches!(err, InitError::Kbs(s) if s.contains("401")));
     }
 
@@ -125,7 +128,10 @@ mod tests {
     fn fetch_wrap_key_403_rego_denied() {
         let port = spawn_server(403, vec![]);
         let c = KbsClient::new(format!("http://127.0.0.1:{port}"), "wrap".into());
-        let err = match c.fetch_wrap_key() { Ok(_) => panic!("expected error"), Err(e) => e };
+        let err = match c.fetch_wrap_key() {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
         assert!(matches!(err, InitError::Kbs(s) if s.contains("403")));
     }
 
@@ -133,7 +139,10 @@ mod tests {
     fn fetch_wrap_key_404_not_found() {
         let port = spawn_server(404, vec![]);
         let c = KbsClient::new(format!("http://127.0.0.1:{port}"), "wrap".into());
-        let err = match c.fetch_wrap_key() { Ok(_) => panic!("expected error"), Err(e) => e };
+        let err = match c.fetch_wrap_key() {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
         assert!(matches!(err, InitError::Kbs(s) if s.contains("404")));
     }
 
@@ -141,7 +150,10 @@ mod tests {
     fn fetch_wrap_key_wrong_length() {
         let port = spawn_server(200, vec![0u8; 16]);
         let c = KbsClient::new(format!("http://127.0.0.1:{port}"), "wrap".into());
-        let err = match c.fetch_wrap_key() { Ok(_) => panic!("expected error"), Err(e) => e };
+        let err = match c.fetch_wrap_key() {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
         assert!(matches!(err, InitError::Kbs(s) if s.contains("wrong length")));
     }
 }

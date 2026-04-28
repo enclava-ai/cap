@@ -9,15 +9,12 @@
 //! The dm-crypt mapping persists across init-container exit because the
 //! sandbox VM kernel outlives the init container's userspace; after we open
 //! the volume here, the app and caddy containers see `/dev/mapper/<name>`
-//! for the rest of the pod's lifetime.
+//! for the rest of the pod's lifetime. Fresh LUKS2 volumes are formatted ext4
+//! before the first mount, so the runtime image must include `mkfs.ext4`.
 
 use std::path::{Path, PathBuf};
 
-use libcryptsetup_rs::{
-    CryptInit,
-    consts::flags::CryptActivate,
-    consts::vals::EncryptionFormat,
-};
+use libcryptsetup_rs::{CryptInit, consts::flags::CryptActivate, consts::vals::EncryptionFormat};
 
 use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
@@ -98,18 +95,33 @@ pub fn format_if_unformatted_then_open(
     mapping_name: &str,
     key: &DerivedSeed,
 ) -> Result<LuksOpened> {
-    if !is_formatted(device)? {
+    let needs_mkfs = !is_formatted(device)?;
+    if needs_mkfs {
         format(device, key)?;
     }
-    open(device, mapping_name, key)
+    let opened = open(device, mapping_name, key)?;
+    if needs_mkfs {
+        mkfs_ext4(&opened.mapper_path)?;
+    }
+    Ok(opened)
+}
+
+fn mkfs_ext4(mapper_path: &Path) -> Result<()> {
+    let status = std::process::Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg(mapper_path)
+        .status()
+        .map_err(|e| InitError::Luks(format!("mkfs.ext4 {}: {e}", mapper_path.display())))?;
+    if !status.success() {
+        return Err(InitError::Luks(format!(
+            "mkfs.ext4 {} exited with {status}",
+            mapper_path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Mount `mapper_path` (a filesystem) at `mount_point`.
-///
-/// Caller is responsible for ensuring the device carries a filesystem;
-/// fresh LUKS2 volumes need a mkfs pass (handled by the runtime hook in the
-/// production container image, not here — this module deliberately does not
-/// shell out).
 pub fn mount(mapper_path: &Path, mount_point: &Path) -> Result<()> {
     use nix::mount::{MsFlags, mount as nix_mount};
     std::fs::create_dir_all(mount_point)?;
@@ -120,8 +132,13 @@ pub fn mount(mapper_path: &Path, mount_point: &Path) -> Result<()> {
         MsFlags::empty(),
         None::<&str>,
     )
-    .map_err(|e| InitError::Luks(format!("mount {} -> {}: {e}",
-        mapper_path.display(), mount_point.display())))?;
+    .map_err(|e| {
+        InitError::Luks(format!(
+            "mount {} -> {}: {e}",
+            mapper_path.display(),
+            mount_point.display()
+        ))
+    })?;
     Ok(())
 }
 

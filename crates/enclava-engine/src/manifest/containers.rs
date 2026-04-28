@@ -23,11 +23,21 @@ pub fn legacy_bootstrap_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Image reference for the enclava-init initContainer. Operator-supplied via
-/// the `ENCLAVA_INIT_IMAGE` env var; falls back to a placeholder development
-/// tag so manifest tests don't need the env set.
+/// Image reference for the enclava-init initContainer. Production release
+/// builds require a digest-pinned operator-supplied image; debug builds keep a
+/// placeholder so manifest unit tests do not need registry access.
 pub fn enclava_init_image() -> String {
-    std::env::var("ENCLAVA_INIT_IMAGE").unwrap_or_else(|_| "enclava-init:dev".to_string())
+    let image = std::env::var("ENCLAVA_INIT_IMAGE").unwrap_or_else(|_| {
+        if cfg!(debug_assertions) {
+            "enclava-init:dev".to_string()
+        } else {
+            panic!("ENCLAVA_INIT_IMAGE must be set to a digest-pinned image")
+        }
+    });
+    if !cfg!(debug_assertions) && !image.contains("@sha256:") {
+        panic!("ENCLAVA_INIT_IMAGE must be digest-pinned with @sha256:")
+    }
+    image
 }
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
@@ -94,7 +104,10 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             env("SECURE_PV_EXEC_AS", "10001:10001"),
             env("SECURE_PV_CHOWN_RECURSIVE", "true"),
             env("WORKLOAD_SECRET_SOURCE", "kbs"),
-            env("WORKLOAD_SECRET_PATH", "/run/secure-pv/workload-secret-seed"),
+            env(
+                "WORKLOAD_SECRET_PATH",
+                "/run/secure-pv/workload-secret-seed",
+            ),
             env("KBS_CDH_ENDPOINT", "http://127.0.0.1:8081/cdh/resource"),
             env_field_ref("LUKS_MAPPING_NAME", "metadata.name"),
             env("ENCLAVA_SECURE_PV_BOOTSTRAP", "1"),
@@ -110,7 +123,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         ]);
     } else {
         env_vars.push(env("APP_SEED_PATH", "/state/app/seed"));
-        env_vars.push(env("VOLUME_MOUNT_POINT", &app.storage.app_data.mount_path));
+        env_vars.push(env("VOLUME_MOUNT_POINT", "/state"));
     }
 
     let (command, args): (Option<Vec<String>>, Option<Vec<String>>) = if legacy {
@@ -162,8 +175,9 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         ]);
     } else {
         volume_mounts.push(VolumeMount {
-            name: "state".to_string(),
+            name: "state-mount".to_string(),
             mount_path: "/state".to_string(),
+            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
     }
@@ -277,28 +291,35 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 /// Build the enclava-init initContainer (Phase 5).
 ///
 /// Runs once at pod startup. Performs Argon2id-based unlock or KBS autounlock,
-/// opens both LUKS volumes, runs the Trustee policy verification chain, writes
+/// opens both LUKS block PVCs, mounts the decrypted filesystems into shared
+/// mountpoint volumes, runs the Trustee policy verification chain, writes
 /// per-component HKDF seeds to /state/{caddy,app}/seed, and exits 0. Per B2
 /// investigation, the dm-crypt mapping persists across init exit because the
 /// Kata SEV-SNP guest kernel keeps the dm table for the sandbox VM lifetime.
 ///
-/// CAP_SYS_ADMIN is required for the cryptsetup luksOpen syscall and dropped
-/// the moment enclava-init exits — no privileged userspace remains.
+/// The one-shot init container needs device-mapper and mount propagation
+/// rights. It exits before steady-state app/caddy start, so no privileged
+/// userspace remains.
 pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
     Container {
         name: "enclava-init".to_string(),
         image: Some(enclava_init_image()),
         command: Some(vec!["/usr/local/bin/enclava-init".to_string()]),
-        env: Some(vec![env("ENCLAVA_INIT_CONFIG", "/etc/enclava-init/config.toml")]),
+        env: Some(vec![env(
+            "ENCLAVA_INIT_CONFIG",
+            "/etc/enclava-init/config.toml",
+        )]),
         volume_mounts: Some(vec![
             VolumeMount {
-                name: "state".to_string(),
+                name: "state-mount".to_string(),
                 mount_path: "/state".to_string(),
+                mount_propagation: Some("Bidirectional".to_string()),
                 ..Default::default()
             },
             VolumeMount {
-                name: "tls-state".to_string(),
+                name: "tls-state-mount".to_string(),
                 mount_path: "/state/tls-state".to_string(),
+                mount_propagation: Some("Bidirectional".to_string()),
                 ..Default::default()
             },
             VolumeMount {
@@ -324,14 +345,14 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             },
         ]),
         security_context: Some(SecurityContext {
-            privileged: Some(false),
-            allow_privilege_escalation: Some(false),
+            privileged: Some(true),
+            allow_privilege_escalation: Some(true),
             run_as_user: Some(0),
             run_as_group: Some(0),
             run_as_non_root: Some(false),
             read_only_root_filesystem: Some(true),
-            // cryptsetup luksOpen needs CAP_SYS_ADMIN for the device-mapper
-            // ioctls; dropped on init exit, so the steady-state pod has none.
+            // cryptsetup luksOpen and mount propagation need SYS_ADMIN; this
+            // container is one-shot, so steady-state pod containers have none.
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(vec!["SYS_ADMIN".to_string()]),
@@ -561,13 +582,15 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         });
     } else {
         volume_mounts.push(VolumeMount {
-            name: "state".to_string(),
+            name: "state-mount".to_string(),
             mount_path: "/state".to_string(),
+            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
         volume_mounts.push(VolumeMount {
-            name: "tls-state".to_string(),
+            name: "tls-state-mount".to_string(),
             mount_path: "/state/tls-state".to_string(),
+            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
     }

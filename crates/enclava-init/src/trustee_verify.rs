@@ -13,13 +13,16 @@
 //! local descriptor file the way the earlier prototype did — that would be
 //! pretending to verify something we didn't.
 //!
-//! All hashing uses CE-v1 records via `enclava_common::canonical` so
-//! signer + verifier agree byte-for-byte across crates.
+//! Descriptor hashing uses `enclava_common::descriptor`, the same module the
+//! CLI signer uses, so signer + verifier agree byte-for-byte across crates.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::ce_v1_bytes;
 #[cfg(test)]
 use enclava_common::canonical::ce_v1_hash;
+use enclava_common::descriptor::{
+    DeploymentDescriptor, descriptor_canonical_bytes, descriptor_core_hash,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -236,10 +239,7 @@ fn verify_keyring(artifacts: &ArtifactsBundle, expected_fingerprint: &[u8; 32]) 
     Ok(())
 }
 
-fn is_descriptor_signing_pubkey_in_keyring(
-    keyring: &serde_json::Value,
-    pubkey: &[u8; 32],
-) -> bool {
+fn is_descriptor_signing_pubkey_in_keyring(keyring: &serde_json::Value, pubkey: &[u8; 32]) -> bool {
     let Some(members) = keyring.get("members").and_then(|m| m.as_array()) else {
         return false;
     };
@@ -259,7 +259,10 @@ fn verify_signed_policy_artifact_metadata(
     let descriptor = &artifacts.descriptor_payload;
     let m = &env.metadata;
 
-    let want_app = descriptor.get("app_id").and_then(|v| v.as_str()).unwrap_or("");
+    let want_app = descriptor
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let want_deploy = descriptor
         .get("deploy_id")
         .and_then(|v| v.as_str())
@@ -281,7 +284,9 @@ fn verify_signed_policy_artifact_metadata(
         return Err(InitError::TrusteePolicy("step 5: app_id mismatch".into()));
     }
     if m.deploy_id != want_deploy {
-        return Err(InitError::TrusteePolicy("step 5: deploy_id mismatch".into()));
+        return Err(InitError::TrusteePolicy(
+            "step 5: deploy_id mismatch".into(),
+        ));
     }
     if m.descriptor_core_hash != hex::encode(cc.descriptor_core_hash) {
         return Err(InitError::TrusteePolicy(
@@ -312,45 +317,28 @@ fn verify_signed_policy_artifact_metadata(
 }
 
 fn compute_descriptor_core_hash(descriptor: &serde_json::Value) -> Result<[u8; 32]> {
-    let bytes = ce_v1_descriptor_core_message(descriptor)?;
-    Ok(sha256_bytes(&bytes))
-}
-
-fn ce_v1_descriptor_core_message(descriptor: &serde_json::Value) -> Result<Vec<u8>> {
-    let mut filtered = descriptor
-        .as_object()
-        .cloned()
-        .ok_or_else(|| InitError::TrusteePolicy("descriptor not an object".into()))?;
-    filtered.remove("expected_cc_init_data_hash");
-    filtered.remove("expected_kbs_policy_hash");
-    Ok(encode_json_object_ce_v1(
-        "enclava-deployment-descriptor-core-v1",
-        &filtered,
-    ))
+    let d = parse_descriptor(descriptor)?;
+    Ok(descriptor_core_hash(&d))
 }
 
 fn ce_v1_descriptor_full_message(descriptor: &serde_json::Value) -> Result<Vec<u8>> {
-    let obj = descriptor
-        .as_object()
-        .cloned()
-        .ok_or_else(|| InitError::TrusteePolicy("descriptor not an object".into()))?;
-    Ok(encode_json_object_ce_v1(
-        "enclava-deployment-descriptor-v1",
-        &obj,
-    ))
+    let d = parse_descriptor(descriptor)?;
+    Ok(descriptor_canonical_bytes(&d))
+}
+
+fn parse_descriptor(descriptor: &serde_json::Value) -> Result<DeploymentDescriptor> {
+    serde_json::from_value(descriptor.clone())
+        .map_err(|e| InitError::TrusteePolicy(format!("descriptor schema: {e}")))
 }
 
 fn ce_v1_policy_envelope_message(env: &PolicyEnvelope) -> Result<Vec<u8>> {
-    let metadata_value = serde_json::to_value(&env.metadata)
-        .map_err(|e| InitError::Serde(e.to_string()))?;
+    let metadata_value =
+        serde_json::to_value(&env.metadata).map_err(|e| InitError::Serde(e.to_string()))?;
     let metadata_obj = metadata_value
         .as_object()
         .cloned()
         .ok_or_else(|| InitError::Serde("metadata not an object".into()))?;
-    let metadata_bytes = encode_json_object_ce_v1(
-        "enclava-policy-metadata-v1",
-        &metadata_obj,
-    );
+    let metadata_bytes = encode_json_object_ce_v1("enclava-policy-metadata-v1", &metadata_obj);
     let metadata_hash: [u8; 32] = Sha256::digest(&metadata_bytes).into();
     let rego_hash: [u8; 32] = Sha256::digest(env.rego_text.as_bytes()).into();
     Ok(ce_v1_bytes(&[
@@ -405,7 +393,10 @@ fn ct_eq_hex(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]
@@ -439,6 +430,61 @@ mod tests {
         env
     }
 
+    fn descriptor_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "v1",
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "org_slug": "abcd1234",
+            "app_id": "22222222-2222-2222-2222-222222222222",
+            "app_name": "demo",
+            "deploy_id": "33333333-3333-3333-3333-333333333333",
+            "created_at": "2026-04-01T12:00:00Z",
+            "nonce": "07".repeat(32),
+            "app_domain": "demo.abcd1234.enclava.dev",
+            "tee_domain": "demo.abcd1234.tee.enclava.dev",
+            "custom_domains": ["app.example.com"],
+            "namespace": "cap-abcd1234-demo",
+            "service_account": "cap-demo-sa",
+            "identity_hash": "09".repeat(32),
+            "image_digest": "sha256:aaaa",
+            "signer_identity": {
+                "subject": "https://github.com/x/y/.github/workflows/build.yml",
+                "issuer": "https://token.actions.githubusercontent.com"
+            },
+            "oci_runtime_spec": {
+                "command": ["/app"],
+                "args": ["--serve"],
+                "env": [
+                    {"name": "A", "value": "1"},
+                    {"name": "B", "value": "2"}
+                ],
+                "ports": [{"container_port": 3000, "protocol": "TCP"}],
+                "mounts": [],
+                "capabilities": {"add": [], "drop": []},
+                "security_context": {
+                    "run_as_user": 0,
+                    "run_as_group": 0,
+                    "read_only_root_fs": false,
+                    "allow_privilege_escalation": false,
+                    "privileged": false
+                },
+                "resources": {"requests": [], "limits": []}
+            },
+            "sidecars": {
+                "attestation_proxy_digest": "sha256:1111",
+                "caddy_digest": "sha256:2222"
+            },
+            "expected_firmware_measurement": "03".repeat(32),
+            "expected_runtime_class": "kata-qemu-snp",
+            "kbs_resource_path": "default/cap-abcd1234-demo-owner",
+            "policy_template_id": "tmpl-default",
+            "policy_template_sha256": "04".repeat(32),
+            "platform_release_version": "v1.2.3",
+            "expected_cc_init_data_hash": "05".repeat(32),
+            "expected_kbs_policy_hash": "06".repeat(32)
+        })
+    }
+
     #[test]
     fn ce_v1_byte_parity_with_enclava_common() {
         let bytes = ce_v1_bytes(&[("purpose", b"test"), ("k", b"v")]);
@@ -466,16 +512,10 @@ mod tests {
 
     #[test]
     fn descriptor_core_hash_excludes_expected_fields() {
-        let v1 = serde_json::json!({
-            "app_id": "a",
-            "expected_cc_init_data_hash": "AA",
-            "expected_kbs_policy_hash": "BB"
-        });
-        let v2 = serde_json::json!({
-            "app_id": "a",
-            "expected_cc_init_data_hash": "CC",
-            "expected_kbs_policy_hash": "DD"
-        });
+        let v1 = descriptor_json();
+        let mut v2 = v1.clone();
+        v2["expected_cc_init_data_hash"] = serde_json::Value::String("aa".repeat(32));
+        v2["expected_kbs_policy_hash"] = serde_json::Value::String("bb".repeat(32));
         let h1 = compute_descriptor_core_hash(&v1).unwrap();
         let h2 = compute_descriptor_core_hash(&v2).unwrap();
         assert_eq!(h1, h2);
@@ -511,7 +551,12 @@ mod tests {
 
         let mut metadata = metadata_for(rego);
         metadata.app_id = descriptor.get("app_id").unwrap().as_str().unwrap().into();
-        metadata.deploy_id = descriptor.get("deploy_id").unwrap().as_str().unwrap().into();
+        metadata.deploy_id = descriptor
+            .get("deploy_id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .into();
         metadata.descriptor_core_hash = hex::encode(core_hash);
         metadata.descriptor_signing_pubkey = hex::encode(pubkey_bytes);
         metadata.platform_release_version = descriptor
@@ -561,13 +606,7 @@ mod tests {
     fn end_to_end_chain_passes_for_valid_inputs() {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
-        let descriptor = serde_json::json!({
-            "app_id": "app-1",
-            "deploy_id": "deploy-1",
-            "platform_release_version": "v1.2.3",
-            "policy_template_id": "tmpl-default",
-            "policy_template_sha256": "00".repeat(32)
-        });
+        let descriptor = descriptor_json();
         let keyring = serde_json::json!({
             "members": [
                 {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
@@ -593,13 +632,7 @@ mod tests {
     fn end_to_end_chain_rejects_tampered_descriptor() {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
-        let descriptor = serde_json::json!({
-            "app_id": "app-1",
-            "deploy_id": "deploy-1",
-            "platform_release_version": "v1.2.3",
-            "policy_template_id": "tmpl-default",
-            "policy_template_sha256": "00".repeat(32)
-        });
+        let descriptor = descriptor_json();
         let keyring = serde_json::json!({
             "members": [
                 {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
@@ -610,7 +643,7 @@ mod tests {
         let (mut bundle, env, cc, signer_pk, _) =
             build_inputs(&descriptor, keyring, rego, &signing, &deployer, cc_toml);
 
-        bundle.descriptor_payload["app_id"] = serde_json::Value::String("evil".into());
+        bundle.descriptor_payload["app_name"] = serde_json::Value::String("evil".into());
 
         let inputs = VerifyInputs {
             policy_envelope: &env,
@@ -633,13 +666,7 @@ mod tests {
     fn end_to_end_chain_rejects_wrong_keyring_fingerprint() {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
-        let descriptor = serde_json::json!({
-            "app_id": "app-1",
-            "deploy_id": "deploy-1",
-            "platform_release_version": "v1",
-            "policy_template_id": "tmpl",
-            "policy_template_sha256": "00".repeat(32)
-        });
+        let descriptor = descriptor_json();
         let keyring = serde_json::json!({
             "members": [
                 {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
@@ -667,13 +694,7 @@ mod tests {
     fn end_to_end_chain_rejects_rego_mismatch() {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
-        let descriptor = serde_json::json!({
-            "app_id": "app-1",
-            "deploy_id": "deploy-1",
-            "platform_release_version": "v1",
-            "policy_template_id": "tmpl",
-            "policy_template_sha256": "00".repeat(32)
-        });
+        let descriptor = descriptor_json();
         let keyring = serde_json::json!({
             "members": [
                 {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
