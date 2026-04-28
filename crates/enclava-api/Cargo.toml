@@ -12,10 +12,6 @@ name = "enclava-api"
 path = "src/main.rs"
 
 [[bin]]
-name = "kbs-resource-writer"
-path = "src/bin/kbs-resource-writer.rs"
-
-[[bin]]
 name = "migrate-two-hostnames"
 path = "src/bin/migrate_two_hostnames.rs"
 
@@ -53,7 +49,9 @@ sigstore = { workspace = true }
 hickory-resolver = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
-json-patch = "4.1"
+
+[features]
+prod-strict = ["enclava-engine/prod-strict"]
 
 [dev-dependencies]
 axum-test = "20"

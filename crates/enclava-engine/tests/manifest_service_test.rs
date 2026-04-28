@@ -34,6 +34,10 @@ fn service_has_attestation_port() {
         .find(|p| p.name.as_deref() == Some("attestation"))
         .unwrap();
     assert_eq!(att.port, 8081);
+    assert_eq!(
+        att.target_port.as_ref().unwrap(),
+        &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8443)
+    );
 }
 
 #[test]

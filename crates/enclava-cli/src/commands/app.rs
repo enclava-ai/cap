@@ -7,12 +7,30 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::Utc;
 use clap::Subcommand;
 use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::*;
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
+use enclava_cli::descriptor::{
+    CapAppOciRuntimeSpecInput, DeploymentDescriptorBuildInput, Sidecars, SignerIdentity,
+    build_descriptor, cap_app_oci_runtime_spec,
+};
+use enclava_cli::keyring::{
+    keyring_fingerprint, load_keyring_envelope, load_trusted_owner, member_allows_deploy,
+    verify_keyring,
+};
+use enclava_cli::keys;
+use enclava_cli::platform_release::PlatformRelease;
 use enclava_cli::tee_client::TeeClient;
+use enclava_common::types::{ResourceLimits, UnlockMode};
+use enclava_engine::manifest::cc_init_data;
+use enclava_engine::types::{
+    AttestationConfig, ConfidentialApp, Container, DomainSpec, StorageSpec, WorkloadArtifactBinding,
+};
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Resolve app name from --app flag or enclava.toml.
 fn resolve_app_name(explicit: &Option<String>) -> Result<String, Box<dyn std::error::Error>> {
@@ -43,6 +61,381 @@ fn parse_config_vars(vars: &[String]) -> Result<Vec<(String, String)>, Box<dyn s
             Ok((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+fn parse_hex32(name: &str, value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let bytes = hex::decode(value.trim())?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("{name} must be 32 bytes, got {}", bytes.len()).into())
+}
+
+fn env_hex32(name: &str) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+    std::env::var(name)
+        .ok()
+        .map(|value| parse_hex32(name, &value))
+        .transpose()
+}
+
+fn jwt_subject(token: &str) -> Option<Uuid> {
+    #[derive(serde::Deserialize)]
+    struct Claims {
+        sub: String,
+    }
+
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.as_bytes()).ok()?;
+    let claims: Claims = serde_json::from_slice(&bytes).ok()?;
+    Uuid::parse_str(&claims.sub).ok()
+}
+
+fn render_trustee_policy(
+    template: &str,
+    descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let replacements = [
+        (
+            "{{init_data_hash}}",
+            hex::encode(descriptor.expected_cc_init_data_hash),
+        ),
+        ("{{image_digest}}", descriptor.image_digest.clone()),
+        (
+            "{{signer_subject}}",
+            descriptor.signer_identity.subject.clone(),
+        ),
+        (
+            "{{signer_issuer}}",
+            descriptor.signer_identity.issuer.clone(),
+        ),
+        ("{{namespace}}", descriptor.namespace.clone()),
+        ("{{service_account}}", descriptor.service_account.clone()),
+        ("{{identity_hash}}", hex::encode(descriptor.identity_hash)),
+        (
+            "{{kbs_resource_path}}",
+            descriptor.kbs_resource_path.clone(),
+        ),
+    ];
+
+    let mut rendered = template.to_string();
+    for (needle, value) in replacements {
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| matches!(byte, b'"' | b'\\' | b'\n' | b'\r'))
+        {
+            return Err(format!("invalid Rego template slot value for {needle}").into());
+        }
+        rendered = rendered.replace(needle, &value);
+    }
+    if rendered.contains("{{") {
+        return Err("unrendered Rego template slot remains in platform release".into());
+    }
+    Ok(rendered)
+}
+
+struct ConfidentialAppForCcHash<'a> {
+    image: enclava_common::image::ImageRef,
+    release: &'a PlatformRelease,
+    workload_artifact_binding: WorkloadArtifactBinding,
+    tenant_id: String,
+    tenant_instance_identity_hash: [u8; 32],
+    bootstrap_owner_pubkey_hash: String,
+}
+
+fn confidential_app_for_cc_hash(
+    app: &AppResponse,
+    app_config: &AppConfig,
+    params: ConfidentialAppForCcHash<'_>,
+) -> Result<ConfidentialApp, Box<dyn std::error::Error>> {
+    let ConfidentialAppForCcHash {
+        image,
+        release,
+        workload_artifact_binding,
+        tenant_id,
+        tenant_instance_identity_hash,
+        bootstrap_owner_pubkey_hash,
+    } = params;
+
+    let unlock_mode = match app.unlock_mode.as_str() {
+        "password" => UnlockMode::Password,
+        "auto" | "auto-unlock" => UnlockMode::Auto,
+        other => return Err(format!("unsupported unlock mode {other}").into()),
+    };
+
+    Ok(ConfidentialApp {
+        app_id: Uuid::parse_str(&app.id)?,
+        name: app.name.clone(),
+        namespace: app.namespace.clone(),
+        instance_id: app.instance_id.clone(),
+        tenant_id,
+        bootstrap_owner_pubkey_hash,
+        tenant_instance_identity_hash: hex::encode(tenant_instance_identity_hash),
+        service_account: app
+            .service_account
+            .clone()
+            .unwrap_or_else(|| format!("cap-{}-sa", app.name)),
+        signer_identity_subject: app.signer_identity_subject.clone(),
+        signer_identity_issuer: app.signer_identity_issuer.clone(),
+        containers: vec![Container {
+            name: "web".to_string(),
+            image,
+            port: Some(app_config.app.port),
+            command: None,
+            env: HashMap::new(),
+            storage_paths: app_config.storage.paths.clone(),
+            is_primary: true,
+        }],
+        storage: StorageSpec::new(&app_config.storage.size, &app_config.storage.tls_size),
+        unlock_mode,
+        domain: DomainSpec {
+            platform_domain: app.domain.clone(),
+            tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
+            custom_domain: app.custom_domain.clone(),
+        },
+        api_signing_pubkey: String::new(),
+        api_url: String::new(),
+        resources: ResourceLimits {
+            cpu: app_config.resources.cpu.clone(),
+            memory: app_config.resources.memory.clone(),
+        },
+        attestation: AttestationConfig {
+            proxy_image: enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?,
+            caddy_image: enclava_common::image::ImageRef::parse(&release.caddy_ingress_image)?,
+            acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+            trustee_policy_read_available: true,
+            workload_artifacts_url: None,
+            trustee_policy_url: None,
+            platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
+            signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
+        },
+        egress_allowlist: Vec::new(),
+        workload_artifact_binding: Some(workload_artifact_binding),
+    })
+}
+
+fn bootstrap_identity_hash(
+    paths: &CliPaths,
+    org_name: &str,
+    app_name: &str,
+    tenant_id: &str,
+    instance_id: &str,
+) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+    let key_path = paths.bootstrap_key_path(org_name, app_name);
+    if !key_path.exists() {
+        return Ok(None);
+    }
+
+    let private_key_hex = std::fs::read_to_string(&key_path)?;
+    let private_key_bytes: [u8; 32] = hex::decode(private_key_hex.trim())?
+        .try_into()
+        .map_err(|_| "bootstrap key must be 32 bytes (64 hex chars)")?;
+    let signing_key = SigningKey::from_bytes(&private_key_bytes);
+    let public_key_hash = hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes()));
+    let identity_hash =
+        enclava_common::crypto::compute_identity_hash(tenant_id, instance_id, &public_key_hash);
+    Ok(Some(parse_hex32(
+        "tenant_instance_identity_hash",
+        &identity_hash,
+    )?))
+}
+
+fn bootstrap_public_key_hash(
+    paths: &CliPaths,
+    org_name: &str,
+    app_name: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let key_path = paths.bootstrap_key_path(org_name, app_name);
+    if !key_path.exists() {
+        return Ok(None);
+    }
+    let private_key_hex = std::fs::read_to_string(&key_path)?;
+    let private_key_bytes: [u8; 32] = hex::decode(private_key_hex.trim())?
+        .try_into()
+        .map_err(|_| "bootstrap key must be 32 bytes (64 hex chars)")?;
+    let signing_key = SigningKey::from_bytes(&private_key_bytes);
+    Ok(Some(hex::encode(Sha256::digest(
+        signing_key.verifying_key().to_bytes(),
+    ))))
+}
+
+async fn build_signed_deploy_blobs(
+    api: &ApiClient,
+    paths: &CliPaths,
+    cli_config: &config::CliConfig,
+    creds: &config::Credentials,
+    app: &AppResponse,
+    app_config: &AppConfig,
+    image: &str,
+) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+    let image_ref = enclava_common::image::ImageRef::parse(image)?;
+    if !image_ref.has_digest() {
+        return Err("deployment descriptor signing requires --image to be digest-pinned".into());
+    }
+
+    let release = PlatformRelease::load_verified()?;
+    let policy_template_sha256 = release.policy_template_sha256_bytes()?;
+    let _signing_service_pubkey = release.signing_service_pubkey_bytes()?;
+    let proxy_image = enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?;
+    let caddy_image = enclava_common::image::ImageRef::parse(&release.caddy_ingress_image)?;
+    if !proxy_image.has_digest() || !caddy_image.has_digest() {
+        return Err("platform release sidecar anchors must be digest-pinned".into());
+    }
+
+    let org_name = match cli_config.org.as_deref() {
+        Some(org) => org,
+        None => return Err("active org is required to sign deployment descriptor".into()),
+    };
+    let org_id = if let Ok(value) = std::env::var("ENCLAVA_ORG_ID") {
+        Uuid::parse_str(&value)?
+    } else {
+        api.list_orgs()
+            .await?
+            .into_iter()
+            .find(|org| org.name == org_name)
+            .and_then(|org| org.id)
+            .ok_or_else(|| format!("active org '{org_name}' was not returned by /orgs"))?
+            .parse()?
+    };
+
+    let app_id = Uuid::parse_str(&app.id)?;
+    let user_id = creds
+        .session_token
+        .as_deref()
+        .and_then(jwt_subject)
+        .unwrap_or_else(Uuid::new_v4);
+    let deployer_key = keys::create_and_store(user_id)?;
+    let trusted_owner = load_trusted_owner(&org_id)?
+        .ok_or("org owner pubkey is not trusted; run `enclava org keyring trust` or `enclava org keyring init`")?;
+    let keyring_envelope = load_keyring_envelope(&org_id).map_err(|err| {
+        format!(
+            "org keyring for {org_id} is not available locally: {err}; run `enclava org keyring init` or import the owner-signed keyring"
+        )
+    })?;
+    let verified_keyring = verify_keyring(&keyring_envelope, &trusted_owner)?;
+    if !member_allows_deploy(verified_keyring, &deployer_key.public) {
+        return Err(
+            "current CLI signing key is not an owner/admin/deployer in the org keyring".into(),
+        );
+    }
+    let org_keyring_fingerprint = keyring_fingerprint(verified_keyring);
+
+    let tenant_id = org_name.to_string();
+    let identity_hash = if let Some(value) = app.tenant_instance_identity_hash.as_deref() {
+        parse_hex32("tenant_instance_identity_hash", value)?
+    } else if let Some(value) = env_hex32("ENCLAVA_TENANT_INSTANCE_IDENTITY_HASH")? {
+        value
+    } else if app.unlock_mode == "password" {
+        match bootstrap_identity_hash(paths, org_name, &app.name, &tenant_id, &app.instance_id)? {
+            Some(hash) => hash,
+            None => {
+                return Err(
+                    "tenant identity hash anchor is required to sign deployment descriptor".into(),
+                );
+            }
+        }
+    } else {
+        return Err("ENCLAVA_TENANT_INSTANCE_IDENTITY_HASH is required to sign auto-unlock deployment descriptor".into());
+    };
+    let bootstrap_pubkey_hash = if let Some(value) = app.bootstrap_owner_pubkey_hash.clone() {
+        value
+    } else if let Some(value) = bootstrap_public_key_hash(paths, org_name, &app.name)? {
+        value
+    } else {
+        std::env::var("ENCLAVA_BOOTSTRAP_OWNER_PUBKEY_HASH")
+            .map_err(|_| "bootstrap owner pubkey hash is required to derive cc_init_data hash")?
+    };
+
+    let signer_identity = match (
+        app.signer_identity_subject.clone(),
+        app.signer_identity_issuer.clone(),
+    ) {
+        (Some(subject), Some(issuer)) if !subject.is_empty() && !issuer.is_empty() => {
+            SignerIdentity { subject, issuer }
+        }
+        _ => {
+            return Err(
+                "app signer identity must be pinned before signing deployment descriptor".into(),
+            );
+        }
+    };
+
+    let mut descriptor = build_descriptor(DeploymentDescriptorBuildInput {
+        org_id,
+        org_slug: org_name.to_string(),
+        app_id,
+        app_name: app.name.clone(),
+        deploy_id: Uuid::new_v4(),
+        created_at: Utc::now(),
+        app_domain: app.domain.clone(),
+        tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
+        custom_domains: app.custom_domain.clone().into_iter().collect(),
+        namespace: app.namespace.clone(),
+        service_account: app
+            .service_account
+            .clone()
+            .unwrap_or_else(|| format!("cap-{}-sa", app.name)),
+        identity_hash,
+        image_digest: image_ref.digest().to_string(),
+        signer_identity,
+        oci_runtime_spec: cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
+            container_name: "web".to_string(),
+            port: app_config.app.port,
+            workload_command: Vec::new(),
+            storage_paths: app_config.storage.paths.clone(),
+            cpu_limit: app_config.resources.cpu.clone(),
+            memory_limit: app_config.resources.memory.clone(),
+        }),
+        sidecars: Sidecars {
+            attestation_proxy_digest: proxy_image.digest().to_string(),
+            caddy_digest: caddy_image.digest().to_string(),
+        },
+        expected_firmware_measurement: release.expected_firmware_measurement_bytes()?,
+        expected_runtime_class: release.expected_runtime_class.clone(),
+        kbs_resource_path: format!(
+            "default/{}-{}-owner/seed-encrypted",
+            app.namespace, app.name
+        ),
+        policy_template_id: release.policy_template_id.clone(),
+        policy_template_sha256,
+        platform_release_version: release.platform_release_version.clone(),
+        expected_cc_init_data_hash: [0; 32],
+        expected_kbs_policy_hash: [0; 32],
+    });
+
+    let descriptor_core_hash = enclava_cli::descriptor::descriptor_core_hash(&descriptor);
+    let workload_artifact_binding = WorkloadArtifactBinding {
+        descriptor_core_hash,
+        descriptor_signing_pubkey: deployer_key.public.to_bytes(),
+        org_keyring_fingerprint,
+    };
+    let cc_app = confidential_app_for_cc_hash(
+        app,
+        app_config,
+        ConfidentialAppForCcHash {
+            image: image_ref.clone(),
+            release: &release,
+            workload_artifact_binding,
+            tenant_id,
+            tenant_instance_identity_hash: identity_hash,
+            bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
+        },
+    )?;
+    let cc_init_data_hash: [u8; 32] =
+        Sha256::digest(cc_init_data::build_toml(&cc_app).as_bytes()).into();
+    descriptor.expected_cc_init_data_hash = cc_init_data_hash;
+    let rendered_policy = render_trustee_policy(&release.policy_template_text, &descriptor)?;
+    descriptor.expected_kbs_policy_hash = Sha256::digest(rendered_policy.as_bytes()).into();
+
+    let descriptor_envelope = enclava_cli::descriptor::sign(
+        &deployer_key,
+        descriptor,
+        format!("cli:{}", deployer_key.user_id),
+    );
+
+    Ok(Some((
+        serde_json::to_string(&descriptor_envelope)?,
+        serde_json::to_string(&keyring_envelope)?,
+    )))
 }
 
 #[derive(Args)]
@@ -159,7 +552,7 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
 #[derive(Args)]
 pub struct DeployArgs {
-    /// Container image to deploy (tag resolved to digest automatically)
+    /// Digest-pinned container image to deploy when signing deployment artifacts.
     #[arg(long)]
     pub image: Option<String>,
     /// Set config key=value pairs delivered to TEE after boot
@@ -168,20 +561,35 @@ pub struct DeployArgs {
 }
 
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = match AppConfig::find_and_load() {
-        Ok(config) => config.app.name,
+    let app_config = match AppConfig::find_and_load() {
+        Ok(config) => config,
         Err(_) => {
             return Err("no enclava.toml found -- run `enclava init` or specify --app".into());
         }
     };
+    let app_name = app_config.app.name.clone();
 
     let config_pairs = parse_config_vars(&args.config_vars)?;
-    let (api, _paths, _cli_config) = build_api_client()?;
+    let (api, paths, cli_config) = build_api_client()?;
+    let creds = config::load_credentials(&paths)?;
     let app = api.get_app(&app_name).await?;
     let is_password_mode = app.unlock_mode == "password";
+    let signed_blobs = match args.image.as_deref() {
+        Some(image) => {
+            build_signed_deploy_blobs(&api, &paths, &cli_config, &creds, &app, &app_config, image)
+                .await?
+        }
+        None => None,
+    };
 
     let req = DeployRequest {
         image: args.image.clone(),
+        customer_descriptor_blob: signed_blobs
+            .as_ref()
+            .map(|(descriptor_blob, _)| descriptor_blob.clone()),
+        org_keyring_blob: signed_blobs
+            .as_ref()
+            .map(|(_, keyring_blob)| keyring_blob.clone()),
     };
 
     // Phase 1: Deploy
@@ -224,7 +632,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         pb.set_position(3);
         pb.set_message("Waiting for ownership claim endpoint...");
         if wait_for_bootstrap_endpoint(&api, &app_name, max_wait, poll_interval, &pb).await? {
-            claim_initial_ownership(&api, &_paths, &_cli_config, &app_name).await?;
+            claim_initial_ownership(&api, &paths, &cli_config, &app_name).await?;
             pb.set_message("Ownership claimed");
         }
     } else {

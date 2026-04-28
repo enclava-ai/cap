@@ -2,15 +2,16 @@
 //!
 //! Requires `libcryptsetup-dev` (Debian) / `cryptsetup-devel` (Fedora) at
 //! build time and `libcryptsetup.so.12` at runtime. Inside the Kata SEV-SNP
-//! guest the `dm_mod` and `dm_crypt` kernel modules must be loadable — the
-//! StatefulSet sets `io.katacontainers.config.agent.kernel_modules` as
-//! defense-in-depth (B2 investigation).
+//! guest the `dm_mod` and `dm_crypt` kernel features must be present. On the
+//! production guest image they are built in, so CAP must not ask kata-agent to
+//! modprobe them via `io.katacontainers.config.agent.kernel_modules`.
 //!
-//! The dm-crypt mapping persists across init-container exit because the
-//! sandbox VM kernel outlives the init container's userspace; after we open
-//! the volume here, the app and caddy containers see `/dev/mapper/<name>`
-//! for the rest of the pod's lifetime. Fresh LUKS2 volumes are formatted ext4
-//! before the first mount, so the runtime image must include `mkfs.ext4`.
+//! Live Kata SEV-SNP validation showed LUKS format/open/mount works in the
+//! guest, but creating workload containers after the mount exists fails on the
+//! current runtime. CAP therefore starts app/caddy under wait-exec helpers
+//! first, then runs this mounter sidecar and keeps it alive for the pod lifetime.
+//! Fresh LUKS2 volumes are formatted ext4 before the first mount, so the
+//! runtime image must include `mkfs.ext4`.
 
 use std::path::{Path, PathBuf};
 

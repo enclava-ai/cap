@@ -29,7 +29,9 @@ pub fn generate_service(app: &ConfidentialApp) -> Service {
         spec: Some(ServiceSpec {
             // The owner bootstrap API lives in the attestation-proxy sidecar and
             // must be reachable before the workload app has unlocked storage and
-            // passed its own readiness checks.
+            // passed its own readiness checks. The service's public attestation
+            // port targets the proxy's TLS listener; internal sidecars keep using
+            // cleartext loopback port 8081.
             publish_not_ready_addresses: Some(true),
             ports: Some(vec![
                 ServicePort {
@@ -41,7 +43,7 @@ pub fn generate_service(app: &ConfidentialApp) -> Service {
                 ServicePort {
                     name: Some("attestation".to_string()),
                     port: 8081,
-                    target_port: Some(IntOrString::Int(8081)),
+                    target_port: Some(IntOrString::Int(8443)),
                     ..Default::default()
                 },
             ]),

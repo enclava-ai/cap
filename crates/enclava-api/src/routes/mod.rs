@@ -7,3 +7,5 @@ pub mod domains;
 pub mod orgs;
 pub mod status;
 pub mod unlock;
+pub mod users;
+pub mod workload;

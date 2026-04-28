@@ -5,14 +5,18 @@ RUN apt-get update && \
       clang \
       libclang-dev \
       libcryptsetup-dev \
+      musl-tools \
       pkg-config && \
     rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p enclava-init
+RUN cargo build --release -p enclava-init --bin enclava-init && \
+    cargo build --release -p enclava-wait-exec --target x86_64-unknown-linux-musl
 
 FROM debian:bookworm-slim
 
@@ -24,5 +28,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/enclava-init /usr/local/bin/enclava-init
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/enclava-wait-exec /usr/local/bin/enclava-wait-exec
 
 ENTRYPOINT ["/usr/local/bin/enclava-init"]

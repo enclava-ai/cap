@@ -66,10 +66,14 @@ pub fn sample_app() -> ConfidentialApp {
             )
             .unwrap(),
             acme_ca_url: default_acme_ca_url(),
-            cloudflare_token_secret: "cloudflare-api-token-enclava-dev".to_string(),
-            cloudflare_api_token: Some("test-cloudflare-token".to_string()),
+            trustee_policy_read_available: false,
+            workload_artifacts_url: None,
+            trustee_policy_url: None,
+            platform_trustee_policy_pubkey_hex: None,
+            signing_service_pubkey_hex: None,
         },
         egress_allowlist: Vec::new(),
+        workload_artifact_binding: None,
     }
 }
 

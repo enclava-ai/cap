@@ -177,9 +177,9 @@ fn statefulset_has_kernel_params_annotation() {
 
 #[test]
 fn statefulset_phase5_split_init_and_steady_state_containers() {
-    // Phase 5: attestation-proxy is a native sidecar (initContainer with
-    // restartPolicy=Always) followed by the one-shot enclava-init; app and
-    // caddy run as steady-state containers.
+    // Phase 5: attestation-proxy is a native sidecar initContainer. A one-shot
+    // tools initContainer installs the static wait/exec helper. App/caddy start
+    // under that helper, then enclava-init runs as the mounter sidecar.
     let app = sample_app();
     let sts = generate_statefulset(&app);
     let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
@@ -187,22 +187,25 @@ fn statefulset_phase5_split_init_and_steady_state_containers() {
     let init = pod.init_containers.as_ref().unwrap();
     let init_names: Vec<&str> = init.iter().map(|c| c.name.as_str()).collect();
     assert!(init_names.contains(&"attestation-proxy"));
-    assert!(init_names.contains(&"enclava-init"));
+    assert!(init_names.contains(&"enclava-tools"));
+    assert!(!init_names.contains(&"enclava-init"));
 
     let proxy = init.iter().find(|c| c.name == "attestation-proxy").unwrap();
     assert_eq!(proxy.restart_policy.as_deref(), Some("Always"));
+    let tools = init.iter().find(|c| c.name == "enclava-tools").unwrap();
+    assert!(tools.restart_policy.is_none());
 
     let names: Vec<&str> = pod.containers.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"web"));
     assert!(names.contains(&"tenant-ingress"));
+    assert!(names.contains(&"enclava-init"));
     assert!(!names.contains(&"attestation-proxy"));
-    assert!(!names.contains(&"enclava-init"));
 }
 
 #[test]
-fn statefulset_has_kernel_modules_annotation_for_dm_crypt() {
-    // B2 investigation: defense-in-depth annotation that fails loud if the
-    // Kata guest kernel image lacks dm_mod / dm_crypt.
+fn statefulset_does_not_request_guest_kernel_modules() {
+    // The production Kata guest has dm_mod/dm_crypt built in. Asking kata-agent
+    // to modprobe built-in-only features makes sandbox startup fail with ENOENT.
     let sts = generate_statefulset(&sample_app());
     let annotations = sts
         .spec
@@ -215,11 +218,7 @@ fn statefulset_has_kernel_modules_annotation_for_dm_crypt() {
         .annotations
         .as_ref()
         .unwrap();
-    let modules = annotations
-        .get("io.katacontainers.config.agent.kernel_modules")
-        .unwrap();
-    assert!(modules.contains("dm_mod"));
-    assert!(modules.contains("dm_crypt"));
+    assert!(!annotations.contains_key("io.katacontainers.config.agent.kernel_modules"));
 }
 
 #[test]
@@ -256,6 +255,7 @@ fn statefulset_has_volumes() {
         .unwrap();
     assert!(volumes.iter().any(|v| v.name == "ownership-signal"));
     assert!(volumes.iter().any(|v| v.name == "unlock-socket"));
+    assert!(volumes.iter().any(|v| v.name == "enclava-tools"));
     assert!(volumes.iter().any(|v| v.name == "enclava-init-config"));
     // Phase 5 default does not mount Cloudflare DNS-01 token nor the legacy bootstrap script.
     assert!(volumes.iter().all(|v| v.name != "tls-cloudflare-token"));

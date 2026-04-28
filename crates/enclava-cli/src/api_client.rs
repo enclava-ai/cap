@@ -475,4 +475,46 @@ impl ApiClient {
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
+
+    pub async fn register_public_key(
+        &self,
+        req: &RegisterPublicKeyRequest,
+    ) -> Result<RegisterPublicKeyResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/users/me/public-keys"))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn put_org_keyring(
+        &self,
+        org_name: &str,
+        req: &PutOrgKeyringRequest,
+    ) -> Result<OrgKeyringResponse, ApiError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/orgs/{org_name}/keyring")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_org_keyring(&self, org_name: &str) -> Result<OrgKeyringResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/orgs/{org_name}/keyring")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
 }

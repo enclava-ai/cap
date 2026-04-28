@@ -1,4 +1,4 @@
-//! Startup ConfigMap referenced by the app container volume.
+//! Startup ConfigMap referenced by app containers that do not provide argv.
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

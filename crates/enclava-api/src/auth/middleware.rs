@@ -2,7 +2,7 @@
 //!
 //! Extracts the authenticated user from either:
 //! - Authorization: Bearer <session-jwt>
-//! - Authorization: Bearer <api-key>  (starts with "enc_")
+//! - Authorization: Bearer <api-key>  (starts with "enclava_" or "enc_")
 //! - X-API-Key: <api-key>
 //!
 //! Resolves the active org from:
@@ -18,7 +18,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::auth::api_key::{ValidatedApiKey, validate_api_key};
+use crate::auth::api_key::{ValidatedApiKey, is_api_key_candidate, validate_api_key};
 use crate::auth::jwt::verify_session_token;
 use crate::state::AppState;
 
@@ -112,7 +112,7 @@ async fn resolve_auth(
 ) -> Result<(Uuid, Option<ValidatedApiKey>), AuthError> {
     // Try X-API-Key header first
     if let Some(key) = extract_api_key_header(parts)
-        && key.starts_with("enc_")
+        && is_api_key_candidate(&key)
     {
         let validated = validate_api_key(pool, &key)
             .await
@@ -124,7 +124,7 @@ async fn resolve_auth(
     let token = extract_bearer(parts).ok_or(AuthError::MissingAuth)?;
 
     // API key in bearer
-    if token.starts_with("enc_") {
+    if is_api_key_candidate(&token) {
         let validated = validate_api_key(pool, &token)
             .await
             .map_err(|_| AuthError::MissingAuth)?;
@@ -152,7 +152,7 @@ async fn resolve_org(
             "SELECT o.name, m.role as \"role: _\"
              FROM organizations o
              JOIN memberships m ON m.org_id = o.id
-             WHERE o.id = $1 AND m.user_id = $2",
+             WHERE o.id = $1 AND m.user_id = $2 AND m.removed_at IS NULL",
         )
         .bind(key.org_id)
         .bind(user_id)
@@ -170,7 +170,7 @@ async fn resolve_org(
             "SELECT o.id, o.name, m.role as \"role: _\"
              FROM organizations o
              JOIN memberships m ON m.org_id = o.id
-             WHERE o.name = $1 AND m.user_id = $2",
+             WHERE o.name = $1 AND m.user_id = $2 AND m.removed_at IS NULL",
         )
         .bind(&org_name)
         .bind(user_id)
@@ -190,7 +190,7 @@ async fn resolve_org(
         "SELECT o.id, o.name, m.role as \"role: _\"
          FROM organizations o
          JOIN memberships m ON m.org_id = o.id
-         WHERE m.user_id = $1 AND o.is_personal = true
+         WHERE m.user_id = $1 AND o.is_personal = true AND m.removed_at IS NULL
          LIMIT 1",
     )
     .bind(user_id)

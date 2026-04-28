@@ -82,6 +82,9 @@ pub struct Config {
     #[serde(default)]
     pub trustee_policy_url: Option<String>,
 
+    #[serde(default = "default_kbs_attestation_token_url")]
+    pub kbs_attestation_token_url: String,
+
     #[serde(default)]
     pub cc_init_data_path: Option<String>,
 
@@ -118,6 +121,10 @@ fn default_caddy_uid() -> u32 {
 
 fn default_caddy_gid() -> u32 {
     10002
+}
+
+fn default_kbs_attestation_token_url() -> String {
+    "http://127.0.0.1:8006/aa/token?token_type=kbs".to_string()
 }
 
 impl Config {
@@ -163,6 +170,10 @@ hkdf-info = "tls-state-luks-key"
         assert_eq!(c.tls_state.device, "/dev/csi1");
         assert_eq!(c.app_uid, 10001);
         assert_eq!(c.caddy_uid, 10002);
+        assert_eq!(
+            c.kbs_attestation_token_url,
+            "http://127.0.0.1:8006/aa/token?token_type=kbs"
+        );
         assert!(c.app_bind_mounts.is_empty());
     }
 

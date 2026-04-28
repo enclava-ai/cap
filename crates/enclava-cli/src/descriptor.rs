@@ -3,6 +3,7 @@
 //! Descriptor types and CE-v1 canonicalisation live in `enclava-common` so the
 //! CLI signer, signing service, and in-TEE verifier share one byte layout.
 
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 pub use enclava_common::descriptor::{
     Capabilities, DeploymentDescriptor, EnvVar, Mount, OciRuntimeSpec, Port, Resources,
@@ -10,10 +11,134 @@ pub use enclava_common::descriptor::{
     canonical_sidecar_map_bytes, canonical_signer_bytes, descriptor_canonical_bytes,
     descriptor_core_canonical_bytes, descriptor_core_hash,
 };
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::keys::UserSigningKey;
+
+#[derive(Debug, Clone)]
+pub struct DeploymentDescriptorBuildInput {
+    pub org_id: uuid::Uuid,
+    pub org_slug: String,
+    pub app_id: uuid::Uuid,
+    pub app_name: String,
+    pub deploy_id: uuid::Uuid,
+    pub created_at: DateTime<Utc>,
+    pub app_domain: String,
+    pub tee_domain: String,
+    pub custom_domains: Vec<String>,
+    pub namespace: String,
+    pub service_account: String,
+    pub identity_hash: [u8; 32],
+    pub image_digest: String,
+    pub signer_identity: SignerIdentity,
+    pub oci_runtime_spec: OciRuntimeSpec,
+    pub sidecars: Sidecars,
+    pub expected_firmware_measurement: [u8; 32],
+    pub expected_runtime_class: String,
+    pub kbs_resource_path: String,
+    pub policy_template_id: String,
+    pub policy_template_sha256: [u8; 32],
+    pub platform_release_version: String,
+    pub expected_cc_init_data_hash: [u8; 32],
+    pub expected_kbs_policy_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct CapAppOciRuntimeSpecInput {
+    pub container_name: String,
+    pub port: u16,
+    pub workload_command: Vec<String>,
+    pub storage_paths: Vec<String>,
+    pub cpu_limit: String,
+    pub memory_limit: String,
+}
+
+pub const CAP_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
+pub const CAP_APP_UID: u32 = 10001;
+pub const CAP_APP_GID: u32 = 10001;
+pub const CAP_APP_CPU_REQUEST: &str = "250m";
+pub const CAP_APP_MEMORY_REQUEST: &str = "512Mi";
+
+fn storage_subdir(path: &str) -> String {
+    path.trim_start_matches('/').replace('/', "-")
+}
+
+fn named_value(name: &str, value: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: value.to_string(),
+    }
+}
+
+/// Build the customer descriptor OCI subset for CAP's current non-legacy app
+/// container shape.
+///
+/// The API remains the source of truth for the final manifest. This helper
+/// mirrors only deterministic fields available to the CLI today: wait-exec
+/// wrapping, app container env, port, app UID/GID/security flags, fixed
+/// resource requests, caller-supplied limits, and storage path destinations.
+/// Exact parity for API-only fields such as persisted primary container
+/// command/name/resource overrides needs API-side descriptor generation.
+pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeSpec {
+    let mut mounts = vec![Mount {
+        source: "state-mount".to_string(),
+        destination: "/state".to_string(),
+        mount_type: "kubernetes-volume".to_string(),
+        options: vec![
+            "rw".to_string(),
+            "mountPropagation=HostToContainer".to_string(),
+        ],
+    }];
+    mounts.extend(input.storage_paths.iter().map(|path| Mount {
+        source: format!("state-mount:{}", storage_subdir(path)),
+        destination: path.clone(),
+        mount_type: "kubernetes-volume-subpath".to_string(),
+        options: vec![
+            "rw".to_string(),
+            "mountPropagation=HostToContainer".to_string(),
+        ],
+    }));
+
+    OciRuntimeSpec {
+        command: vec![CAP_WAIT_EXEC_PATH.to_string()],
+        args: input.workload_command,
+        env: vec![
+            named_value("APP_SEED_PATH", "/state/app/seed"),
+            named_value("VOLUME_MOUNT_POINT", "/state"),
+            named_value("ENCLAVA_CONTAINER_NAME", &input.container_name),
+            named_value("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),
+            named_value("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
+        ],
+        ports: vec![Port {
+            container_port: input.port.into(),
+            protocol: "TCP".to_string(),
+        }],
+        mounts,
+        capabilities: Capabilities {
+            add: Vec::new(),
+            drop: vec!["ALL".to_string()],
+        },
+        security_context: SecurityContext {
+            run_as_user: CAP_APP_UID,
+            run_as_group: CAP_APP_GID,
+            read_only_root_fs: true,
+            allow_privilege_escalation: false,
+            privileged: false,
+        },
+        resources: Resources {
+            requests: vec![
+                named_value("cpu", CAP_APP_CPU_REQUEST),
+                named_value("memory", CAP_APP_MEMORY_REQUEST),
+            ],
+            limits: vec![
+                named_value("cpu", &input.cpu_limit),
+                named_value("memory", &input.memory_limit),
+            ],
+        },
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DescriptorError {
@@ -89,6 +214,39 @@ pub fn sign(
         signature,
         signing_key_id,
         signing_pubkey: deployer.public,
+    }
+}
+
+pub fn build_descriptor(input: DeploymentDescriptorBuildInput) -> DeploymentDescriptor {
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    DeploymentDescriptor {
+        schema_version: "v1".to_string(),
+        org_id: input.org_id,
+        org_slug: input.org_slug,
+        app_id: input.app_id,
+        app_name: input.app_name,
+        deploy_id: input.deploy_id,
+        created_at: input.created_at,
+        nonce,
+        app_domain: input.app_domain,
+        tee_domain: input.tee_domain,
+        custom_domains: input.custom_domains,
+        namespace: input.namespace,
+        service_account: input.service_account,
+        identity_hash: input.identity_hash,
+        image_digest: input.image_digest,
+        signer_identity: input.signer_identity,
+        oci_runtime_spec: input.oci_runtime_spec,
+        sidecars: input.sidecars,
+        expected_firmware_measurement: input.expected_firmware_measurement,
+        expected_runtime_class: input.expected_runtime_class,
+        kbs_resource_path: input.kbs_resource_path,
+        policy_template_id: input.policy_template_id,
+        policy_template_sha256: input.policy_template_sha256,
+        platform_release_version: input.platform_release_version,
+        expected_cc_init_data_hash: input.expected_cc_init_data_hash,
+        expected_kbs_policy_hash: input.expected_kbs_policy_hash,
     }
 }
 

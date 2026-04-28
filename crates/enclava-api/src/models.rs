@@ -132,6 +132,7 @@ pub struct Membership {
     pub org_id: Uuid,
     pub role: Role,
     pub created_at: DateTime<Utc>,
+    pub removed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

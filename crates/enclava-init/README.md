@@ -1,10 +1,11 @@
 # enclava-init
 
 In-TEE Rust replacement for the legacy `bootstrap_script.sh`. Runs as a
-Kubernetes initContainer inside a Kata SEV-SNP guest. Performs Argon2id-based
-password unlock or KBS-fetched autounlock, opens both LUKS devices (state and
-tls-state), runs the in-TEE Trustee policy verification chain, writes
-per-component HKDF-derived seeds, and exits 0.
+long-running mounter sidecar inside a Kata SEV-SNP guest. Performs
+Argon2id-based password unlock or KBS-fetched autounlock, opens both LUKS
+devices (state and tls-state), runs the in-TEE Trustee policy verification
+chain, writes per-component HKDF-derived seeds, marks `/run/enclava/init-ready`,
+and stays alive as the mount propagation source.
 
 ## Build dependencies
 
@@ -25,6 +26,12 @@ the LUKS module — Phase 5 requires real cryptsetup.
 The runtime image needs `libcryptsetup.so.12` plus `mkfs.ext4` for fresh PVCs.
 The checked-in `crates/enclava-init/Dockerfile` installs `libcryptsetup12` and
 `e2fsprogs`.
+
+The same image also carries `/usr/local/bin/enclava-wait-exec`, a static musl
+helper copied into a shared `enclava-tools` EmptyDir before workload containers
+start. Workload containers execute that helper instead of a shell script: it
+writes `/run/enclava/containers/<name>`, waits for `/run/enclava/init-ready`,
+then `exec`s the original workload argv.
 
 ## Configuration
 
@@ -53,6 +60,15 @@ policy from `GET /resource-policy/<id>/body` and the artifact bundle from
 `GET /api/v1/workload/artifacts`, then runs the six-step chain in
 `trustee_verify::verify_chain` (see `SECURITY_MITIGATION_PLAN.md` rev14
 ~lines 811-833). Any mismatch refuses to release seeds.
+
+CAP only renders this mode when all production endpoints and public keys are
+configured. The generated ConfigMap also includes `cc-init-data.toml`, and
+`enclava-init` checks its SHA-256 against the customer-signed descriptor while
+CAP's workload artifact endpoint checks the same descriptor hash against
+Trustee-verified attestation claims.
+For v1 artifacts, `platform-trustee-policy-pubkey-hex` and
+`signing-service-pubkey-hex` must be the same Ed25519 public key; mismatches
+are treated as configuration errors.
 
 Until Phase 3's Trustee patches deploy, the flag defaults to false and the
 binary releases seeds with a loud `tracing::error!` saying verification was

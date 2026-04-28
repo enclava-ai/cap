@@ -210,6 +210,11 @@ pub fn require_scope(key: &ValidatedApiKey, scope: &str) -> Result<(), ApiKeyErr
     }
 }
 
+/// Returns true when a token has an API-key prefix rather than a session JWT.
+pub(crate) fn is_api_key_candidate(token: &str) -> bool {
+    token.starts_with(HMAC_KEY_PREFIX) || token.starts_with(LEGACY_KEY_PREFIX)
+}
+
 /// Revoke an API key.
 pub async fn revoke_api_key(
     pool: &PgPool,
@@ -283,30 +288,11 @@ fn parse_hmac_key(raw_key: &str) -> Result<ParsedHmacKey, ApiKeyError> {
 
 fn load_current_pepper() -> Result<Vec<u8>, ApiKeyError> {
     if let Ok(b64) = std::env::var("API_KEY_HMAC_PEPPER_BASE64") {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .map_err(|e| ApiKeyError::Hash(format!("invalid API_KEY_HMAC_PEPPER_BASE64: {e}")))?;
-        if decoded.len() < 32 {
-            return Err(ApiKeyError::Hash(
-                "API_KEY_HMAC_PEPPER_BASE64 must decode to at least 32 bytes".to_string(),
-            ));
-        }
-        return Ok(decoded);
+        return decode_base64_pepper(b64.trim());
     }
 
     if let Ok(value) = std::env::var("API_KEY_HMAC_PEPPER") {
-        if let Ok(decoded) = hex::decode(value.trim())
-            && decoded.len() >= 32
-        {
-            return Ok(decoded);
-        }
-        let raw = value.into_bytes();
-        if raw.len() >= 32 {
-            return Ok(raw);
-        }
-        return Err(ApiKeyError::Hash(
-            "API_KEY_HMAC_PEPPER must be at least 32 raw bytes or 32 decoded hex bytes".to_string(),
-        ));
+        return decode_raw_or_hex_pepper(value.trim(), "API_KEY_HMAC_PEPPER");
     }
 
     Err(ApiKeyError::MissingPepper)
@@ -332,6 +318,33 @@ fn load_accepted_peppers() -> Result<Vec<Vec<u8>>, ApiKeyError> {
         }
     }
     Ok(peppers)
+}
+
+fn decode_base64_pepper(value: &str) -> Result<Vec<u8>, ApiKeyError> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|e| ApiKeyError::Hash(format!("invalid API_KEY_HMAC_PEPPER_BASE64: {e}")))?;
+    if decoded.len() < 32 {
+        return Err(ApiKeyError::Hash(
+            "API_KEY_HMAC_PEPPER_BASE64 must decode to at least 32 bytes".to_string(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn decode_raw_or_hex_pepper(value: &str, name: &str) -> Result<Vec<u8>, ApiKeyError> {
+    if let Ok(decoded) = hex::decode(value)
+        && decoded.len() >= 32
+    {
+        return Ok(decoded);
+    }
+    let raw = value.as_bytes().to_vec();
+    if raw.len() >= 32 {
+        return Ok(raw);
+    }
+    Err(ApiKeyError::Hash(format!(
+        "{name} must be at least 32 raw bytes or 32 decoded hex bytes"
+    )))
 }
 
 fn hmac_sha256_hex(secret: &[u8], pepper: &[u8]) -> Result<String, ApiKeyError> {
@@ -361,6 +374,16 @@ mod tests {
     #[test]
     fn generated_hmac_key_has_128_bit_prefix_and_256_bit_secret() {
         let key = generate_raw_key();
+        assert!(key.starts_with(HMAC_KEY_PREFIX));
+        let parts: Vec<&str> = key
+            .strip_prefix(HMAC_KEY_PREFIX)
+            .unwrap()
+            .split('_')
+            .collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 26);
+        assert_eq!(parts[1].len(), 52);
+
         let parsed = parse_hmac_key(&key).unwrap();
         assert_eq!(parsed.prefix_encoded.len(), 26);
         assert_eq!(parsed.secret.len(), 32);
@@ -374,6 +397,40 @@ mod tests {
     }
 
     #[test]
+    fn api_key_candidate_accepts_new_and_legacy_prefixes() {
+        assert!(is_api_key_candidate(
+            "enclava_ABCDEFG234567ABCDEFG234_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
+        assert!(is_api_key_candidate("enc_0123456789abcdef"));
+        assert!(!is_api_key_candidate("eyJhbGciOiJIUzI1NiJ9.jwt"));
+    }
+
+    #[test]
+    fn hmac_lookup_uses_base32_prefix_only() {
+        let key = generate_raw_key();
+        let parsed = parse_hmac_key(&key).unwrap();
+        let lookup = parse_lookup(&key).unwrap();
+        assert_eq!(lookup.key_prefix, parsed.prefix_encoded);
+        assert!(!lookup.key_prefix.starts_with(HMAC_KEY_PREFIX));
+        assert!(matches!(lookup.material, LookupMaterial::Hmac { .. }));
+    }
+
+    #[test]
+    fn invalid_hmac_key_lengths_are_rejected() {
+        let short_secret = "enclava_AAAAAAAAAAAAAAAAAAAAAAAAAA_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(matches!(
+            parse_hmac_key(short_secret),
+            Err(ApiKeyError::InvalidFormat)
+        ));
+
+        let short_prefix = "enclava_AAAAAAAAAAAAAAAAAAAAAAAAA_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(matches!(
+            parse_hmac_key(short_prefix),
+            Err(ApiKeyError::InvalidFormat)
+        ));
+    }
+
+    #[test]
     fn hmac_verification_is_exact() {
         let secret = [7u8; 32];
         let pepper = [9u8; 32];
@@ -382,5 +439,23 @@ mod tests {
         let stored = hex::decode(&good).unwrap();
         assert_eq!(hex::decode(good).unwrap().ct_eq(&stored).unwrap_u8(), 1);
         assert_eq!(hex::decode(bad).unwrap().ct_eq(&stored).unwrap_u8(), 0);
+    }
+
+    #[test]
+    fn pepper_decoding_accepts_raw_hex_and_base64_values() {
+        let raw = "01234567890123456789012345678901";
+        assert_eq!(
+            decode_raw_or_hex_pepper(raw, "API_KEY_HMAC_PEPPER").unwrap(),
+            raw.as_bytes()
+        );
+
+        let hex_value = "0909090909090909090909090909090909090909090909090909090909090909";
+        assert_eq!(
+            decode_raw_or_hex_pepper(hex_value, "API_KEY_HMAC_PEPPER").unwrap(),
+            vec![9u8; 32]
+        );
+
+        let b64_value = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert_eq!(decode_base64_pepper(&b64_value).unwrap(), vec![7u8; 32]);
     }
 }

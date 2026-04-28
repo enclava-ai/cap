@@ -189,11 +189,11 @@ fn load_attestation_for_migration() -> Option<AttestationConfig> {
             .ok()
             .filter(|url| !url.trim().is_empty())
             .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
-        cloudflare_token_secret: std::env::var("CLOUDFLARE_TOKEN_SECRET")
-            .unwrap_or_else(|_| "cloudflare-api-token-enclava-dev".to_string()),
-        cloudflare_api_token: std::env::var("CLOUDFLARE_API_TOKEN")
-            .ok()
-            .filter(|token| !token.trim().is_empty()),
+        trustee_policy_read_available: false,
+        workload_artifacts_url: None,
+        trustee_policy_url: None,
+        platform_trustee_policy_pubkey_hex: None,
+        signing_service_pubkey_hex: None,
     })
 }
 

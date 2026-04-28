@@ -22,12 +22,14 @@ fn enforce_production_env_gates() -> Result<(), String> {
                 ));
             }
         }
-        if let Ok(mode) = std::env::var("TENANT_TEE_TLS_MODE")
-            && matches!(mode.trim(), "staging" | "insecure")
-        {
-            return Err(
-                "TENANT_TEE_TLS_MODE=staging|insecure is only allowed in debug builds".into(),
-            );
+        for mode_var in ["TENANT_TEE_TLS_MODE", "ENCLAVA_TEE_TLS_MODE"] {
+            if let Ok(mode) = std::env::var(mode_var)
+                && matches!(mode.trim(), "staging" | "insecure")
+            {
+                return Err(format!(
+                    "{mode_var}=staging|insecure is only allowed in debug builds"
+                ));
+            }
         }
     }
     Ok(())

@@ -7,10 +7,20 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
+};
+use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, VerifyingKey};
+use enclava_common::canonical::ce_v1_bytes;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthContext;
+use crate::auth::scopes;
 use crate::models::{App, UnlockMode};
 use crate::state::AppState;
 
@@ -24,6 +34,8 @@ pub struct UnlockStatusResponse {
 #[derive(Debug, Deserialize)]
 pub struct UpdateUnlockModeRequest {
     pub mode: String,
+    pub transition_receipt: Option<SignedReceiptResponse>,
+    pub transition_attestation: Option<TransitionReceiptAttestation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,6 +44,42 @@ pub struct UpdateUnlockModeResponse {
     pub unlock_mode: String,
     pub deployment_id: Option<Uuid>,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SignedReceiptResponse {
+    pub operation: String,
+    pub payload: ReceiptPayloadView,
+    pub receipt: ReceiptEnvelope,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReceiptPayloadView {
+    pub purpose: String,
+    pub app_id: String,
+    pub resource_path: Option<String>,
+    pub from_mode: Option<String>,
+    pub to_mode: Option<String>,
+    pub attestation_quote_sha256: Option<String>,
+    pub new_value_sha256: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReceiptEnvelope {
+    pub pubkey: String,
+    pub pubkey_sha256: String,
+    pub payload_canonical_bytes: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TransitionReceiptAttestation {
+    pub tee_domain: String,
+    pub nonce: String,
+    pub leaf_spki_sha256: String,
+    pub receipt_pubkey_sha256: String,
+    pub attestation_evidence_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +130,183 @@ fn validate_transition(current: RequestedUnlockMode, requested: RequestedUnlockM
         )
 }
 
+fn verify_transition_receipt(
+    receipt: &SignedReceiptResponse,
+    app: &App,
+    current: RequestedUnlockMode,
+    requested: RequestedUnlockMode,
+) -> Result<VerifiedTransitionReceipt, String> {
+    if receipt.operation != "unlock_mode_transition" {
+        return Err("transition_receipt.operation".to_string());
+    }
+    if receipt.payload.purpose != "enclava-unlock-receipt-v1" {
+        return Err("transition_receipt.payload.purpose".to_string());
+    }
+    if receipt.payload.app_id != app.id.to_string() {
+        return Err("transition_receipt.payload.app_id".to_string());
+    }
+    if receipt.payload.resource_path.is_some() {
+        return Err("transition_receipt.payload.resource_path".to_string());
+    }
+    if receipt.payload.from_mode.as_deref() != Some(current.api_value()) {
+        return Err("transition_receipt.payload.from_mode".to_string());
+    }
+    if receipt.payload.to_mode.as_deref() != Some(requested.api_value()) {
+        return Err("transition_receipt.payload.to_mode".to_string());
+    }
+    let attestation_quote_sha256 = parse_hex32(
+        "transition_receipt.payload.attestation_quote_sha256",
+        receipt
+            .payload
+            .attestation_quote_sha256
+            .as_deref()
+            .ok_or_else(|| "transition_receipt.payload.attestation_quote_sha256".to_string())?,
+    )?;
+    if receipt.payload.new_value_sha256.is_some() {
+        return Err("transition_receipt.payload.new_value_sha256".to_string());
+    }
+    let receipt_timestamp = DateTime::parse_from_rfc3339(&receipt.payload.timestamp)
+        .map_err(|_| "transition_receipt.payload.timestamp".to_string())?
+        .with_timezone(&Utc);
+
+    let expected_payload = ce_v1_bytes(&[
+        ("purpose", receipt.payload.purpose.as_bytes()),
+        ("app_id", app.id.as_bytes()),
+        ("from_mode", current.api_value().as_bytes()),
+        ("to_mode", requested.api_value().as_bytes()),
+        (
+            "attestation_quote_sha256",
+            receipt
+                .payload
+                .attestation_quote_sha256
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+        ),
+        ("timestamp", receipt.payload.timestamp.as_bytes()),
+    ]);
+    let payload_bytes = B64
+        .decode(&receipt.receipt.payload_canonical_bytes)
+        .map_err(|_| "transition_receipt.payload_canonical_bytes".to_string())?;
+    if payload_bytes != expected_payload {
+        return Err("transition_receipt.payload_canonical_bytes".to_string());
+    }
+
+    let pubkey_vec = B64
+        .decode(&receipt.receipt.pubkey)
+        .map_err(|_| "transition_receipt.pubkey".to_string())?;
+    let pubkey_bytes: [u8; 32] = pubkey_vec
+        .try_into()
+        .map_err(|_| "transition_receipt.pubkey".to_string())?;
+    let pubkey_sha256 = hex::encode(Sha256::digest(pubkey_bytes));
+    if receipt.receipt.pubkey_sha256 != pubkey_sha256 {
+        return Err("transition_receipt.pubkey_sha256".to_string());
+    }
+    let pubkey_sha256_bytes = Sha256::digest(pubkey_bytes).to_vec();
+
+    let signature_vec = B64
+        .decode(&receipt.receipt.signature)
+        .map_err(|_| "transition_receipt.signature".to_string())?;
+    let signature_bytes: [u8; 64] = signature_vec
+        .try_into()
+        .map_err(|_| "transition_receipt.signature".to_string())?;
+    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
+        .map_err(|_| "transition_receipt.pubkey".to_string())?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify_strict(&payload_bytes, &signature)
+        .map_err(|_| "transition_receipt.signature".to_string())?;
+
+    Ok(VerifiedTransitionReceipt {
+        receipt_timestamp,
+        pubkey_sha256_bytes,
+        attestation_quote_sha256,
+    })
+}
+
+#[derive(Debug)]
+struct VerifiedTransitionReceipt {
+    receipt_timestamp: DateTime<Utc>,
+    pubkey_sha256_bytes: Vec<u8>,
+    attestation_quote_sha256: Vec<u8>,
+}
+
+fn parse_hex32(field: &'static str, value: &str) -> Result<Vec<u8>, String> {
+    let trimmed = value.trim();
+    if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(field.to_string());
+    }
+    hex::decode(trimmed).map_err(|_| field.to_string())
+}
+
+fn verify_transition_attestation(
+    attestation: &TransitionReceiptAttestation,
+    app: &App,
+    verified_receipt: &VerifiedTransitionReceipt,
+) -> Result<(), String> {
+    let expected_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
+    if attestation.tee_domain != expected_domain {
+        return Err("transition_attestation.tee_domain".to_string());
+    }
+
+    let nonce = URL_SAFE_NO_PAD
+        .decode(&attestation.nonce)
+        .or_else(|_| B64.decode(&attestation.nonce))
+        .map_err(|_| "transition_attestation.nonce".to_string())?;
+    if nonce.len() != 32 {
+        return Err("transition_attestation.nonce".to_string());
+    }
+
+    parse_hex32(
+        "transition_attestation.leaf_spki_sha256",
+        &attestation.leaf_spki_sha256,
+    )?;
+    let attested_receipt_key = parse_hex32(
+        "transition_attestation.receipt_pubkey_sha256",
+        &attestation.receipt_pubkey_sha256,
+    )?;
+    if attested_receipt_key != verified_receipt.pubkey_sha256_bytes {
+        return Err("transition_attestation.receipt_pubkey_sha256".to_string());
+    }
+
+    let evidence_hash = parse_hex32(
+        "transition_attestation.attestation_evidence_sha256",
+        &attestation.attestation_evidence_sha256,
+    )?;
+    if evidence_hash != verified_receipt.attestation_quote_sha256 {
+        return Err("transition_attestation.attestation_evidence_sha256".to_string());
+    }
+
+    Ok(())
+}
+
+async fn reject_replayed_transition_receipt(
+    pool: &PgPool,
+    app_id: Uuid,
+    receipt_timestamp: DateTime<Utc>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let latest: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT max(receipt_timestamp) FROM unlock_transition_receipts WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    if latest.is_some_and(|latest| receipt_timestamp <= latest) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "replayed transition_receipt"})),
+        ));
+    }
+    Ok(())
+}
+
 /// GET /apps/{name}/unlock/status -- ownership state (queried from TEE).
 pub async fn unlock_status(
     auth: AuthContext,
@@ -104,7 +329,7 @@ pub async fn unlock_status(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
+    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
     let tee_url = format!("https://{}/.well-known/confidential", domain);
 
     let status_url = format!("https://{}/.well-known/confidential/status", domain);
@@ -156,7 +381,7 @@ pub async fn unlock_endpoint(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
+    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
     let base = format!("https://{}/.well-known/confidential", domain);
 
     Ok(Json(UnlockEndpointResponse {
@@ -177,6 +402,9 @@ pub async fn update_unlock_mode(
     Path(app_name): Path<String>,
     Json(body): Json<UpdateUnlockModeRequest>,
 ) -> Result<Json<UpdateUnlockModeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_owner(&auth)?;
+    scopes::require_scope(&auth, "apps:write")?;
+
     let requested = RequestedUnlockMode::parse(&body.mode).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -217,10 +445,60 @@ pub async fn update_unlock_mode(
         }));
     }
 
+    let receipt = body.transition_receipt.as_ref().ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "transition_receipt required for unlock mode change"
+        })),
+    ))?;
+    let verified_receipt =
+        verify_transition_receipt(receipt, &app, current, requested).map_err(|field| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid transition_receipt",
+                    "field": field,
+                })),
+            )
+        })?;
+    let transition_attestation = body.transition_attestation.as_ref().ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "transition_attestation required for unlock mode change"
+        })),
+    ))?;
+    verify_transition_attestation(transition_attestation, &app, &verified_receipt).map_err(
+        |field| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid transition_attestation",
+                    "field": field,
+                })),
+            )
+        },
+    )?;
+    reject_replayed_transition_receipt(&state.db, app.id, verified_receipt.receipt_timestamp)
+        .await?;
+
+    let receipt_json = serde_json::to_value(receipt).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "receipt serialization error"})),
+        )
+    })?;
+
+    let mut tx = state.db.begin().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
     sqlx::query("UPDATE apps SET unlock_mode = $1::unlock_enum, updated_at = now() WHERE id = $2")
         .bind(requested.db_value())
         .bind(app.id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|_| {
             (
@@ -228,6 +506,33 @@ pub async fn update_unlock_mode(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
+
+    sqlx::query(
+        "INSERT INTO unlock_transition_receipts
+            (app_id, from_mode, to_mode, receipt, receipt_pubkey_sha256, receipt_timestamp)
+         VALUES ($1, $2::unlock_enum, $3::unlock_enum, $4, $5, $6)",
+    )
+    .bind(app.id)
+    .bind(current.db_value())
+    .bind(requested.db_value())
+    .bind(receipt_json)
+    .bind(verified_receipt.pubkey_sha256_bytes)
+    .bind(verified_receipt.receipt_timestamp)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    tx.commit().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
 
     let updated_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app.id)
@@ -331,13 +636,17 @@ pub async fn update_unlock_mode(
         };
 
         if let Err(e) = crate::deploy::apply_deployment_manifests(
-            db.clone(),
-            apply_app.clone(),
-            deploy_id,
-            attestation,
-            kbs_policy,
-            api_signing_pubkey,
-            api_url,
+            crate::deploy::ApplyDeploymentManifestsRequest {
+                pool: db.clone(),
+                app: apply_app.clone(),
+                deployment_id: deploy_id,
+                attestation_config: attestation,
+                kbs_policy_config: kbs_policy,
+                api_signing_pubkey,
+                api_url,
+                workload_artifact_binding: None,
+                signed_policy_artifact: None,
+            },
         )
         .await
         {
@@ -371,7 +680,102 @@ pub async fn update_unlock_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestedUnlockMode, validate_transition};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use chrono::Utc;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    use super::{
+        ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode, SignedReceiptResponse,
+        TransitionReceiptAttestation, validate_transition, verify_transition_attestation,
+        verify_transition_receipt,
+    };
+    use crate::models::{App, AppStatus, UnlockMode};
+
+    fn test_app() -> App {
+        App {
+            id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            org_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            name: "demo".to_string(),
+            namespace: "cap-demo".to_string(),
+            instance_id: "instance-test-01".to_string(),
+            tenant_id: "tenant-test".to_string(),
+            service_account: "cap-demo-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: "11".repeat(32),
+            unlock_mode: UnlockMode::Password,
+            domain: "demo.enclava.dev".to_string(),
+            tee_domain: Some("demo.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: AppStatus::Running,
+            signer_identity_subject: None,
+            signer_identity_issuer: None,
+            signer_identity_set_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn signed_transition_receipt(
+        from_mode: &str,
+        to_mode: &str,
+        attestation_quote_sha256: &str,
+        signing_key: &SigningKey,
+    ) -> SignedReceiptResponse {
+        let timestamp = "2026-04-28T12:00:00Z";
+        let payload = ReceiptPayloadView {
+            purpose: "enclava-unlock-receipt-v1".to_string(),
+            app_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            resource_path: None,
+            from_mode: Some(from_mode.to_string()),
+            to_mode: Some(to_mode.to_string()),
+            attestation_quote_sha256: Some(attestation_quote_sha256.to_string()),
+            new_value_sha256: None,
+            timestamp: timestamp.to_string(),
+        };
+        let payload_canonical_bytes = enclava_common::canonical::ce_v1_bytes(&[
+            ("purpose", payload.purpose.as_bytes()),
+            (
+                "app_id",
+                uuid::Uuid::parse_str(&payload.app_id).unwrap().as_bytes(),
+            ),
+            ("from_mode", from_mode.as_bytes()),
+            ("to_mode", to_mode.as_bytes()),
+            (
+                "attestation_quote_sha256",
+                attestation_quote_sha256.as_bytes(),
+            ),
+            ("timestamp", payload.timestamp.as_bytes()),
+        ]);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let signature = signing_key.sign(&payload_canonical_bytes);
+        SignedReceiptResponse {
+            operation: "unlock_mode_transition".to_string(),
+            payload,
+            receipt: ReceiptEnvelope {
+                pubkey: B64.encode(pubkey),
+                pubkey_sha256: hex::encode(Sha256::digest(pubkey)),
+                payload_canonical_bytes: B64.encode(payload_canonical_bytes),
+                signature: B64.encode(signature.to_bytes()),
+            },
+        }
+    }
+
+    fn transition_attestation(
+        signing_key: &SigningKey,
+        quote_hash: &str,
+    ) -> TransitionReceiptAttestation {
+        TransitionReceiptAttestation {
+            tee_domain: "demo.tee.enclava.dev".to_string(),
+            nonce: B64.encode([0x99; 32]),
+            leaf_spki_sha256: "aa".repeat(32),
+            receipt_pubkey_sha256: hex::encode(Sha256::digest(
+                signing_key.verifying_key().to_bytes(),
+            )),
+            attestation_evidence_sha256: quote_hash.to_string(),
+        }
+    }
 
     #[test]
     fn parses_public_unlock_mode_names() {
@@ -408,5 +812,79 @@ mod tests {
             RequestedUnlockMode::Password,
             RequestedUnlockMode::Password
         ));
+    }
+
+    #[test]
+    fn verifies_unlock_mode_transition_receipt_signature_and_payload() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let quote_hash = "ab".repeat(32);
+        let receipt = signed_transition_receipt("password", "auto", &quote_hash, &signing_key);
+        let verified = verify_transition_receipt(
+            &receipt,
+            &test_app(),
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("receipt verifies");
+        assert_eq!(
+            verified.pubkey_sha256_bytes,
+            Sha256::digest(signing_key.verifying_key().to_bytes()).to_vec()
+        );
+        let attestation = transition_attestation(&signing_key, &quote_hash);
+        verify_transition_attestation(&attestation, &test_app(), &verified).unwrap();
+    }
+
+    #[test]
+    fn rejects_unlock_mode_transition_receipt_for_wrong_mode() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let receipt = signed_transition_receipt("auto", "password", &"ab".repeat(32), &signing_key);
+        assert_eq!(
+            verify_transition_receipt(
+                &receipt,
+                &test_app(),
+                RequestedUnlockMode::Password,
+                RequestedUnlockMode::Auto,
+            )
+            .unwrap_err(),
+            "transition_receipt.payload.from_mode"
+        );
+    }
+
+    #[test]
+    fn rejects_unlock_mode_transition_receipt_bad_signature() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let mut receipt =
+            signed_transition_receipt("password", "auto", &"ab".repeat(32), &signing_key);
+        receipt.receipt.signature = B64.encode([0x55; 64]);
+        assert_eq!(
+            verify_transition_receipt(
+                &receipt,
+                &test_app(),
+                RequestedUnlockMode::Password,
+                RequestedUnlockMode::Auto,
+            )
+            .unwrap_err(),
+            "transition_receipt.signature"
+        );
+    }
+
+    #[test]
+    fn rejects_transition_attestation_for_wrong_receipt_key() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let other_key = SigningKey::from_bytes(&[8; 32]);
+        let quote_hash = "ab".repeat(32);
+        let receipt = signed_transition_receipt("password", "auto", &quote_hash, &signing_key);
+        let verified = verify_transition_receipt(
+            &receipt,
+            &test_app(),
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .unwrap();
+        let attestation = transition_attestation(&other_key, &quote_hash);
+        assert_eq!(
+            verify_transition_attestation(&attestation, &test_app(), &verified).unwrap_err(),
+            "transition_attestation.receipt_pubkey_sha256"
+        );
     }
 }

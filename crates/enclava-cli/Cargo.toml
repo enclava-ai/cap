@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 enclava-common = { workspace = true }
+enclava-engine = { path = "../enclava-engine" }
 tokio = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
@@ -36,6 +37,14 @@ base64 = { workspace = true }
 zeroize = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+x509-cert = { workspace = true }
+sev = { version = "7.1.0", default-features = false, features = ["snp", "crypto_nossl"] }
+
+[features]
+prod-strict = []
 
 [dev-dependencies]
+enclava-engine = { path = "../enclava-engine", features = ["testutil"] }
 tempfile = "3"

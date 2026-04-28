@@ -1,7 +1,7 @@
 //! Ingress ConfigMap: Caddyfile rendering with CAP routes.
 //!
 //! Generates the tenant-ingress ConfigMap containing a Caddyfile that:
-//! - Terminates TLS inside the TEE via Cloudflare DNS-01 ACME
+//! - Terminates TLS inside the TEE via ACME TLS-ALPN-01
 //! - Routes attestation + ownership endpoints to the proxy (8081)
 //! - Routes /.well-known/confidential/* to the proxy (CAP-specific)
 //! - Routes everything else to the app container

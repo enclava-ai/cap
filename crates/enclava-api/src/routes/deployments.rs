@@ -26,6 +26,30 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
     )
 }
 
+fn signing_error_response(
+    error: crate::signing_service::SigningServiceError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::signing_service::SigningServiceError;
+
+    let status = match &error {
+        SigningServiceError::PartialBlobs
+        | SigningServiceError::Blob(_)
+        | SigningServiceError::Mismatch(_)
+        | SigningServiceError::InvalidSignature => StatusCode::BAD_REQUEST,
+        SigningServiceError::Upstream { .. } | SigningServiceError::Http(_) => {
+            StatusCode::BAD_GATEWAY
+        }
+        SigningServiceError::InvalidUrl(_)
+        | SigningServiceError::Db(_)
+        | SigningServiceError::Serde(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    (
+        status,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
+}
+
 /// Pick the right cosign `VerificationPolicy` for a stored signer identity.
 ///
 /// GitHub Actions OIDC subjects are URLs that contain `@` after the workflow
@@ -136,6 +160,10 @@ pub struct DeployRequest {
     pub container_name: Option<String>,
     #[serde(default)]
     pub resources: Option<DeployResources>,
+    #[serde(default)]
+    pub customer_descriptor_blob: Option<String>,
+    #[serde(default)]
+    pub org_keyring_blob: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -202,6 +230,26 @@ pub async fn deploy(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
+
+    let signing_artifacts = crate::signing_service::decode_optional_blobs(
+        body.customer_descriptor_blob.clone(),
+        body.org_keyring_blob.clone(),
+    )
+    .map_err(signing_error_response)?;
+    if state
+        .attestation
+        .as_ref()
+        .map(|cfg| cfg.trustee_policy_read_available)
+        .unwrap_or(false)
+        && signing_artifacts.is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "trustee policy verification requires customer_descriptor_blob and org_keyring_blob"
+            })),
+        ));
+    }
 
     // Resolve image tag to digest
     let image_ref = enclava_common::image::ImageRef::parse(&body.image).map_err(|e| {
@@ -369,7 +417,68 @@ pub async fn deploy(
         })?;
     }
 
+    let mut workload_artifact_binding = None;
+    let mut signed_policy_artifact = None;
+    if let Some(artifacts) = signing_artifacts.as_ref() {
+        artifacts
+            .validate_deployment_inputs(&app, &image_digest)
+            .map_err(signing_error_response)?;
+        let attestation = state.attestation.as_ref().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "signed deployment artifacts require attestation runtime configuration"
+            })),
+        ))?;
+        let signing_service_pubkey_hex =
+            attestation.signing_service_pubkey_hex.as_deref().ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "signed deployment artifacts require SIGNING_SERVICE_PUBKEY_HEX"
+                })),
+            ))?;
+        let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+        let mut app_spec = crate::deploy::build_confidential_app(
+            &state.db,
+            &app,
+            attestation,
+            &api_signing_pubkey,
+            &state.api_url,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
+        let binding = artifacts.binding();
+        app_spec.workload_artifact_binding = Some(binding.clone());
+        let (_encoded, cc_init_data_hash) =
+            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        artifacts
+            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+            .map_err(signing_error_response)?;
+
+        let signing_service = state.signing_service.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "platform signing service is not configured"})),
+        ))?;
+        let signed = signing_service
+            .sign(&artifacts.sign_request())
+            .await
+            .map_err(signing_error_response)?;
+        artifacts
+            .validate_signed_artifact(&signed, signing_service_pubkey_hex)
+            .map_err(signing_error_response)?;
+        workload_artifact_binding = Some(binding);
+        signed_policy_artifact = Some(signed);
+    }
+
     // Build spec snapshot
+    let deploy_id = signing_artifacts
+        .as_ref()
+        .map(|artifacts| artifacts.descriptor.deploy_id)
+        .unwrap_or_else(Uuid::new_v4);
     let spec_snapshot = serde_json::json!({
         "app_name": app.name,
         "namespace": app.namespace,
@@ -377,11 +486,13 @@ pub async fn deploy(
         "image": body.image,
         "image_digest": &image_digest,
         "resources": body.resources,
+        "signed_descriptor_core_hash": signing_artifacts
+            .as_ref()
+            .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
     });
 
     // Create deployment record. cosign_verified is set from the actual
     // verification result, not hardcoded.
-    let deploy_id = Uuid::new_v4();
     let cosign_verified = true;
     sqlx::query(
         "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom)
@@ -403,8 +514,18 @@ pub async fn deploy(
         )
     })?;
 
-    // Audit. TODO(phase-2): propagate signer_identity into the rendered
-    // Rego policy when the signing service / policy-templates land.
+    if let (Some(artifacts), Some(signed)) =
+        (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
+    {
+        crate::signing_service::persist_workload_artifacts(
+            &state.db, app.id, deploy_id, artifacts, signed,
+        )
+        .await
+        .map_err(signing_error_response)?;
+    }
+
+    // Audit the image signer and, when present, the signed descriptor hash
+    // persisted for workload-attested artifact fetches.
     let _ = sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.deploy', $4)",
     )
@@ -417,6 +538,9 @@ pub async fn deploy(
         "signer_subject": verified.signer_subject,
         "signer_issuer": verified.signer_issuer,
         "rekor_log_index": verified.rekor_log_index,
+        "descriptor_core_hash": signing_artifacts
+            .as_ref()
+            .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
     }))
     .execute(&state.db)
     .await;
@@ -471,13 +595,17 @@ pub async fn deploy(
         };
 
         if let Err(e) = crate::deploy::apply_deployment_manifests(
-            db.clone(),
-            apply_app.clone(),
-            deploy_id,
-            attestation,
-            kbs_policy,
-            api_signing_pubkey,
-            api_url,
+            crate::deploy::ApplyDeploymentManifestsRequest {
+                pool: db.clone(),
+                app: apply_app.clone(),
+                deployment_id: deploy_id,
+                attestation_config: attestation,
+                kbs_policy_config: kbs_policy,
+                api_signing_pubkey,
+                api_url,
+                workload_artifact_binding,
+                signed_policy_artifact,
+            },
         )
         .await
         {

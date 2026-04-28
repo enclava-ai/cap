@@ -31,7 +31,7 @@ use crate::errors::{InitError, Result};
 
 /// Envelope of the active Trustee policy as fetched from
 /// `GET /resource-policy/<id>/body` (rev9 finding #2 — Phase 3 endpoint).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyEnvelope {
     pub metadata: PolicyMetadata,
     pub rego_text: String,
@@ -41,7 +41,7 @@ pub struct PolicyEnvelope {
     pub signature: [u8; 64],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyMetadata {
     pub app_id: String,
     pub deploy_id: String,
@@ -86,6 +86,19 @@ pub struct VerifyInputs<'a> {
 /// Run all six in-TEE verification steps. Returns Ok(()) only if every step
 /// passes; any mismatch returns `InitError::TrusteePolicy(<step>)`.
 pub fn verify_chain(inputs: &VerifyInputs<'_>) -> Result<()> {
+    if inputs.platform_trustee_policy_pubkey.to_bytes() != inputs.signing_service_pubkey.to_bytes()
+    {
+        return Err(InitError::TrusteePolicy(
+            "policy verification pubkey mismatch".into(),
+        ));
+    }
+
+    if inputs.policy_envelope != &inputs.artifacts.signed_policy_artifact {
+        return Err(InitError::TrusteePolicy(
+            "active Trustee policy does not match workload artifact bundle".into(),
+        ));
+    }
+
     verify_policy_envelope_signature(
         inputs.policy_envelope,
         inputs.platform_trustee_policy_pubkey,
@@ -207,6 +220,38 @@ impl ArtifactFetcher {
             .map_err(|e| InitError::Kbs(format!("fetch policy: {e}")))?;
         Ok((bundle, policy))
     }
+}
+
+pub fn resolve_kbs_attestation_token(
+    env_token: Option<&str>,
+    token_url: &str,
+    timeout: Duration,
+) -> Result<String> {
+    if let Some(token) = env_token.map(str::trim).filter(|token| !token.is_empty()) {
+        return Ok(token.to_string());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| InitError::Kbs(format!("token client build: {e}")))?;
+    let payload: serde_json::Value = client
+        .get(token_url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .map_err(|e| InitError::Kbs(format!("fetch KBS attestation token: {e}")))?;
+    parse_kbs_attestation_token_payload(&payload)
+}
+
+fn parse_kbs_attestation_token_payload(payload: &serde_json::Value) -> Result<String> {
+    let token = payload
+        .get("token")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| InitError::Kbs("KBS attestation token response missing token".into()))?;
+    Ok(token.to_string())
 }
 
 fn verify_policy_envelope_signature(env: &PolicyEnvelope, pk: &VerifyingKey) -> Result<()> {
@@ -702,7 +747,7 @@ mod tests {
         });
         let rego = "package enclava\n";
         let cc_toml = b"x";
-        let (bundle, mut env, cc, signer_pk, _) =
+        let (mut bundle, mut env, cc, signer_pk, _) =
             build_inputs(&descriptor, keyring, rego, &signing, &deployer, cc_toml);
 
         // Point expected_kbs_policy_hash at one rego, but ship a different one.
@@ -711,6 +756,7 @@ mod tests {
         // and instead reach step 6.
         let new_msg = ce_v1_policy_envelope_message(&env).unwrap();
         env.signature = signing.sign(&new_msg).to_bytes();
+        bundle.signed_policy_artifact = env.clone();
 
         let inputs = VerifyInputs {
             policy_envelope: &env,
@@ -725,8 +771,94 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_chain_rejects_active_policy_not_in_artifact_bundle() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let deployer = SigningKey::generate(&mut OsRng);
+        let descriptor = descriptor_json();
+        let keyring = serde_json::json!({
+            "members": [
+                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
+            ]
+        });
+        let rego = "package enclava\n";
+        let cc_toml = b"x";
+        let (bundle, mut env, cc, signer_pk, _) =
+            build_inputs(&descriptor, keyring, rego, &signing, &deployer, cc_toml);
+        env.metadata.key_id = "different-active-policy".into();
+        let new_msg = ce_v1_policy_envelope_message(&env).unwrap();
+        env.signature = signing.sign(&new_msg).to_bytes();
+
+        let inputs = VerifyInputs {
+            policy_envelope: &env,
+            artifacts: &bundle,
+            cc_init_data_claims: &cc,
+            local_cc_init_data_toml: cc_toml,
+            platform_trustee_policy_pubkey: &signer_pk,
+            signing_service_pubkey: &signer_pk,
+        };
+        let err = verify_chain(&inputs).unwrap_err();
+        assert!(
+            matches!(err, InitError::TrusteePolicy(s) if s.contains("does not match workload artifact"))
+        );
+    }
+
+    #[test]
+    fn end_to_end_chain_rejects_policy_pubkey_mismatch() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let other_signer = SigningKey::generate(&mut OsRng);
+        let deployer = SigningKey::generate(&mut OsRng);
+        let descriptor = descriptor_json();
+        let keyring = serde_json::json!({
+            "members": [
+                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
+            ]
+        });
+        let rego = "package enclava\n";
+        let cc_toml = b"x";
+        let (bundle, env, cc, signer_pk, _) =
+            build_inputs(&descriptor, keyring, rego, &signing, &deployer, cc_toml);
+        let other_pk = other_signer.verifying_key();
+
+        let inputs = VerifyInputs {
+            policy_envelope: &env,
+            artifacts: &bundle,
+            cc_init_data_claims: &cc,
+            local_cc_init_data_toml: cc_toml,
+            platform_trustee_policy_pubkey: &signer_pk,
+            signing_service_pubkey: &other_pk,
+        };
+        let err = verify_chain(&inputs).unwrap_err();
+        assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("pubkey mismatch")));
+    }
+
+    #[test]
     fn skipped_chain_logs_and_returns_false() {
         let result = verify_chain_or_skip(None).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn resolve_kbs_attestation_token_prefers_env_token() {
+        let token = resolve_kbs_attestation_token(
+            Some("  env-token  "),
+            "http://127.0.0.1:1/unused",
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(token, "env-token");
+    }
+
+    #[test]
+    fn parse_kbs_attestation_token_payload_rejects_missing_token() {
+        let err = parse_kbs_attestation_token_payload(&serde_json::json!({})).unwrap_err();
+        assert!(matches!(err, InitError::Kbs(msg) if msg.contains("missing token")));
+    }
+
+    #[test]
+    fn parse_kbs_attestation_token_payload_accepts_token() {
+        let token =
+            parse_kbs_attestation_token_payload(&serde_json::json!({ "token": "abc.def.ghi" }))
+                .unwrap();
+        assert_eq!(token, "abc.def.ghi");
     }
 }

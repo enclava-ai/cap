@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::jwt::issue_config_token;
 use crate::auth::middleware::AuthContext;
+use crate::auth::scopes;
 use crate::models::App;
 use crate::state::AppState;
 
@@ -29,6 +30,9 @@ pub async fn issue_config_token_route(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_admin(&auth)?;
+    scopes::require_scope(&auth, "config:write")?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -50,6 +54,7 @@ pub async fn issue_config_token_route(
         auth.user_id,
         auth.org_id,
         app.id,
+        &app.instance_id,
         vec!["config:write".to_string()],
     )
     .map_err(|e| {

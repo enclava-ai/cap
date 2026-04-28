@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -168,6 +169,26 @@ pub fn sign_keyring(owner: &UserSigningKey, keyring: OrgKeyring) -> OrgKeyringEn
     }
 }
 
+pub fn single_member_keyring(
+    org_id: Uuid,
+    version: u64,
+    member_key: &UserSigningKey,
+    role: Role,
+    updated_at: DateTime<Utc>,
+) -> OrgKeyring {
+    OrgKeyring {
+        org_id,
+        version,
+        members: vec![Member {
+            user_id: member_key.user_id,
+            pubkey: member_key.public,
+            role,
+            added_at: updated_at,
+        }],
+        updated_at,
+    }
+}
+
 /// Verify an envelope against an explicit trusted owner pubkey.
 pub fn verify_keyring<'e>(
     envelope: &'e OrgKeyringEnvelope,
@@ -197,6 +218,10 @@ fn state_dir(org_id: &Uuid) -> Result<PathBuf, KeyringError> {
 
 fn owner_pubkey_path(org_id: &Uuid) -> Result<PathBuf, KeyringError> {
     Ok(state_dir(org_id)?.join("owner_pubkey"))
+}
+
+fn keyring_envelope_path(org_id: &Uuid) -> Result<PathBuf, KeyringError> {
+    Ok(state_dir(org_id)?.join("org_keyring.json"))
 }
 
 pub fn load_trusted_owner(org_id: &Uuid) -> Result<Option<VerifyingKey>, KeyringError> {
@@ -229,6 +254,39 @@ pub fn store_trusted_owner(org_id: &Uuid, pubkey: &VerifyingKey) -> Result<(), K
     fs::write(&path, pubkey.to_bytes())?;
     set_file_0600(&path);
     Ok(())
+}
+
+pub fn load_keyring_envelope(org_id: &Uuid) -> Result<OrgKeyringEnvelope, KeyringError> {
+    let raw = fs::read_to_string(keyring_envelope_path(org_id)?)?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+pub fn store_keyring_envelope(
+    org_id: &Uuid,
+    envelope: &OrgKeyringEnvelope,
+) -> Result<PathBuf, KeyringError> {
+    let path = keyring_envelope_path(org_id)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(envelope)?)?;
+    set_file_0600(&tmp);
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+pub fn keyring_fingerprint(keyring: &OrgKeyring) -> [u8; 32] {
+    Sha256::digest(canonical_keyring_bytes(keyring)).into()
+}
+
+pub fn keyring_fingerprint_hex(keyring: &OrgKeyring) -> String {
+    hex::encode(keyring_fingerprint(keyring))
+}
+
+pub fn member_allows_deploy(keyring: &OrgKeyring, pubkey: &VerifyingKey) -> bool {
+    let pubkey = pubkey.to_bytes();
+    keyring.members.iter().any(|member| {
+        member.pubkey.to_bytes() == pubkey
+            && matches!(member.role, Role::Owner | Role::Admin | Role::Deployer)
+    })
 }
 
 #[cfg(unix)]

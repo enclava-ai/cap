@@ -79,9 +79,50 @@ fn list_apps_deserializes_bare_array() {
 }
 
 #[test]
+fn app_response_accepts_phase7_fields_when_server_exposes_them() {
+    let body = serde_json::json!({
+        "id": "8d1e6166",
+        "name": "testapp",
+        "namespace": "cap-x-y",
+        "instance_id": "cli-x-y",
+        "domain": "testapp.enclava.local",
+        "tee_domain": "testapp.tee.enclava.local",
+        "custom_domain": null,
+        "unlock_mode": "password",
+        "status": "creating",
+        "signer_identity_subject": "https://github.com/acme/repo/.github/workflows/deploy.yml@refs/heads/main",
+        "signer_identity_issuer": "https://token.actions.githubusercontent.com",
+        "created_at": "2026-04-18T14:14:35Z"
+    });
+    let app: AppResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(app.tee_domain.as_deref(), Some("testapp.tee.enclava.local"));
+    assert!(app.signer_identity_subject.unwrap().contains("github.com"));
+}
+
+#[test]
+fn deploy_request_serializes_signed_artifact_blobs() {
+    let req = DeployRequest {
+        image: Some("registry.example.com/acme/web@sha256:abc".to_string()),
+        customer_descriptor_blob: Some(r#"{"descriptor":{}}"#.to_string()),
+        org_keyring_blob: Some(r#"{"keyring":{}}"#.to_string()),
+    };
+    let value = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        value["customer_descriptor_blob"],
+        serde_json::json!(r#"{"descriptor":{}}"#)
+    );
+    assert_eq!(
+        value["org_keyring_blob"],
+        serde_json::json!(r#"{"keyring":{}}"#)
+    );
+}
+
+#[test]
 fn unlock_mode_transition_request_contains_only_mode() {
     let req = UpdateUnlockModeRequest {
         mode: "auto-unlock".to_string(),
+        transition_receipt: None,
+        transition_attestation: None,
     };
     let v: serde_json::Value = serde_json::to_value(&req).unwrap();
     assert_eq!(v, serde_json::json!({ "mode": "auto-unlock" }));

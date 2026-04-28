@@ -19,11 +19,11 @@ fn sample_app_serializes_to_json() {
 }
 
 #[test]
-fn owner_resource_path_uses_namespace_and_app_name() {
+fn owner_resource_path_uses_namespace_app_name_and_tag() {
     let app = sample_app();
     assert_eq!(
         app.owner_resource_path(),
-        "default/cap-test-org-test-app-test-app-owner"
+        "default/cap-test-org-test-app-test-app-owner/seed-encrypted"
     );
 }
 

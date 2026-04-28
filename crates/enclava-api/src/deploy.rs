@@ -11,11 +11,24 @@ use enclava_engine::apply::{
 use enclava_engine::manifest::generate_all_manifests;
 use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
+    WorkloadArtifactBinding,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::{App, AppContainer, AppResources};
+
+pub struct ApplyDeploymentManifestsRequest {
+    pub pool: PgPool,
+    pub app: App,
+    pub deployment_id: Uuid,
+    pub attestation_config: Option<AttestationConfig>,
+    pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
+    pub api_signing_pubkey: String,
+    pub api_url: String,
+    pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
+    pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
@@ -145,6 +158,7 @@ pub async fn build_confidential_app(
         },
         attestation: attestation_config.clone(),
         egress_allowlist: Vec::new(),
+        workload_artifact_binding: None,
     })
 }
 
@@ -312,16 +326,21 @@ async fn restart_statefulset_for_ingress(
 /// Apply manifests before returning the deploy response, then continue rollout
 /// monitoring in the background so CLI/API calls are not held for TEE boot.
 pub async fn apply_deployment_manifests(
-    pool: PgPool,
-    app: App,
-    deployment_id: Uuid,
-    attestation_config: Option<AttestationConfig>,
-    kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
-    api_signing_pubkey: String,
-    api_url: String,
+    request: ApplyDeploymentManifestsRequest,
 ) -> Result<(), DeployError> {
+    let ApplyDeploymentManifestsRequest {
+        pool,
+        app,
+        deployment_id,
+        attestation_config,
+        kbs_policy_config,
+        api_signing_pubkey,
+        api_url,
+        workload_artifact_binding,
+        signed_policy_artifact,
+    } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
-    let app_spec = build_confidential_app(
+    let mut app_spec = build_confidential_app(
         &pool,
         &app,
         &attestation_config,
@@ -329,6 +348,7 @@ pub async fn apply_deployment_manifests(
         &api_url,
     )
     .await?;
+    app_spec.workload_artifact_binding = workload_artifact_binding;
 
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
@@ -338,9 +358,20 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
-    crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
-    crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
+    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+        crate::kbs::write_signed_policy_artifact(
+            kbs_policy_config.as_ref(),
+            signed_policy_artifact,
+        )
+        .await?;
+    } else {
+        // Backward-compatible path for unsigned deployments only. Signed
+        // deployments must use the signing-service envelope as Trustee's
+        // authoritative policy body.
+        crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
+        crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
+        crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
+    }
 
     let engine = ApplyEngine::try_default().await?;
     apply_all(&engine, &manifests).await?;

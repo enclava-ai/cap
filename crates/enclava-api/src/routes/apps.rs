@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthContext;
+use crate::auth::scopes;
 use crate::models::App;
 use crate::state::AppState;
 
@@ -48,6 +49,68 @@ async fn delete_tenant_namespace(namespace: &str) -> Result<(), kube::Error> {
         Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+async fn request_workload_teardown(
+    state: &AppState,
+    auth: &AuthContext,
+    app: &App,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let token = crate::auth::jwt::issue_config_token(
+        &state.signing_key,
+        auth.user_id,
+        auth.org_id,
+        app.id,
+        &app.instance_id,
+        vec!["teardown".to_string()],
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to issue teardown token: {e}")})),
+        )
+    })?;
+
+    let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
+    let url = format!(
+        "https://{}/.well-known/confidential/teardown",
+        domain.trim_end_matches('/')
+    );
+    let response = state
+        .tee_http_client
+        .post(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "failed to contact workload teardown endpoint",
+                    "detail": e.to_string(),
+                })),
+            )
+        })?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let status_code = status.as_u16();
+    let body = response.text().await.unwrap_or_default();
+    Err((
+        if matches!(status_code, 409 | 423) {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_GATEWAY
+        },
+        Json(serde_json::json!({
+            "error": "workload teardown failed",
+            "status": status_code,
+            "body": body,
+        })),
+    ))
 }
 
 /// Comprehensive app name validation
@@ -132,6 +195,9 @@ pub struct AppResponse {
     pub name: String,
     pub namespace: String,
     pub instance_id: String,
+    pub service_account: String,
+    pub bootstrap_owner_pubkey_hash: String,
+    pub tenant_instance_identity_hash: String,
     pub domain: String,
     pub tee_domain: Option<String>,
     pub custom_domain: Option<String>,
@@ -149,6 +215,9 @@ impl From<App> for AppResponse {
             name: a.name,
             namespace: a.namespace,
             instance_id: a.instance_id,
+            service_account: a.service_account,
+            bootstrap_owner_pubkey_hash: a.bootstrap_owner_pubkey_hash,
+            tenant_instance_identity_hash: a.tenant_instance_identity_hash,
             domain: a.domain,
             tee_domain: a.tee_domain,
             custom_domain: a.custom_domain,
@@ -443,6 +512,9 @@ pub async fn delete_app(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_admin(&auth)?;
+    scopes::require_scope(&auth, "apps:write")?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -459,7 +531,9 @@ pub async fn delete_app(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    // Mark as deleting
+    request_workload_teardown(&state, &auth, &app).await?;
+
+    // Mark as deleting after workload-owned KBS material has been removed.
     sqlx::query("UPDATE apps SET status = 'deleting', updated_at = now() WHERE id = $1")
         .bind(app.id)
         .execute(&state.db)
@@ -618,12 +692,8 @@ pub async fn rotate_signer(
     Path(app_name): Path<String>,
     Json(body): Json<RotateSignerRequest>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
-    if !matches!(auth.role, crate::models::Role::Owner) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "owner role required"})),
-        ));
-    }
+    scopes::require_owner(&auth)?;
+    scopes::require_scope(&auth, "apps:write")?;
 
     if body.subject.trim().is_empty() || body.issuer.trim().is_empty() {
         return Err((

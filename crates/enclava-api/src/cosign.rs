@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sigstore::cosign::CosignCapabilities;
@@ -482,6 +483,8 @@ pub fn sidecar_pins_from_env() -> Result<Option<Vec<SidecarPin>>, CosignError> {
         pins.push(build_pin_from_env(
             "attestation_proxy",
             &image,
+            "ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_BASE64",
+            "ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_PEM",
             "ATTESTATION_PROXY_SIGNER_SUBJECT",
             "ATTESTATION_PROXY_SIGNER_ISSUER",
         )?);
@@ -490,6 +493,8 @@ pub fn sidecar_pins_from_env() -> Result<Option<Vec<SidecarPin>>, CosignError> {
         pins.push(build_pin_from_env(
             "caddy_ingress",
             &image,
+            "CADDY_INGRESS_SIGNER_PUBLIC_KEY_BASE64",
+            "CADDY_INGRESS_SIGNER_PUBLIC_KEY_PEM",
             "CADDY_INGRESS_SIGNER_SUBJECT",
             "CADDY_INGRESS_SIGNER_ISSUER",
         )?);
@@ -500,6 +505,8 @@ pub fn sidecar_pins_from_env() -> Result<Option<Vec<SidecarPin>>, CosignError> {
 fn build_pin_from_env(
     label: &'static str,
     image_ref: &str,
+    public_key_b64_var: &str,
+    public_key_pem_var: &str,
     subject_var: &str,
     issuer_var: &str,
 ) -> Result<SidecarPin, CosignError> {
@@ -510,6 +517,15 @@ fn build_pin_from_env(
             CosignError::InvalidPolicy(format!("{label} image is not digest-pinned: {image_ref}"))
         })?
         .to_string();
+
+    if let Some(pem) = read_public_key_policy(public_key_b64_var, public_key_pem_var)? {
+        return Ok(SidecarPin {
+            label,
+            image_ref: image_ref.to_string(),
+            image_digest: digest,
+            policy: VerificationPolicy::PublicKey { pem },
+        });
+    }
 
     let subject = std::env::var(subject_var).map_err(|_| {
         CosignError::InvalidPolicy(format!("missing {subject_var} for sidecar {label}"))
@@ -537,6 +553,37 @@ fn build_pin_from_env(
     })
 }
 
+fn read_public_key_policy(
+    public_key_b64_var: &str,
+    public_key_pem_var: &str,
+) -> Result<Option<String>, CosignError> {
+    for name in [
+        public_key_b64_var,
+        "PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_BASE64",
+    ] {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            let decoded = B64
+                .decode(value.trim())
+                .map_err(|e| CosignError::InvalidPolicy(format!("invalid {name}: {e}")))?;
+            let pem = String::from_utf8(decoded)
+                .map_err(|e| CosignError::InvalidPolicy(format!("{name} is not UTF-8: {e}")))?;
+            return Ok(Some(pem));
+        }
+    }
+
+    for name in [public_key_pem_var, "PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_PEM"] {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +602,8 @@ mod tests {
         let err = build_pin_from_env(
             "attestation_proxy",
             "ghcr.io/x/y:tag",
+            "TEST_PUBLIC_KEY_BASE64",
+            "TEST_PUBLIC_KEY_PEM",
             "TEST_SUBJECT_VAR",
             "TEST_ISSUER_VAR",
         )
@@ -577,6 +626,8 @@ mod tests {
         let pin = build_pin_from_env(
             "attestation_proxy",
             "ghcr.io/x/y@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "TEST_PUBLIC_KEY_BASE64",
+            "TEST_PUBLIC_KEY_PEM",
             "TEST_SIDECAR_SUBJECT_URL",
             "TEST_SIDECAR_ISSUER_URL",
         )
@@ -588,6 +639,49 @@ mod tests {
         assert_eq!(
             pin.image_digest,
             "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn build_pin_from_env_public_key_overrides_fulcio_vars() {
+        let pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAeDjxjxz1f2yWqSX+F2TSLujEc5tMLMMIRxI2CPOXKv8=\n-----END PUBLIC KEY-----\n";
+        unsafe {
+            std::env::set_var("TEST_SIDECAR_PUBLIC_KEY_B64", B64.encode(pem));
+            std::env::remove_var("TEST_SIDECAR_PUBLIC_KEY_PEM");
+            std::env::remove_var("PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_BASE64");
+            std::env::remove_var("PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_PEM");
+        }
+        let pin = build_pin_from_env(
+            "attestation_proxy",
+            "ghcr.io/x/y@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "TEST_SIDECAR_PUBLIC_KEY_B64",
+            "TEST_SIDECAR_PUBLIC_KEY_PEM",
+            "TEST_SIDECAR_MISSING_SUBJECT",
+            "TEST_SIDECAR_MISSING_ISSUER",
+        )
+        .expect("pin");
+        assert!(matches!(pin.policy, VerificationPolicy::PublicKey { .. }));
+    }
+
+    #[test]
+    fn build_pin_from_env_rejects_invalid_public_key_base64() {
+        unsafe {
+            std::env::set_var("TEST_SIDECAR_BAD_PUBLIC_KEY_B64", "not base64");
+            std::env::remove_var("TEST_SIDECAR_BAD_PUBLIC_KEY_PEM");
+            std::env::remove_var("PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_BASE64");
+            std::env::remove_var("PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_PEM");
+        }
+        let err = build_pin_from_env(
+            "attestation_proxy",
+            "ghcr.io/x/y@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "TEST_SIDECAR_BAD_PUBLIC_KEY_B64",
+            "TEST_SIDECAR_BAD_PUBLIC_KEY_PEM",
+            "TEST_SIDECAR_MISSING_SUBJECT",
+            "TEST_SIDECAR_MISSING_ISSUER",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CosignError::InvalidPolicy(msg) if msg.contains("TEST_SIDECAR_BAD_PUBLIC_KEY_B64"))
         );
     }
 

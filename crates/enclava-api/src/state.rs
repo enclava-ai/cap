@@ -1,5 +1,6 @@
 use crate::dns::DnsConfig;
 use crate::kbs::KbsPolicyConfig;
+use crate::signing_service::SigningServiceClient;
 use ed25519_dalek::SigningKey;
 use enclava_engine::types::AttestationConfig;
 use sqlx::PgPool;
@@ -38,6 +39,13 @@ pub struct AppState {
     pub dns: Option<DnsConfig>,
     /// Trustee KBS policy settings for CAP-managed owner-resource bindings.
     pub kbs_policy: Option<KbsPolicyConfig>,
+    /// Trustee callback used to validate workload attestation tokens before
+    /// returning descriptor/keyring/policy artifacts to a pod.
+    pub trustee_attestation_verify_url: Option<String>,
+    /// Off-cluster policy signing service. When signed descriptor/keyring
+    /// blobs are supplied on deploy, CAP forwards them here and persists the
+    /// returned signed policy artifact.
+    pub signing_service: Option<SigningServiceClient>,
     /// Cluster-wide apply backpressure for this API instance. Applying a CAP
     /// deployment starts a Kata VM and attaches Longhorn volumes; bursts can
     /// overwhelm a single worker node before Kubernetes has useful feedback.

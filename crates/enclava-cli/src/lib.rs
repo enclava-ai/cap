@@ -1,8 +1,10 @@
 pub mod api_client;
 pub mod api_types;
 pub mod app_config;
+pub mod attestation;
 pub mod config;
 pub mod descriptor;
 pub mod keyring;
 pub mod keys;
+pub mod platform_release;
 pub mod tee_client;

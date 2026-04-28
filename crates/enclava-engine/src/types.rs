@@ -52,6 +52,35 @@ pub struct ConfidentialApp {
     /// egress entry restricted to the listed TCP ports.
     #[serde(default)]
     pub egress_allowlist: Vec<EgressRule>,
+    /// Customer-signed descriptor/keyring values that must be carried in
+    /// cc_init_data so enclava-init can fetch and verify workload artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadArtifactBinding {
+    #[serde(with = "hex_bytes32")]
+    pub descriptor_core_hash: [u8; 32],
+    #[serde(with = "hex_bytes32")]
+    pub descriptor_signing_pubkey: [u8; 32],
+    #[serde(with = "hex_bytes32")]
+    pub org_keyring_fingerprint: [u8; 32],
+}
+
+mod hex_bytes32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(b))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        use serde::de::Error;
+        let s = String::deserialize(d)?;
+        let bytes = hex::decode(&s).map_err(D::Error::custom)?;
+        bytes.try_into().map_err(|_| D::Error::custom("len != 32"))
+    }
 }
 
 /// One world-egress allowance. Hosts must validate as FQDNs (see
@@ -69,14 +98,26 @@ pub struct AttestationConfig {
     pub proxy_image: ImageRef,
     /// Caddy tenant-ingress image reference (digest-pinned).
     pub caddy_image: ImageRef,
-    /// ACME directory URL used by tenant Caddy for DNS-01 issuance.
+    /// ACME directory URL used by tenant Caddy for TLS-ALPN-01 issuance.
     #[serde(default = "default_acme_ca_url")]
     pub acme_ca_url: String,
-    /// Cloudflare API token secret name for ACME DNS-01 challenge.
-    pub cloudflare_token_secret: String,
-    /// Cloudflare API token value copied into each tenant namespace for Caddy.
+    /// Enables in-TEE Trustee policy verification once the Trustee workload
+    /// policy-read and CAP workload-artifact endpoints are deployed.
+    #[serde(default)]
+    pub trustee_policy_read_available: bool,
+    /// CAP API workload-attested artifact endpoint reachable from the workload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloudflare_api_token: Option<String>,
+    pub workload_artifacts_url: Option<String>,
+    /// Trustee workload-attested active policy body endpoint for this platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trustee_policy_url: Option<String>,
+    /// Platform Ed25519 public key for Trustee policy artifacts, hex encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_trustee_policy_pubkey_hex: Option<String>,
+    /// Signing-service Ed25519 public key for descriptor/keyring authorization,
+    /// hex encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_service_pubkey_hex: Option<String>,
 }
 
 pub fn default_acme_ca_url() -> String {
@@ -190,10 +231,10 @@ impl ConfidentialApp {
             .unwrap_or(&self.domain.platform_domain)
     }
 
-    /// KBS owner ciphertext path prefix for this app.
-    /// E.g., "default/{namespace}-{name}-owner"
+    /// KBS owner ciphertext path for this app.
+    /// E.g., "default/{namespace}-{name}-owner/seed-encrypted"
     pub fn owner_resource_path(&self) -> String {
-        format!("default/{}", self.owner_resource_type())
+        format!("default/{}/seed-encrypted", self.owner_resource_type())
     }
 
     /// Stable owner-resource instance name used by the attestation proxy.

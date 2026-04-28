@@ -85,6 +85,7 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (api, paths) = build_api_client()?;
     let tee_url = resolve_tee_url(&api, &app_name).await?;
     let tee = TeeClient::new(&tee_url);
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     println!("Claiming ownership of {app_name}...");
 
@@ -166,6 +167,7 @@ pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> 
     let (api, _paths) = build_api_client()?;
     let tee_url = resolve_tee_url(&api, &app_name).await?;
     let tee = TeeClient::new(&tee_url);
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let password = Password::new().with_prompt("Unlock password").interact()?;
 
@@ -180,6 +182,7 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
     let (api, _paths) = build_api_client()?;
     let tee_url = resolve_tee_url(&api, &app_name).await?;
     let tee = TeeClient::new(&tee_url);
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let mnemonic: String = Input::new()
         .with_prompt("Recovery mnemonic (BIP39)")
@@ -201,6 +204,7 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
     let (api, _paths) = build_api_client()?;
     let tee_url = resolve_tee_url(&api, &app_name).await?;
     let tee = TeeClient::new(&tee_url);
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let current = Password::new().with_prompt("Current password").interact()?;
 
@@ -222,6 +226,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let (api, _paths) = build_api_client()?;
             let tee_url = resolve_tee_url(&api, &app_name).await?;
             let tee = TeeClient::new(&tee_url);
+            let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
             let password = Password::new()
                 .with_prompt("Unlock password (to authorize sealing)")
@@ -231,11 +236,22 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             tee.enable_auto_unlock(&password).await?;
             println!("Sealed seed written inside the TEE.");
 
+            let app_meta = api.get_app(&app_name).await?;
+            let transition_receipt = tee
+                .sign_unlock_mode_transition(
+                    &app_meta.id,
+                    &app_meta.unlock_mode,
+                    "auto",
+                    &transition_attestation,
+                )
+                .await?;
             let transition = api
                 .update_unlock_mode(
                     &app_name,
                     &UpdateUnlockModeRequest {
                         mode: "auto-unlock".to_string(),
+                        transition_receipt: Some(transition_receipt),
+                        transition_attestation: Some(transition_attestation),
                     },
                 )
                 .await?;
@@ -254,6 +270,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let (api, _paths) = build_api_client()?;
             let tee_url = resolve_tee_url(&api, &app_name).await?;
             let tee = TeeClient::new(&tee_url);
+            let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
             let password = Password::new()
                 .with_prompt("Unlock password (to authorize unsealing)")
@@ -263,11 +280,22 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             tee.disable_auto_unlock(&password).await?;
             println!("Sealed seed removed inside the TEE.");
 
+            let app_meta = api.get_app(&app_name).await?;
+            let transition_receipt = tee
+                .sign_unlock_mode_transition(
+                    &app_meta.id,
+                    &app_meta.unlock_mode,
+                    "password",
+                    &transition_attestation,
+                )
+                .await?;
             let transition = api
                 .update_unlock_mode(
                     &app_name,
                     &UpdateUnlockModeRequest {
                         mode: "password".to_string(),
+                        transition_receipt: Some(transition_receipt),
+                        transition_attestation: Some(transition_attestation),
                     },
                 )
                 .await?;

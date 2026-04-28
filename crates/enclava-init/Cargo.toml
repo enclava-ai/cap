@@ -36,4 +36,5 @@ rand = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 
 [features]
+prod-strict = []
 luks-integration = []

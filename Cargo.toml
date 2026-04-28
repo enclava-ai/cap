@@ -6,6 +6,7 @@ members = [
     "crates/enclava-api",
     "crates/enclava-cli",
     "crates/enclava-init",
+    "crates/enclava-wait-exec",
 ]
 
 [workspace.package]
@@ -31,7 +32,7 @@ base64 = "0.22"
 data-encoding = "2"
 flate2 = "1.0"
 axum = { version = "0.8", features = ["macros"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "derive", "migrate", "macros"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 argon2 = "0.5"
@@ -54,6 +55,9 @@ tower_governor = "0.8"
 sigstore = { version = "0.13", default-features = false, features = ["cosign", "sigstore-trust-root", "rustls-tls"] }
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
 zeroize = { version = "1", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
+tokio-rustls = "0.26"
+x509-cert = "0.2"
 
 # Internal
 enclava-common = { path = "crates/enclava-common" }

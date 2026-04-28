@@ -24,6 +24,27 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
         .primary_container()
         .expect("app must have a primary container");
     let image_digest = primary.image.digest_ref();
+    let signer_identity_subject = required_claim(
+        "signer_identity_subject",
+        app.signer_identity_subject.as_deref(),
+    );
+    let signer_identity_issuer = required_claim(
+        "signer_identity_issuer",
+        app.signer_identity_issuer.as_deref(),
+    );
+    assert_non_empty("image_digest", &image_digest);
+    assert_non_empty("namespace", &app.namespace);
+    assert_non_empty("service_account", &app.service_account);
+    assert_non_empty("identity_hash", &app.tenant_instance_identity_hash);
+    assert_non_empty("runtime_class", DEFAULT_RUNTIME_CLASS);
+    assert_non_empty(
+        "sidecar_digests.attestation_proxy",
+        app.attestation.proxy_image.digest(),
+    );
+    assert_non_empty(
+        "sidecar_digests.caddy_ingress",
+        app.attestation.caddy_image.digest(),
+    );
 
     let identity_toml = build_identity_toml(
         &app.namespace,
@@ -39,6 +60,37 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     toml.push_str("version = \"0.1.0\"\nalgorithm = \"sha256\"\n");
     toml.push('\n');
     toml.push_str("[data]\n");
+    toml.push_str(&format!("image_digest = \"{}\"\n", image_digest));
+    toml.push_str(&format!("runtime_class = \"{}\"\n", DEFAULT_RUNTIME_CLASS));
+    toml.push_str(&format!("namespace = \"{}\"\n", app.namespace));
+    toml.push_str(&format!("service_account = \"{}\"\n", app.service_account));
+    toml.push_str(&format!(
+        "identity_hash = \"{}\"\n",
+        app.tenant_instance_identity_hash
+    ));
+    toml.push_str(&format!(
+        "signer_identity_subject = \"{}\"\n",
+        signer_identity_subject
+    ));
+    toml.push_str(&format!(
+        "signer_identity_issuer = \"{}\"\n",
+        signer_identity_issuer
+    ));
+    if let Some(binding) = &app.workload_artifact_binding {
+        toml.push_str(&format!(
+            "descriptor_core_hash = \"{}\"\n",
+            hex::encode(binding.descriptor_core_hash)
+        ));
+        toml.push_str(&format!(
+            "descriptor_signing_pubkey = \"{}\"\n",
+            hex::encode(binding.descriptor_signing_pubkey)
+        ));
+        toml.push_str(&format!(
+            "org_keyring_fingerprint = \"{}\"\n",
+            hex::encode(binding.org_keyring_fingerprint)
+        ));
+    }
+    toml.push('\n');
 
     // policy.rego
     toml.push_str("\"policy.rego\" = '''\n");
@@ -72,11 +124,9 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     toml.push_str(&identity_toml);
     toml.push_str("'''\n");
 
-    // Phase 11: bind runtime class and sidecar digests so the customer-signed
+    // Phase 11: bind sidecar digests so the customer-signed
     // descriptor can chain `expected_cc_init_data_hash` to the exact runtime
     // identity. enclava-init re-derives these and refuses to start on mismatch.
-    toml.push('\n');
-    toml.push_str(&format!("runtime_class = \"{}\"\n", DEFAULT_RUNTIME_CLASS));
     toml.push('\n');
     toml.push_str("[data.sidecar_digests]\n");
     toml.push_str(&format!(
@@ -94,6 +144,16 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
 /// The SNP runtime class CAP requires. enclava-init reads this from cc_init_data
 /// at boot and refuses to start if the rendered Pod's `runtimeClassName` differs.
 pub const DEFAULT_RUNTIME_CLASS: &str = "kata-qemu-snp";
+
+fn required_claim<'a>(name: &str, value: Option<&'a str>) -> &'a str {
+    let value = value.unwrap_or_else(|| panic!("cc_init_data requires non-empty {name}"));
+    assert_non_empty(name, value);
+    value
+}
+
+fn assert_non_empty(name: &str, value: &str) {
+    assert!(!value.is_empty(), "cc_init_data requires non-empty {name}");
+}
 
 fn build_agent_policy(
     image_digest: &str,

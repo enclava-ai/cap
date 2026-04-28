@@ -80,10 +80,22 @@ pub struct AppResponse {
     pub name: String,
     pub namespace: String,
     pub instance_id: String,
+    #[serde(default)]
+    pub service_account: Option<String>,
+    #[serde(default)]
+    pub bootstrap_owner_pubkey_hash: Option<String>,
+    #[serde(default)]
+    pub tenant_instance_identity_hash: Option<String>,
     pub domain: String,
+    #[serde(default)]
+    pub tee_domain: Option<String>,
     pub custom_domain: Option<String>,
     pub status: String,
     pub unlock_mode: String,
+    #[serde(default)]
+    pub signer_identity_subject: Option<String>,
+    #[serde(default)]
+    pub signer_identity_issuer: Option<String>,
     pub created_at: String,
 }
 
@@ -92,6 +104,10 @@ pub struct AppResponse {
 #[derive(Debug, Serialize)]
 pub struct DeployRequest {
     pub image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_descriptor_blob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_keyring_blob: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +157,10 @@ pub struct UnlockStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct UpdateUnlockModeRequest {
     pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_receipt: Option<SignedReceiptResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_attestation: Option<TransitionReceiptAttestation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +169,47 @@ pub struct UpdateUnlockModeResponse {
     pub unlock_mode: String,
     pub deployment_id: Option<String>,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedReceiptResponse {
+    pub operation: String,
+    pub payload: ReceiptPayloadView,
+    pub receipt: ReceiptEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptPayloadView {
+    pub purpose: String,
+    pub app_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_quote_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_value_sha256: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptEnvelope {
+    pub pubkey: String,
+    pub pubkey_sha256: String,
+    pub payload_canonical_bytes: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionReceiptAttestation {
+    pub tee_domain: String,
+    pub nonce: String,
+    pub leaf_spki_sha256: String,
+    pub receipt_pubkey_sha256: String,
+    pub attestation_evidence_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +328,36 @@ pub struct OrgResponse {
 pub struct InviteRequest {
     pub identifier: String,
     pub role: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterPublicKeyRequest {
+    pub public_key: String,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterPublicKeyResponse {
+    pub id: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PutOrgKeyringRequest {
+    pub version: u64,
+    pub keyring_payload: serde_json::Value,
+    pub signature: String,
+    pub signing_pubkey: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrgKeyringResponse {
+    pub org_id: String,
+    pub version: u64,
+    pub keyring_payload: serde_json::Value,
+    pub signature: String,
+    pub signing_pubkey: String,
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Deserialize)]

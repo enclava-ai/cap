@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
-    branches: ['main', 'develop']
+    branches: ["main", "develop"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -61,6 +64,29 @@ jobs:
       - name: Run doctests
         run: cargo test --doc
 
+  dependency-gates:
+    name: Audit Rust dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo audit and cargo deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Run cargo audit
+        # RUSTSEC-2023-0071 is transitive through jsonwebtoken/sigstore and has
+        # no fixed upstream release. cargo-deny records the same exception with
+        # rationale in deny.toml.
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+      - name: Run cargo deny
+        run: cargo deny check advisories sources
+
   build:
     name: Build all crates
     runs-on: ubuntu-latest
@@ -92,3 +118,22 @@ jobs:
         run: |
           cargo build --release --bin enclava-api
           cargo build --release --bin enclava
+
+      - name: Build prod-strict release path
+        run: |
+          cargo build --release -p enclava-common --features prod-strict
+          cargo build --release -p enclava-engine --features prod-strict
+          cargo build --release -p enclava-api --features prod-strict
+          cargo build --release -p enclava-cli --features prod-strict
+          cargo build --release -p enclava-init --features prod-strict
+
+      - name: Verify prod-strict rejects debug-only features
+        run: |
+          if cargo check --release -p enclava-engine --features prod-strict,testutil; then
+            echo "enclava-engine prod-strict unexpectedly accepted testutil"
+            exit 1
+          fi
+          if cargo check --release -p enclava-init --features prod-strict,luks-integration; then
+            echo "enclava-init prod-strict unexpectedly accepted luks-integration"
+            exit 1
+          fi

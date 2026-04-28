@@ -1,5 +1,6 @@
 use enclava_engine::manifest::cc_init_data::{build_toml, encode_cc_init_data, sha256_hex};
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::WorkloadArtifactBinding;
 
 #[test]
 fn toml_contains_policy_rego() {
@@ -45,6 +46,9 @@ fn toml_contains_image_digest() {
     let app = sample_app();
     let toml = build_toml(&app);
     assert!(toml.contains(
+        "image_digest = \"ghcr.io/test/app@sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\""
+    ));
+    assert!(toml.contains(
         "ghcr.io/test/app@sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
     ));
 }
@@ -64,10 +68,87 @@ fn toml_contains_service_account() {
 }
 
 #[test]
+fn data_claims_include_required_rego_descriptor_anchors() {
+    let app = sample_app();
+    let toml = build_toml(&app);
+    let value: toml::Value = toml::from_str(&toml).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+
+    for key in [
+        "image_digest",
+        "signer_identity_subject",
+        "signer_identity_issuer",
+        "namespace",
+        "service_account",
+        "identity_hash",
+        "runtime_class",
+    ] {
+        let value = data.get(key).and_then(toml::Value::as_str).unwrap();
+        assert!(!value.is_empty(), "{key} must be non-empty");
+    }
+
+    assert_eq!(
+        data["image_digest"].as_str().unwrap(),
+        app.primary_container().unwrap().image.digest_ref()
+    );
+    assert_eq!(
+        data["signer_identity_subject"].as_str().unwrap(),
+        app.signer_identity_subject.as_deref().unwrap()
+    );
+    assert_eq!(
+        data["signer_identity_issuer"].as_str().unwrap(),
+        app.signer_identity_issuer.as_deref().unwrap()
+    );
+    assert_eq!(data["namespace"].as_str().unwrap(), app.namespace);
+    assert_eq!(
+        data["service_account"].as_str().unwrap(),
+        app.service_account
+    );
+    assert_eq!(
+        data["identity_hash"].as_str().unwrap(),
+        app.tenant_instance_identity_hash
+    );
+    assert_eq!(data["runtime_class"].as_str().unwrap(), "kata-qemu-snp");
+
+    let sidecars = data
+        .get("sidecar_digests")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    assert_eq!(
+        sidecars["attestation_proxy"].as_str().unwrap(),
+        app.attestation.proxy_image.digest()
+    );
+    assert_eq!(
+        sidecars["caddy_ingress"].as_str().unwrap(),
+        app.attestation.caddy_image.digest()
+    );
+}
+
+#[test]
 fn toml_contains_policy_instance_annotation() {
     let app = sample_app();
     let toml = build_toml(&app);
     assert!(toml.contains("\"tenant.flowforge.sh/instance\":\"test-app\""));
+}
+
+#[test]
+fn toml_contains_workload_artifact_binding_when_present() {
+    let mut app = sample_app();
+    app.workload_artifact_binding = Some(WorkloadArtifactBinding {
+        descriptor_core_hash: [0xab; 32],
+        descriptor_signing_pubkey: [0xcd; 32],
+        org_keyring_fingerprint: [0xef; 32],
+    });
+    let toml = build_toml(&app);
+    assert!(toml.contains(&format!("descriptor_core_hash = \"{}\"", "ab".repeat(32))));
+    assert!(toml.contains(&format!(
+        "descriptor_signing_pubkey = \"{}\"",
+        "cd".repeat(32)
+    )));
+    assert!(toml.contains(&format!(
+        "org_keyring_fingerprint = \"{}\"",
+        "ef".repeat(32)
+    )));
 }
 
 #[test]

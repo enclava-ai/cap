@@ -1,5 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
@@ -7,7 +8,17 @@ use enclava_init::config::{Config, Mode, VolumeConfig};
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{kbs_fetch, luks, seeds, socket, trustee_verify, unlock, writes};
 
+const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
+
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("--probe-ready") {
+        return if ready_file_exists(&ready_file_path()) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -32,6 +43,14 @@ fn run() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/enclava-init/config.toml"));
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
+    let stay_alive = stay_alive_enabled();
+    let ready_file = ready_file_path();
+    if stay_alive {
+        clear_ready_file(&ready_file)
+            .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
+        wait_for_container_start_sentinels()
+            .context("waiting for workload containers to start before mounting LUKS")?;
+    }
 
     let owner = match cfg.mode {
         Mode::Password => acquire_owner_seed_password(&cfg)?,
@@ -56,8 +75,106 @@ fn run() -> Result<()> {
 
     write_per_component_seeds(&cfg, &owner)?;
 
+    if stay_alive {
+        mark_ready_file(&ready_file)
+            .with_context(|| format!("writing ready file {}", ready_file.display()))?;
+        tracing::info!(
+            ready_file = %ready_file.display(),
+            "enclava-init: seeds released; keeping mounter sidecar alive"
+        );
+        stay_alive_forever();
+    }
+
     tracing::info!("enclava-init: seeds released");
     Ok(())
+}
+
+fn stay_alive_enabled() -> bool {
+    std::env::var("ENCLAVA_INIT_STAY_ALIVE")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
+fn ready_file_path() -> PathBuf {
+    std::env::var("ENCLAVA_INIT_READY_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_READY_FILE))
+}
+
+fn started_dir_path() -> PathBuf {
+    std::env::var("ENCLAVA_INIT_STARTED_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/run/enclava/containers"))
+}
+
+fn wait_for_container_start_sentinels() -> Result<()> {
+    let names = std::env::var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS").unwrap_or_default();
+    let containers = names
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(validate_sentinel_name)
+        .collect::<Result<Vec<_>>>()?;
+    if containers.is_empty() {
+        return Ok(());
+    }
+
+    let dir = started_dir_path();
+    tracing::info!(
+        dir = %dir.display(),
+        containers = containers.join(","),
+        "waiting for workload containers to start before opening LUKS"
+    );
+    loop {
+        let missing = containers
+            .iter()
+            .filter(|name| !ready_file_exists(&dir.join(name.as_str())))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tracing::debug!(
+            missing = missing.join(","),
+            "workload containers not started yet"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn validate_sentinel_name(name: &str) -> Result<String> {
+    let path = Path::new(name);
+    if path.components().count() == 1
+        && matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        Ok(name.to_string())
+    } else {
+        Err(anyhow!("invalid container sentinel name: {name}"))
+    }
+}
+
+fn clear_ready_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn mark_ready_file(path: &Path) -> Result<()> {
+    writes::atomic_write(path, b"ready\n", 0o644).map_err(Into::into)
+}
+
+fn ready_file_exists(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+fn stay_alive_forever() -> ! {
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
@@ -240,7 +357,12 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
     let signer_pk = parse_pubkey(signer_pk_hex)?;
     let signing_pk = parse_pubkey(signing_pk_hex)?;
 
-    let token = std::env::var("KBS_ATTESTATION_TOKEN").unwrap_or_default();
+    let token = trustee_verify::resolve_kbs_attestation_token(
+        std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
+        &cfg.kbs_attestation_token_url,
+        std::time::Duration::from_secs(15),
+    )
+    .context("resolving KBS attestation token")?;
     let fetcher = trustee_verify::ArtifactFetcher {
         workload_artifacts_url: workload_url.into(),
         trustee_policy_url: policy_url.into(),
@@ -314,4 +436,29 @@ fn write_per_component_seeds(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
         .with_context(|| format!("chown {}", app_path.display()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn ready_probe_reflects_ready_file_state() {
+        let dir = tempdir().unwrap();
+        let ready = dir.path().join("run/enclava/init-ready");
+
+        assert!(!ready_file_exists(&ready));
+        mark_ready_file(&ready).unwrap();
+        assert!(ready_file_exists(&ready));
+        clear_ready_file(&ready).unwrap();
+        assert!(!ready_file_exists(&ready));
+    }
+
+    #[test]
+    fn container_sentinel_names_are_single_path_components() {
+        assert_eq!(validate_sentinel_name("web").unwrap(), "web");
+        assert!(validate_sentinel_name("../web").is_err());
+        assert!(validate_sentinel_name("web/sidecar").is_err());
+    }
 }

@@ -28,6 +28,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthContext;
+use crate::auth::scopes;
 use crate::models::App;
 use crate::state::AppState;
 
@@ -135,6 +136,9 @@ pub async fn create_challenge(
     Path(app_name): Path<String>,
     Json(body): Json<CreateChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_admin(&auth)?;
+    scopes::require_scope(&auth, "apps:write")?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -198,6 +202,9 @@ pub async fn verify_challenge(
     State(state): State<AppState>,
     Path((app_name, domain)): Path<(String, String)>,
 ) -> Result<Json<VerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_admin(&auth)?;
+    scopes::require_scope(&auth, "apps:write")?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -425,6 +432,9 @@ pub async fn remove_custom_domain(
     State(state): State<AppState>,
     Path((app_name, domain)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_admin(&auth)?;
+    scopes::require_scope(&auth, "apps:write")?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)

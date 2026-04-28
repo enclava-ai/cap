@@ -3,7 +3,8 @@
 //! Phase 5 default: raw Block PVCs are passed only to enclava-init. The
 //! decrypted filesystems are mounted into shared EmptyDir mountpoint volumes
 //! (`state-mount`, `tls-state-mount`) that app/caddy consume with
-//! mountPropagation.
+//! mountPropagation. A separate tools EmptyDir carries the static wait/exec
+//! helper into workload containers without requiring a shell in those images.
 
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, EmptyDirVolumeSource, PersistentVolumeClaim, PersistentVolumeClaimSpec,
@@ -65,11 +66,25 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
         });
     } else {
         v.push(Volume {
+            name: "startup".to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: format!("{}-startup", app.name),
+                default_mode: Some(0o555),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        v.push(Volume {
             name: "unlock-socket".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {
                 medium: Some("Memory".to_string()),
                 size_limit: Some(Quantity("1Mi".to_string())),
             }),
+            ..Default::default()
+        });
+        v.push(Volume {
+            name: "enclava-tools".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
         });
         v.push(Volume {

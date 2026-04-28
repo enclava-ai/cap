@@ -12,6 +12,7 @@ pub mod models;
 pub mod ratelimit;
 pub mod registry;
 pub mod routes;
+pub mod signing_service;
 pub mod state;
 
 use axum::Router;
@@ -52,6 +53,11 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::delete(routes::auth::revoke_api_key_route),
         );
 
+    let user_routes = Router::new().route(
+        "/users/me/public-keys",
+        axum::routing::post(routes::users::register_public_key),
+    );
+
     // Org routes (authenticated)
     let org_routes = Router::new()
         .route("/orgs", axum::routing::post(routes::orgs::create_org))
@@ -67,6 +73,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/orgs/{name}/members/{id}",
             axum::routing::delete(routes::orgs::remove_member),
+        )
+        .route(
+            "/orgs/{name}/keyring",
+            axum::routing::get(routes::orgs::get_keyring).put(routes::orgs::put_keyring),
         );
 
     // App routes (authenticated)
@@ -191,8 +201,20 @@ pub fn build_router(state: AppState) -> Router {
     // Health check (unauthenticated)
     let health = Router::new().route("/health", axum::routing::get(|| async { "ok" }));
 
+    // Workload routes (attestation-authenticated through Trustee callback).
+    let workload_routes = Router::new()
+        .route(
+            "/api/v1/workload/artifacts",
+            axum::routing::get(routes::workload::artifacts),
+        )
+        .route(
+            "/workload/artifacts",
+            axum::routing::get(routes::workload::artifacts),
+        );
+
     let api_routes = Router::new()
         .merge(auth_routes)
+        .merge(user_routes)
         .merge(org_routes)
         .merge(app_routes)
         .merge(deploy_routes)
@@ -200,6 +222,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(domain_routes)
         .merge(status_routes)
         .merge(unlock_routes)
+        .merge(workload_routes)
         .merge(billing_routes)
         .layer(GovernorLayer::new(api_governor_conf));
 

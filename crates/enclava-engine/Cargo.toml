@@ -22,6 +22,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 [features]
+prod-strict = []
 testutil = []
 
 [dev-dependencies]

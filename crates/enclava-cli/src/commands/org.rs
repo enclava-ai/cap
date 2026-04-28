@@ -1,7 +1,11 @@
 use clap::Subcommand;
+use ed25519_dalek::VerifyingKey;
 
 use enclava_cli::api_client::ApiClient;
-use enclava_cli::api_types::{CreateOrgRequest, InviteRequest};
+use enclava_cli::api_types::{
+    CreateOrgRequest, InviteRequest, OrgKeyringResponse, PutOrgKeyringRequest,
+    RegisterPublicKeyRequest,
+};
 use enclava_cli::config::{self, CliPaths};
 
 #[derive(Subcommand)]
@@ -33,25 +37,42 @@ pub enum OrgCommand {
 
 #[derive(Subcommand)]
 pub enum KeyringCommand {
-    /// Owner-only: create v1 keyring, sign with current key, upload (stub)
+    /// Owner-only: create v1 keyring, sign, cache, and upload it
     Init {
-        /// Org UUID
-        org_id: String,
+        /// Org name. Defaults to active org.
+        #[arg(long)]
+        org: Option<String>,
+        /// Skip bootstrapping the off-cluster policy signing service owner map.
+        #[arg(long)]
+        skip_signing_service_bootstrap: bool,
     },
-    /// Owner-only: increment version, add member, sign, upload (stub)
+    /// Owner-only: fetch current keyring, add member, sign, cache, and upload it
     AddMember {
-        org_id: String,
+        /// Org name. Defaults to active org.
+        #[arg(long)]
+        org: Option<String>,
+        /// User UUID for the new member.
+        #[arg(long)]
         user_id: String,
         /// Hex-encoded Ed25519 public key (32 bytes / 64 hex chars)
+        #[arg(long)]
         pubkey: String,
         #[arg(long, default_value = "deployer")]
         role: String,
     },
     /// Member's first encounter: TOFU prompt, cache the owner pubkey
     Trust {
+        /// Org UUID.
+        #[arg(long)]
         org_id: String,
         /// Hex-encoded owner pubkey (32 bytes / 64 hex chars)
         owner_pubkey: String,
+    },
+    /// Fetch, verify against trusted owner pubkey, and cache the latest keyring.
+    Fetch {
+        /// Org name. Defaults to active org.
+        #[arg(long)]
+        org: Option<String>,
     },
 }
 
@@ -141,11 +162,13 @@ pub async fn run(cmd: OrgCommand) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Error>> {
     use chrono::Utc;
-    use ed25519_dalek::VerifyingKey;
     use enclava_cli::keyring::{
-        Member, OrgKeyring, Role, fingerprint, sign_keyring, store_trusted_owner,
+        Member, OrgKeyring, OrgKeyringEnvelope, Role, fingerprint, keyring_fingerprint_hex,
+        load_trusted_owner, sign_keyring, store_keyring_envelope, store_trusted_owner,
+        verify_keyring,
     };
     use enclava_cli::keys;
+    use enclava_cli::platform_release::PlatformRelease;
     use uuid::Uuid;
 
     fn parse_pubkey(hex_in: &str) -> Result<VerifyingKey, Box<dyn std::error::Error>> {
@@ -165,13 +188,157 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
+    fn active_org(
+        override_org: Option<String>,
+        config: &config::CliConfig,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        override_org
+            .or_else(|| config.org.clone())
+            .ok_or_else(|| "no active org -- run `enclava org switch <name>`".into())
+    }
+
+    async fn resolve_org_id(
+        api: &ApiClient,
+        org_name: &str,
+    ) -> Result<Uuid, Box<dyn std::error::Error>> {
+        let org = api
+            .list_orgs()
+            .await?
+            .into_iter()
+            .find(|org| org.name == org_name)
+            .ok_or_else(|| format!("org '{org_name}' not found"))?;
+        let id = org
+            .id
+            .ok_or_else(|| format!("API did not return an id for org '{org_name}'"))?;
+        Ok(Uuid::parse_str(&id)?)
+    }
+
+    fn current_user_id(paths: &CliPaths) -> Result<Uuid, Box<dyn std::error::Error>> {
+        let creds = config::load_credentials(paths)?;
+        let token = creds
+            .session_token
+            .as_deref()
+            .ok_or("session login is required for keyring commands")?;
+        #[derive(serde::Deserialize)]
+        struct Claims {
+            sub: String,
+        }
+        let payload = token
+            .split('.')
+            .nth(1)
+            .ok_or("invalid session token: missing payload")?;
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.as_bytes())?;
+        let claims: Claims = serde_json::from_slice(&bytes)?;
+        Ok(Uuid::parse_str(&claims.sub)?)
+    }
+
+    async fn register_key(
+        api: &ApiClient,
+        public: &VerifyingKey,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let req = RegisterPublicKeyRequest {
+            public_key: hex::encode(public.to_bytes()),
+            label: Some("enclava-cli".to_string()),
+        };
+        let _ = api.register_public_key(&req).await?;
+        Ok(())
+    }
+
+    async fn upload_keyring(
+        api: &ApiClient,
+        org_name: &str,
+        envelope: &OrgKeyringEnvelope,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let req = PutOrgKeyringRequest {
+            version: envelope.keyring.version,
+            keyring_payload: serde_json::to_value(&envelope.keyring)?,
+            signature: hex::encode(envelope.signature.to_bytes()),
+            signing_pubkey: hex::encode(envelope.signing_pubkey.to_bytes()),
+        };
+        let resp = api.put_org_keyring(org_name, &req).await?;
+        println!(
+            "Uploaded keyring v{} for {} (fingerprint {})",
+            resp.version, org_name, resp.fingerprint
+        );
+        Ok(())
+    }
+
+    async fn bootstrap_signing_service_owner(
+        org: Uuid,
+        owner_pubkey: &VerifyingKey,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(serde::Deserialize)]
+        struct BootstrapResponse {
+            state: String,
+            owner_pubkey_fingerprint: String,
+        }
+
+        let release = PlatformRelease::load_verified()?;
+        let url = format!(
+            "{}/bootstrap-org",
+            release.signing_service_url.trim_end_matches('/')
+        );
+        let response = reqwest::Client::new()
+            .post(&url)
+            .json(&serde_json::json!({
+                "org_id": org,
+                "owner_pubkey_hex": hex::encode(owner_pubkey.to_bytes()),
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(format!("signing-service bootstrap failed ({status}): {body}").into());
+        }
+        let parsed: BootstrapResponse = serde_json::from_str(&body)?;
+        let expected = hex::encode(owner_pubkey.to_bytes());
+        if parsed.owner_pubkey_fingerprint != expected {
+            return Err("signing-service returned an unexpected owner fingerprint".into());
+        }
+        println!(
+            "Policy signing service owner state: {} ({})",
+            parsed.state, parsed.owner_pubkey_fingerprint
+        );
+        Ok(())
+    }
+
+    fn envelope_from_response(
+        response: OrgKeyringResponse,
+    ) -> Result<OrgKeyringEnvelope, Box<dyn std::error::Error>> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            keyring: OrgKeyring,
+            signature: String,
+            signing_pubkey: String,
+        }
+        let wire = Wire {
+            keyring: serde_json::from_value(response.keyring_payload)?,
+            signature: response.signature,
+            signing_pubkey: response.signing_pubkey,
+        };
+        let sig_bytes: [u8; 64] = hex::decode(wire.signature)?
+            .try_into()
+            .map_err(|_| "API returned org keyring signature with invalid length")?;
+        Ok(OrgKeyringEnvelope {
+            keyring: wire.keyring,
+            signature: ed25519_dalek::Signature::from_bytes(&sig_bytes),
+            signing_pubkey: parse_pubkey(&wire.signing_pubkey)?,
+        })
+    }
+
     match cmd {
-        KeyringCommand::Init { org_id } => {
-            let org = Uuid::parse_str(&org_id)?;
-            // TODO(phase-7-api): load the active user_id from creds; assumes a single
-            // local user keypair until the user-keys API endpoint exists.
-            let user_id = Uuid::new_v4();
+        KeyringCommand::Init {
+            org,
+            skip_signing_service_bootstrap,
+        } => {
+            let (api, paths, cli_config) = build_api_client_with_paths()?;
+            let org_name = active_org(org, &cli_config)?;
+            let org = resolve_org_id(&api, &org_name).await?;
+            let user_id = current_user_id(&paths)?;
             let key = keys::create_and_store(user_id)?;
+            register_key(&api, &key.public).await?;
 
             let keyring = OrgKeyring {
                 org_id: org,
@@ -186,28 +353,63 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
             };
             let env = sign_keyring(&key, keyring);
             store_trusted_owner(&org, &key.public)?;
+            store_keyring_envelope(&org, &env)?;
+            upload_keyring(&api, &org_name, &env).await?;
+            if !skip_signing_service_bootstrap {
+                bootstrap_signing_service_owner(org, &key.public).await?;
+            }
 
-            println!("Initialized keyring for {org}");
+            println!("Initialized keyring for {org_name} ({org})");
             println!("Owner pubkey fingerprint: {}", fingerprint(&key.public));
-            println!("Signed envelope (TODO(phase-7-api): upload to platform):");
-            println!("{}", serde_json::to_string_pretty(&env)?);
+            println!(
+                "Keyring fingerprint: {}",
+                keyring_fingerprint_hex(&env.keyring)
+            );
         }
         KeyringCommand::AddMember {
-            org_id,
+            org,
             user_id,
             pubkey,
             role,
         } => {
-            let org = Uuid::parse_str(&org_id)?;
+            let (api, paths, cli_config) = build_api_client_with_paths()?;
+            let org_name = active_org(org, &cli_config)?;
+            let org = resolve_org_id(&api, &org_name).await?;
             let user = Uuid::parse_str(&user_id)?;
             let pk = parse_pubkey(&pubkey)?;
             let role = parse_role(&role)?;
-            println!(
-                "TODO(phase-7-api): fetch current keyring v_n for {org}, append member \
-                 ({user}, {role:?}, {}), bump to v_{{n+1}}, sign with stored owner key, \
-                 upload",
-                fingerprint(&pk)
-            );
+            let owner_user_id = current_user_id(&paths)?;
+            let owner_key = keys::load(owner_user_id)?;
+            let response = api.get_org_keyring(&org_name).await?;
+            let existing = envelope_from_response(response)?;
+            let trusted_owner = load_trusted_owner(&org)?
+                .ok_or("trusted owner pubkey missing; run `enclava org keyring trust`")?;
+            let current = verify_keyring(&existing, &trusted_owner)?;
+            if existing.signing_pubkey.to_bytes() != owner_key.public.to_bytes() {
+                return Err("current CLI key is not the trusted org owner key".into());
+            }
+            let mut members = current.members.clone();
+            if let Some(member) = members.iter_mut().find(|member| member.user_id == user) {
+                member.pubkey = pk;
+                member.role = role;
+            } else {
+                members.push(Member {
+                    user_id: user,
+                    pubkey: pk,
+                    role,
+                    added_at: Utc::now(),
+                });
+            }
+            let next = OrgKeyring {
+                org_id: org,
+                version: current.version + 1,
+                members,
+                updated_at: Utc::now(),
+            };
+            let env = sign_keyring(&owner_key, next);
+            store_keyring_envelope(&org, &env)?;
+            upload_keyring(&api, &org_name, &env).await?;
+            println!("Added/updated member {user} ({})", fingerprint(&pk));
         }
         KeyringCommand::Trust {
             org_id,
@@ -230,6 +432,25 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
             }
             store_trusted_owner(&org, &pk)?;
             println!("Owner pubkey cached at ~/.enclava/state/{org}/owner_pubkey");
+        }
+        KeyringCommand::Fetch { org } => {
+            let (api, _paths, cli_config) = build_api_client_with_paths()?;
+            let org_name = active_org(org, &cli_config)?;
+            let org = resolve_org_id(&api, &org_name).await?;
+            let response = api.get_org_keyring(&org_name).await?;
+            let envelope = envelope_from_response(response)?;
+            let trusted_owner = load_trusted_owner(&org)?
+                .ok_or("trusted owner pubkey missing; run `enclava org keyring trust`")?;
+            verify_keyring(&envelope, &trusted_owner)?;
+            store_keyring_envelope(&org, &envelope)?;
+            println!(
+                "Cached keyring v{} for {} ({})",
+                envelope.keyring.version, org_name, org
+            );
+            println!(
+                "Keyring fingerprint: {}",
+                keyring_fingerprint_hex(&envelope.keyring)
+            );
         }
     }
     Ok(())

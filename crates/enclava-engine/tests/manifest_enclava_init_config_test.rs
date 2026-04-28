@@ -1,5 +1,6 @@
 //! enclava-init ConfigMap (Phase 5).
 
+use enclava_engine::manifest::cc_init_data;
 use enclava_engine::manifest::enclava_init_config::generate_enclava_init_configmap;
 use enclava_engine::testutil::sample_app;
 
@@ -41,9 +42,9 @@ fn config_toml_has_required_unlock_inputs() {
     let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
     assert!(toml_text.contains("argon2-salt-hex = \""));
     assert!(toml_text.contains("kbs-url = \"http://127.0.0.1:8081/cdh/resource\""));
-    assert!(
-        toml_text.contains("kbs-resource-path = \"default/cap-test-org-test-app-test-app-owner\"")
-    );
+    assert!(toml_text.contains(
+        "kbs-resource-path = \"default/cap-test-org-test-app-test-app-owner/seed-encrypted\""
+    ));
     assert!(!toml_text.contains("workload-secret-seed"));
 }
 
@@ -58,6 +59,52 @@ fn config_toml_parses() {
 fn config_toml_defaults_trustee_policy_read_to_false() {
     // Phase 3 patches haven't shipped; verification stays SKIPPED until then.
     let cm = generate_enclava_init_configmap(&sample_app());
-    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+    let data = cm.data.as_ref().unwrap();
+    let toml_text = data.get("config.toml").unwrap();
     assert!(toml_text.contains("trustee-policy-read-available = false"));
+    assert!(!data.contains_key("cc-init-data.toml"));
+}
+
+#[test]
+fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
+    let mut app = sample_app();
+    app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_url =
+        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
+    app.attestation.trustee_policy_url =
+        Some("http://kbs.trustee.svc/resource-policy/default/body".to_string());
+    app.attestation.platform_trustee_policy_pubkey_hex = Some("11".repeat(32));
+    app.attestation.signing_service_pubkey_hex = Some("11".repeat(32));
+
+    let cm = generate_enclava_init_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let toml_text = data.get("config.toml").unwrap();
+    let cc_toml = data.get("cc-init-data.toml").unwrap();
+
+    assert!(toml_text.contains("trustee-policy-read-available = true"));
+    assert!(toml_text.contains("cc-init-data-path = \"/etc/enclava-init/cc-init-data.toml\""));
+    assert!(toml_text.contains(
+        "workload-artifacts-url = \"http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts\""
+    ));
+    assert!(
+        toml_text.contains(
+            "trustee-policy-url = \"http://kbs.trustee.svc/resource-policy/default/body\""
+        )
+    );
+    assert!(
+        toml_text.contains(
+            "kbs-attestation-token-url = \"http://127.0.0.1:8006/aa/token?token_type=kbs\""
+        )
+    );
+    assert!(toml_text.contains(&format!(
+        "platform-trustee-policy-pubkey-hex = \"{}\"",
+        "11".repeat(32)
+    )));
+    assert!(toml_text.contains(&format!(
+        "signing-service-pubkey-hex = \"{}\"",
+        "11".repeat(32)
+    )));
+    assert_eq!(cc_toml, &cc_init_data::build_toml(&app));
+
+    let _: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
 }

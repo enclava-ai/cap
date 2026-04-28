@@ -1,11 +1,11 @@
 //! Container shape tests. Phase 5 default (no `LEGACY_BOOTSTRAP_SCRIPT`):
-//! enclava-init opens LUKS in an initContainer; app and caddy are unprivileged
-//! and read seeds from `/state/{app,caddy}/seed`. The app/caddy containers
-//! consume decrypted mountpoint volumes, not raw block PVCs.
+//! app and caddy start under an argv-preserving static wait/exec helper, then
+//! enclava-init opens LUKS as a long-running mounter sidecar. App/caddy are
+//! unprivileged and consume decrypted mountpoint volumes, not raw block PVCs.
 
 use enclava_engine::manifest::containers::{
-    build_app_container, build_attestation_proxy_container, build_caddy_container,
-    build_enclava_init_container,
+    ENCLAVA_WAIT_EXEC_PATH, build_app_container, build_attestation_proxy_container,
+    build_caddy_container, build_enclava_init_container, build_enclava_tools_container,
 };
 use enclava_engine::testutil::sample_app;
 
@@ -36,6 +36,28 @@ fn app_container_does_not_use_sh_c() {
         assert!(!cmd.iter().any(|s| s == "-c"));
         assert!(!cmd.iter().any(|s| s.contains("bootstrap.sh")));
     }
+}
+
+#[test]
+fn app_container_starts_under_wait_wrapper() {
+    let c = build_app_container(&sample_app());
+    assert_eq!(
+        c.command.as_ref().unwrap(),
+        &vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]
+    );
+    let env = c.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_CONTAINER_NAME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("web")
+    );
+    let vm = c.volume_mounts.as_ref().unwrap();
+    assert!(vm.iter().any(|m| m.name == "startup"));
+    assert!(vm.iter().any(|m| m.name == "enclava-tools"));
+    assert!(vm.iter().any(|m| m.name == "unlock-socket"));
 }
 
 #[test]
@@ -87,6 +109,34 @@ fn proxy_container_name_and_port() {
     assert_eq!(c.name, "attestation-proxy");
     let ports = c.ports.as_ref().unwrap();
     assert!(ports.iter().any(|p| p.container_port == 8081));
+    assert!(ports.iter().any(|p| p.container_port == 8443));
+    assert!(
+        ports
+            .iter()
+            .any(|p| { p.container_port == 8081 && p.name.as_deref() == Some("attestation-http") })
+    );
+    assert!(
+        ports
+            .iter()
+            .any(|p| { p.container_port == 8443 && p.name.as_deref() == Some("attestation") })
+    );
+    let env = c.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ATTESTATION_TLS_PORT")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("8443")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "TEE_DOMAIN")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("test-app.abcd1234.tee.enclava.dev")
+    );
 }
 
 #[test]
@@ -133,16 +183,26 @@ fn caddy_container_is_unprivileged_with_only_net_bind() {
 fn caddy_container_command_is_argv_not_shell() {
     let c = build_caddy_container(&sample_app());
     let cmd = c.command.as_ref().unwrap();
-    assert_eq!(cmd, &vec!["caddy".to_string()]);
+    assert_eq!(cmd, &vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]);
     let args = c.args.as_ref().unwrap();
     assert_eq!(
         args,
         &vec![
+            "caddy".to_string(),
             "run".to_string(),
             "--config".to_string(),
             "/etc/caddy/Caddyfile".to_string(),
         ]
     );
+}
+
+#[test]
+fn caddy_container_mounts_static_wait_exec_helper() {
+    let c = build_caddy_container(&sample_app());
+    let vm = c.volume_mounts.as_ref().unwrap();
+    let m = vm.iter().find(|m| m.name == "enclava-tools").unwrap();
+    assert_eq!(m.mount_path, "/enclava-tools");
+    assert_eq!(m.read_only, Some(true));
 }
 
 #[test]
@@ -183,18 +243,80 @@ fn caddy_container_reads_seed_from_state_caddy() {
     assert_eq!(found.value.as_deref(), Some("/state/caddy/seed"));
 }
 
-// === enclava-init initContainer ===
+// === enclava-init mounter sidecar ===
 
 #[test]
-fn enclava_init_container_drops_caps_and_keeps_only_sys_admin() {
+fn enclava_tools_container_installs_static_wait_exec_helper() {
+    let c = build_enclava_tools_container(&sample_app());
+    assert_eq!(c.name, "enclava-tools");
+    assert_eq!(
+        c.command.as_ref().unwrap(),
+        &vec!["/bin/sh".to_string(), "-ec".to_string()]
+    );
+    assert!(
+        c.args
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|arg| arg.contains("/usr/local/bin/enclava-wait-exec"))
+    );
+    let sc = c.security_context.as_ref().unwrap();
+    assert_eq!(sc.privileged, Some(false));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+}
+
+#[test]
+fn enclava_init_container_is_mounter_sidecar_and_keeps_only_sys_admin() {
     let c = build_enclava_init_container(&sample_app());
     assert_eq!(c.name, "enclava-init");
+    assert!(c.restart_policy.is_none());
     let sc = c.security_context.as_ref().unwrap();
     assert_eq!(sc.privileged, Some(true));
     assert_eq!(sc.allow_privilege_escalation, Some(true));
     let caps = sc.capabilities.as_ref().unwrap();
     assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
     assert_eq!(caps.add.as_deref(), Some(&["SYS_ADMIN".to_string()][..]));
+}
+
+#[test]
+fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
+    let c = build_enclava_init_container(&sample_app());
+    let env = c.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_INIT_STAY_ALIVE")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_INIT_READY_FILE")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/run/enclava/init-ready")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_INIT_WAIT_FOR_CONTAINERS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("web,tenant-ingress")
+    );
+    assert!(c.startup_probe.is_none());
+    let probe = c.readiness_probe.as_ref().unwrap();
+    let command = probe.exec.as_ref().unwrap().command.as_ref().unwrap();
+    assert_eq!(
+        command,
+        &vec![
+            "/usr/local/bin/enclava-init".to_string(),
+            "--probe-ready".to_string()
+        ]
+    );
 }
 
 #[test]

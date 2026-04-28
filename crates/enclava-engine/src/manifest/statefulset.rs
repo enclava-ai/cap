@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::manifest::cc_init_data;
 use crate::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
-    build_enclava_init_container, legacy_bootstrap_enabled,
+    build_enclava_init_container, build_enclava_tools_container, legacy_bootstrap_enabled,
 };
 use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
@@ -48,17 +48,6 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
 
     let legacy = legacy_bootstrap_enabled();
 
-    // B2 investigation: enclava-init's cryptsetup luksOpen needs `dm_mod` and
-    // `dm_crypt` loadable inside the SEV-SNP guest kernel. Defense in depth —
-    // the guest kernel image should already have them, but the annotation
-    // makes a misbuilt image fail loudly instead of silently.
-    if !legacy {
-        annotations.insert(
-            "io.katacontainers.config.agent.kernel_modules".to_string(),
-            "dm_mod; dm_crypt".to_string(),
-        );
-    }
-
     let mut node_selector = BTreeMap::new();
     node_selector.insert(
         "katacontainers.io/kata-runtime".to_string(),
@@ -77,12 +66,14 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     sts_labels.insert("app".to_string(), app.name.clone());
 
     // Phase 5 split: attestation-proxy runs as a native Kubernetes sidecar
-    // (initContainer with restartPolicy=Always; requires K8s ≥1.28 where
-    // sidecar containers are stable). enclava-init follows it as a one-shot
-    // initContainer that opens LUKS, runs the in-TEE Trustee policy
-    // verification chain, writes per-component seeds, and exits 0. The dm
-    // mapping persists across init exit because the Kata SEV-SNP sandbox VM
-    // outlives the init container's userspace (B2 investigation).
+    // (initContainer with restartPolicy=Always; requires K8s >=1.28 where
+    // sidecar containers are stable). A one-shot tools initContainer installs
+    // the static wait/exec helper. App and caddy start under that helper and
+    // signal enclava-init. enclava-init then opens LUKS, runs the in-TEE
+    // Trustee policy verification chain, writes per-component seeds, marks
+    // ready, and stays alive as the mount propagation source. Live Kata
+    // SEV-SNP validation showed creating later containers after the LUKS mount
+    // exists fails with EINVAL.
     let (init_containers, containers) = if legacy {
         (
             None,
@@ -96,8 +87,12 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
         let mut proxy = build_attestation_proxy_container(app);
         proxy.restart_policy = Some("Always".to_string());
         (
-            Some(vec![proxy, build_enclava_init_container(app)]),
-            vec![build_app_container(app), build_caddy_container(app)],
+            Some(vec![proxy, build_enclava_tools_container(app)]),
+            vec![
+                build_app_container(app),
+                build_caddy_container(app),
+                build_enclava_init_container(app),
+            ],
         )
     };
 

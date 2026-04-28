@@ -37,6 +37,7 @@ pub struct ConfigTokenClaims {
     pub sub: String, // user_id
     pub org_id: String,
     pub app_id: String,
+    pub instance_id: String,
     pub scopes: Vec<String>,
     pub exp: i64,
     pub iat: i64,
@@ -131,6 +132,7 @@ pub fn issue_config_token(
     user_id: Uuid,
     org_id: Uuid,
     app_id: Uuid,
+    instance_id: &str,
     scopes: Vec<String>,
 ) -> Result<String, JwtError> {
     let now = Utc::now();
@@ -138,6 +140,7 @@ pub fn issue_config_token(
         sub: user_id.to_string(),
         org_id: org_id.to_string(),
         app_id: app_id.to_string(),
+        instance_id: instance_id.to_string(),
         scopes,
         exp: (now + Duration::minutes(5)).timestamp(),
         iat: now.timestamp(),
@@ -199,6 +202,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
+            "test-instance",
             vec!["config:write".to_string()],
         )
         .expect("failed to issue config token");
@@ -226,6 +230,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
+            "test-instance",
             vec!["config:write".into()],
         )
         .unwrap();
@@ -233,6 +238,7 @@ mod tests {
         assert_eq!(claims.iss, TOKEN_ISSUER);
         assert_eq!(claims.aud, CONFIG_AUDIENCE);
         assert_eq!(claims.typ, CONFIG_TYP);
+        assert_eq!(claims.instance_id, "test-instance");
         assert!(!claims.jti.is_empty());
     }
 
@@ -246,6 +252,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
+            "test-instance",
             vec!["config:write".into()],
         )
         .unwrap();

@@ -14,6 +14,13 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn tee_accepts_invalid_certs() -> bool {
     std::env::var("TENANT_TEE_TLS_MODE")
         .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
@@ -116,15 +123,67 @@ fn load_required_image_ref(env_name: &str) -> anyhow::Result<ImageRef> {
     Ok(image)
 }
 
+fn load_url_env(env_name: &str, required: bool) -> anyhow::Result<Option<String>> {
+    let Some(value) = env_nonempty(env_name) else {
+        if required {
+            anyhow::bail!("missing {env_name}");
+        }
+        return Ok(None);
+    };
+    let url = reqwest::Url::parse(&value)
+        .map_err(|e| anyhow::anyhow!("invalid {env_name} URL: {}", e))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("invalid {env_name}: URL scheme must be http or https");
+    }
+    Ok(Some(value))
+}
+
+fn load_pubkey_hex_env(env_name: &str, required: bool) -> anyhow::Result<Option<String>> {
+    let Some(value) = env_nonempty(env_name) else {
+        if required {
+            anyhow::bail!("missing {env_name}");
+        }
+        return Ok(None);
+    };
+    let raw = hex::decode(&value).map_err(|e| anyhow::anyhow!("invalid {env_name}: {}", e))?;
+    if raw.len() != 32 {
+        anyhow::bail!("invalid {env_name}: expected 32-byte Ed25519 public key hex");
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
 fn load_attestation_config() -> anyhow::Result<Option<AttestationConfig>> {
+    let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
     let has_any = ["ATTESTATION_PROXY_IMAGE", "CADDY_INGRESS_IMAGE"]
         .iter()
         .any(|name| std::env::var(name).is_ok());
     if !has_any {
+        if trustee_policy_read_available {
+            anyhow::bail!(
+                "TRUSTEE_POLICY_READ_AVAILABLE=true requires ATTESTATION_PROXY_IMAGE and CADDY_INGRESS_IMAGE"
+            );
+        }
         tracing::warn!(
             "ATTESTATION_PROXY_IMAGE and CADDY_INGRESS_IMAGE are unset; deploy requests will fail until configured"
         );
         return Ok(None);
+    }
+
+    let workload_artifacts_url =
+        load_url_env("WORKLOAD_ARTIFACTS_URL", trustee_policy_read_available)?;
+    let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
+    let platform_trustee_policy_pubkey_hex = load_pubkey_hex_env(
+        "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+        trustee_policy_read_available,
+    )?;
+    let signing_service_pubkey_hex =
+        load_pubkey_hex_env("SIGNING_SERVICE_PUBKEY_HEX", trustee_policy_read_available)?;
+    if trustee_policy_read_available
+        && platform_trustee_policy_pubkey_hex != signing_service_pubkey_hex
+    {
+        anyhow::bail!(
+            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX and SIGNING_SERVICE_PUBKEY_HEX must match for v1 signed policy artifacts"
+        );
     }
 
     Ok(AttestationConfig {
@@ -134,11 +193,11 @@ fn load_attestation_config() -> anyhow::Result<Option<AttestationConfig>> {
             .ok()
             .filter(|url| !url.trim().is_empty())
             .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
-        cloudflare_token_secret: std::env::var("CLOUDFLARE_TOKEN_SECRET")
-            .unwrap_or_else(|_| "cloudflare-api-token-enclava-dev".to_string()),
-        cloudflare_api_token: std::env::var("CLOUDFLARE_API_TOKEN")
-            .ok()
-            .filter(|token| !token.trim().is_empty()),
+        trustee_policy_read_available,
+        workload_artifacts_url,
+        trustee_policy_url,
+        platform_trustee_policy_pubkey_hex,
+        signing_service_pubkey_hex,
     }
     .into())
 }
@@ -251,6 +310,22 @@ async fn main() {
     let attestation = load_attestation_config().expect("failed to load attestation config");
     let dns = load_dns_config().expect("failed to load DNS config");
     let kbs_policy = enclava_api::kbs::config_from_env();
+    let trustee_required = attestation
+        .as_ref()
+        .map(|cfg| cfg.trustee_policy_read_available)
+        .unwrap_or(false);
+    let trustee_attestation_verify_url =
+        load_url_env("TRUSTEE_ATTESTATION_VERIFY_URL", trustee_required)
+            .expect("failed to load Trustee attestation verify URL");
+    let signing_service_url = load_url_env("PLATFORM_SIGNING_SERVICE_URL", trustee_required)
+        .expect("failed to load platform signing service URL");
+    let signing_service = signing_service_url.map(|url| {
+        enclava_api::signing_service::SigningServiceClient::new(
+            url,
+            env_nonempty("PLATFORM_SIGNING_SERVICE_TOKEN"),
+        )
+        .expect("failed to configure platform signing service client")
+    });
     let max_concurrent_applies = std::env::var("CAP_MAX_CONCURRENT_APPLIES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -285,6 +360,8 @@ async fn main() {
         attestation,
         dns,
         kbs_policy,
+        trustee_attestation_verify_url,
+        signing_service,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
     };
 

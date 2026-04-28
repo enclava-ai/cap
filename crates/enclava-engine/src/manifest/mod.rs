@@ -14,7 +14,6 @@ pub mod kbs_policy;
 pub mod namespace;
 pub mod network_policy;
 pub mod resource_quota;
-pub mod secrets;
 pub mod service;
 pub mod service_account;
 pub mod startup;
@@ -22,9 +21,7 @@ pub mod statefulset;
 pub mod volumes;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{
-    ConfigMap, Namespace, ResourceQuota, Secret, Service, ServiceAccount,
-};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, ResourceQuota, Service, ServiceAccount};
 use serde_json::Value;
 
 use crate::types::ConfidentialApp;
@@ -47,7 +44,6 @@ pub struct GeneratedManifests {
     pub startup_configmap: ConfigMap,
     pub ingress_configmap: ConfigMap,
     pub enclava_init_configmap: ConfigMap,
-    pub cloudflare_token_secret: Option<Secret>,
     pub statefulset: StatefulSet,
     /// KBS owner_resource_bindings entry: (key, value) for the policy Rego.
     pub kbs_owner_binding: (String, Value),
@@ -72,9 +68,6 @@ pub fn generate_all_manifests(app: &ConfidentialApp) -> GeneratedManifests {
         startup_configmap: startup::generate_startup_configmap(app),
         ingress_configmap: ingress::generate_ingress_configmap(app),
         enclava_init_configmap: enclava_init_config::generate_enclava_init_configmap(app),
-        // Phase 0/11 cutover: tenant Caddy now uses TLS-ALPN-01 only, so no
-        // Cloudflare DNS-01 token should be created in tenant namespaces.
-        cloudflare_token_secret: None,
         statefulset: statefulset::generate_statefulset(app),
         kbs_owner_binding: kbs_policy::generate_owner_binding_entry(app),
     }

@@ -7,6 +7,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
+use crate::manifest::cc_init_data;
 use crate::types::ConfidentialApp;
 use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
@@ -31,6 +32,12 @@ pub fn generate_enclava_init_configmap(app: &ConfidentialApp) -> ConfigMap {
 
     let mut data = BTreeMap::new();
     data.insert("config.toml".to_string(), render_config_toml(app));
+    if app.attestation.trustee_policy_read_available {
+        data.insert(
+            "cc-init-data.toml".to_string(),
+            cc_init_data::build_toml(app),
+        );
+    }
 
     ConfigMap {
         metadata: ObjectMeta {
@@ -83,9 +90,39 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         ));
     }
 
-    out.push_str("\n# Phase 3 Trustee patches not yet deployed; in-TEE verification\n");
-    out.push_str("# stays SKIPPED with a loud error log until this flips true.\n");
-    out.push_str("trustee-policy-read-available = false\n");
+    if app.attestation.trustee_policy_read_available {
+        out.push_str("\ntrustee-policy-read-available = true\n");
+        out.push_str("cc-init-data-path = \"/etc/enclava-init/cc-init-data.toml\"\n");
+        push_required_option(
+            &mut out,
+            "workload-artifacts-url",
+            app.attestation.workload_artifacts_url.as_deref(),
+        );
+        push_required_option(
+            &mut out,
+            "trustee-policy-url",
+            app.attestation.trustee_policy_url.as_deref(),
+        );
+        out.push_str(
+            "kbs-attestation-token-url = \"http://127.0.0.1:8006/aa/token?token_type=kbs\"\n",
+        );
+        push_required_option(
+            &mut out,
+            "platform-trustee-policy-pubkey-hex",
+            app.attestation
+                .platform_trustee_policy_pubkey_hex
+                .as_deref(),
+        );
+        push_required_option(
+            &mut out,
+            "signing-service-pubkey-hex",
+            app.attestation.signing_service_pubkey_hex.as_deref(),
+        );
+    } else {
+        out.push_str("\n# Phase 3 Trustee patches not yet deployed; in-TEE verification\n");
+        out.push_str("# stays SKIPPED with a loud error log until this flips true.\n");
+        out.push_str("trustee-policy-read-available = false\n");
+    }
 
     if let Some(primary) = app.primary_container() {
         for path in &primary.storage_paths {
@@ -119,4 +156,9 @@ fn storage_subdir(path: &str) -> String {
 
 fn toml_string(s: &str) -> String {
     serde_json::to_string(s).expect("string serialization is infallible")
+}
+
+fn push_required_option(out: &mut String, key: &str, value: Option<&str>) {
+    let value = value.unwrap_or_else(|| panic!("missing required enclava-init config key {key}"));
+    out.push_str(&format!("{key} = {}\n", toml_string(value)));
 }
