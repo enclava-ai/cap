@@ -204,6 +204,54 @@ pub async fn invite_member(
         ));
     }
 
+    let existing_role: Option<Role> = sqlx::query_scalar(
+        "SELECT role as \"role: _\" FROM memberships WHERE user_id = $1 AND org_id = $2",
+    )
+    .bind(invitee_id)
+    .bind(org_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    if role == "owner" && caller_role != Role::Owner {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "owner role required to grant owner"})),
+        ));
+    }
+
+    if existing_role == Some(Role::Owner) && role != "owner" {
+        if caller_role != Role::Owner {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "owner role required to modify owners"})),
+            ));
+        }
+        let owner_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memberships WHERE org_id = $1 AND role = 'owner'",
+        )
+        .bind(org_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+        if owner_count <= 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "organization must retain at least one owner"})),
+            ));
+        }
+    }
+
     sqlx::query(
         "INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, $3::role_enum)
          ON CONFLICT (user_id, org_id) DO UPDATE SET role = $3::role_enum",
@@ -317,6 +365,47 @@ pub async fn remove_member(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "only owners and admins can remove members"})),
         ));
+    }
+
+    let target_role: Option<Role> = sqlx::query_scalar(
+        "SELECT role as \"role: _\" FROM memberships WHERE user_id = $1 AND org_id = $2",
+    )
+    .bind(member_id)
+    .bind(org_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    if target_role == Some(Role::Owner) {
+        if caller_role != Role::Owner {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "owner role required to remove owners"})),
+            ));
+        }
+        let owner_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memberships WHERE org_id = $1 AND role = 'owner'",
+        )
+        .bind(org_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+        if owner_count <= 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "organization must retain at least one owner"})),
+            ));
+        }
     }
 
     sqlx::query("DELETE FROM memberships WHERE user_id = $1 AND org_id = $2")

@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 
 use crate::types::ConfidentialApp;
 
+use super::cc_init_data::compute_cc_init_data;
+
 /// Generate the owner_resource_bindings map entry for a single app.
 /// Returns (key, value) where key is "{namespace}-{name}-owner".
 pub fn generate_owner_binding_entry(app: &ConfidentialApp) -> (String, Value) {
@@ -26,12 +28,18 @@ pub fn generate_owner_binding_entry(app: &ConfidentialApp) -> (String, Value) {
 /// Returns (key, value) where key is "{namespace}-{name}-tls".
 pub fn generate_tls_binding_entry(app: &ConfidentialApp) -> (String, Value) {
     let key = app.tls_resource_type();
+    let primary = app
+        .primary_container()
+        .expect("app must have a primary container");
+    let (_encoded, init_data_hash) = compute_cc_init_data(app);
     let value = json!({
         "repository": "default",
         "tag": "workload-secret-seed",
-        "allowed_images": [],
+        "allowed_images": [primary.image.digest_ref()],
         "allowed_image_tag_prefixes": [],
-        "allowed_init_data_hashes": [],
+        "allowed_init_data_hashes": [init_data_hash],
+        "allowed_signer_identity_subjects": app.signer_identity_subject.as_ref().map(|s| vec![s]).unwrap_or_default(),
+        "allowed_signer_identity_issuers": app.signer_identity_issuer.as_ref().map(|s| vec![s]).unwrap_or_default(),
         "allowed_namespaces": [&app.namespace],
         "allowed_service_accounts": [&app.service_account],
         "allowed_identity_hashes": [&app.tenant_instance_identity_hash]
@@ -67,13 +75,19 @@ pub fn generate_kbs_policy_rego(
         .iter()
         .map(|app| {
             let (key, _val) = generate_tls_binding_entry(app);
+            let primary = app
+                .primary_container()
+                .expect("app must have a primary container");
+            let (_encoded, init_data_hash) = compute_cc_init_data(app);
             format!(
                 "  \"{key}\": {{\n\
                  {indent}\"repository\": \"default\",\n\
                  {indent}\"tag\": \"workload-secret-seed\",\n\
-                 {indent}\"allowed_images\": [],\n\
+                 {indent}\"allowed_images\": [\"{image_digest}\"],\n\
                  {indent}\"allowed_image_tag_prefixes\": [],\n\
-                 {indent}\"allowed_init_data_hashes\": [],\n\
+                 {indent}\"allowed_init_data_hashes\": [\"{init_data_hash}\"],\n\
+                 {indent}\"allowed_signer_identity_subjects\": {signer_subjects},\n\
+                 {indent}\"allowed_signer_identity_issuers\": {signer_issuers},\n\
                  {indent}\"allowed_namespaces\": [\"{namespace}\"],\n\
                  {indent}\"allowed_service_accounts\": [\"{sa}\"],\n\
                  {indent}\"allowed_identity_hashes\": [\"{hash}\"]\n\
@@ -81,6 +95,10 @@ pub fn generate_kbs_policy_rego(
                 key = key,
                 indent = "    ",
                 indent2 = "  ",
+                image_digest = primary.image.digest_ref(),
+                init_data_hash = init_data_hash,
+                signer_subjects = optional_string_array(app.signer_identity_subject.as_deref()),
+                signer_issuers = optional_string_array(app.signer_identity_issuer.as_deref()),
                 namespace = app.namespace,
                 sa = app.service_account,
                 hash = app.tenant_instance_identity_hash,
@@ -120,4 +138,11 @@ pub fn generate_kbs_policy_rego(
     rego.push_str("\n}\n");
 
     rego
+}
+
+fn optional_string_array(value: Option<&str>) -> String {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| serde_json::to_string(&[v]).expect("string array serialization is infallible"))
+        .unwrap_or_else(|| "[]".to_string())
 }

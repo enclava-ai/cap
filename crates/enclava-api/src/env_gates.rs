@@ -65,6 +65,13 @@ fn enforce_with(
         {
             return Err(EnvGateError::DebugOnlyFlagInRelease("TENANT_TEE_TLS_MODE"));
         }
+
+        let api_key_pepper_present = lookup("API_KEY_HMAC_PEPPER")
+            .is_some_and(|v| !v.trim().is_empty())
+            || lookup("API_KEY_HMAC_PEPPER_BASE64").is_some_and(|v| !v.trim().is_empty());
+        if !api_key_pepper_present {
+            return Err(EnvGateError::MissingRequired("API_KEY_HMAC_PEPPER"));
+        }
     }
 
     for required in ALWAYS_REQUIRED {
@@ -92,6 +99,7 @@ mod tests {
     fn ok_required() -> HashMap<&'static str, &'static str> {
         let mut m = HashMap::new();
         m.insert("BTCPAY_WEBHOOK_SECRET", "secret");
+        m.insert("API_KEY_HMAC_PEPPER", "01234567890123456789012345678901");
         m
     }
 
@@ -151,6 +159,27 @@ mod tests {
             run(env, true).unwrap_err(),
             EnvGateError::MissingRequired("BTCPAY_WEBHOOK_SECRET")
         ));
+    }
+
+    #[test]
+    fn release_requires_api_key_hmac_pepper() {
+        let mut env = ok_required();
+        env.remove("API_KEY_HMAC_PEPPER");
+        assert!(matches!(
+            run(env, false).unwrap_err(),
+            EnvGateError::MissingRequired("API_KEY_HMAC_PEPPER")
+        ));
+    }
+
+    #[test]
+    fn release_accepts_api_key_hmac_pepper_base64() {
+        let mut env = ok_required();
+        env.remove("API_KEY_HMAC_PEPPER");
+        env.insert(
+            "API_KEY_HMAC_PEPPER_BASE64",
+            "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+        );
+        run(env, false).expect("base64 pepper should satisfy release gate");
     }
 
     #[test]

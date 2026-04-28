@@ -121,13 +121,18 @@ pub async fn upgrade_tier(
     // Record pending payment
     let payment_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO payments (id, org_id, amount_sats, btcpay_invoice_id)
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO payments (
+            id, org_id, amount_sats, btcpay_invoice_id,
+            requested_tier, expected_amount_sats, purpose
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, 'tier_upgrade')",
     )
     .bind(payment_id)
     .bind(auth.org_id)
     .bind(price as i64)
     .bind(&invoice.id)
+    .bind(&body.tier)
+    .bind(price as i64)
     .execute(&state.db)
     .await
     .map_err(|_| {
@@ -272,13 +277,18 @@ pub async fn renew_subscription(
 
     let payment_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO payments (id, org_id, amount_sats, btcpay_invoice_id)
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO payments (
+            id, org_id, amount_sats, btcpay_invoice_id,
+            requested_tier, expected_amount_sats, purpose
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, 'subscription_renewal')",
     )
     .bind(payment_id)
     .bind(auth.org_id)
     .bind(price as i64)
     .bind(&invoice.id)
+    .bind(&tier_str)
+    .bind(price as i64)
     .execute(&state.db)
     .await
     .map_err(|_| {
@@ -363,38 +373,69 @@ pub async fn btcpay_webhook(
     }
 
     if payload.event_type == "InvoiceSettled" || payload.event_type == "InvoicePaymentSettled" {
-        // Mark payment as confirmed
-        sqlx::query(
-            "UPDATE payments SET status = 'confirmed', confirmed_at = now()
-             WHERE btcpay_invoice_id = $1",
+        let btcpay = crate::billing::btcpay::BtcPayClient::new(
+            &state.btcpay_url,
+            &state.btcpay_api_key,
+            "default",
+        );
+        let invoice = btcpay
+            .get_invoice(&payload.invoice_id)
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if !invoice_status_is_settled(&invoice.status) {
+            tracing::warn!(
+                invoice_id = %payload.invoice_id,
+                status = %invoice.status,
+                "settlement webhook did not match server-side invoice status"
+            );
+            return Ok(StatusCode::OK);
+        }
+
+        let payment: Option<(Uuid, i64, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT org_id, amount_sats, requested_tier, expected_amount_sats
+                 FROM payments
+                 WHERE btcpay_invoice_id = $1 AND status = 'pending'",
         )
         .bind(&payload.invoice_id)
-        .execute(&state.db)
+        .fetch_optional(&state.db)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // Get the payment to find the org
-        let payment: Option<(Uuid, i64)> =
-            sqlx::query_as("SELECT org_id, amount_sats FROM payments WHERE btcpay_invoice_id = $1")
-                .bind(&payload.invoice_id)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some((org_id, amount_sats, requested_tier, expected_amount_sats)) = payment {
+            let expected = expected_amount_sats.unwrap_or(amount_sats);
+            if !invoice_amount_matches(&invoice.amount, expected) {
+                tracing::warn!(
+                    invoice_id = %payload.invoice_id,
+                    expected_amount_sats = expected,
+                    invoice_amount = ?invoice.amount,
+                    "settled invoice amount did not match server-side payment intent"
+                );
+                return Ok(StatusCode::OK);
+            }
 
-        if let Some((org_id, _amount)) = payment {
-            // Determine tier from metadata or amount
-            let tier = payload
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("tier"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("pro");
+            let Some(tier) = requested_tier.filter(|tier| tier_price_sats(tier).is_some()) else {
+                tracing::warn!(
+                    invoice_id = %payload.invoice_id,
+                    "payment missing valid server-side requested_tier; refusing tier update"
+                );
+                return Ok(StatusCode::OK);
+            };
+
+            sqlx::query(
+                "UPDATE payments
+                 SET status = 'confirmed', confirmed_at = now()
+                 WHERE btcpay_invoice_id = $1 AND status = 'pending'",
+            )
+            .bind(&payload.invoice_id)
+            .execute(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
             // Update org tier
             sqlx::query(
                 "UPDATE organizations SET tier = $1::tier_enum, updated_at = now() WHERE id = $2",
             )
-            .bind(tier)
+            .bind(&tier)
             .bind(org_id)
             .execute(&state.db)
             .await
@@ -408,7 +449,7 @@ pub async fn btcpay_webhook(
             )
             .bind(sub_id)
             .bind(org_id)
-            .bind(tier)
+            .bind(&tier)
             .execute(&state.db)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -425,4 +466,39 @@ pub async fn btcpay_webhook(
     }
 
     Ok(StatusCode::OK)
+}
+
+fn invoice_status_is_settled(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "settled" | "complete" | "completed"
+    )
+}
+
+fn invoice_amount_matches(invoice_amount: &Option<String>, expected_sats: i64) -> bool {
+    invoice_amount
+        .as_deref()
+        .and_then(|amount| amount.parse::<i64>().ok())
+        .is_some_and(|amount| amount == expected_sats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settled_status_check_is_strict() {
+        assert!(invoice_status_is_settled("Settled"));
+        assert!(invoice_status_is_settled("complete"));
+        assert!(!invoice_status_is_settled("processing"));
+        assert!(!invoice_status_is_settled("invalid"));
+    }
+
+    #[test]
+    fn invoice_amount_must_match_intent() {
+        assert!(invoice_amount_matches(&Some("1000".to_string()), 1000));
+        assert!(!invoice_amount_matches(&Some("999".to_string()), 1000));
+        assert!(!invoice_amount_matches(&Some("1000.0".to_string()), 1000));
+        assert!(!invoice_amount_matches(&None, 1000));
+    }
 }

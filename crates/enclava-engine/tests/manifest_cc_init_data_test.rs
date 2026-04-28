@@ -10,6 +10,37 @@ fn toml_contains_policy_rego() {
 }
 
 #[test]
+fn agent_policy_fails_closed() {
+    let app = sample_app();
+    let toml = build_toml(&app);
+    assert!(toml.contains("default AllowRequestsFailingPolicy := false"));
+    assert!(toml.contains("default CreateContainerRequest := false"));
+    assert!(toml.contains("default ExecProcessRequest := false"));
+    assert!(toml.contains("default CopyFileRequest := false"));
+    assert!(toml.contains("default WriteStreamRequest := false"));
+    assert!(!toml.contains("default AllowRequestsFailingPolicy := true"));
+}
+
+#[test]
+fn agent_policy_create_container_is_bound_to_workload_identity() {
+    let app = sample_app();
+    let toml = build_toml(&app);
+    assert!(toml.contains("CreateContainerRequest {"));
+    assert!(toml.contains(
+        "input.OCI.Annotations[\"io.kubernetes.cri.image-name\"] == \"ghcr.io/test/app@sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\""
+    ));
+    assert!(toml.contains(
+        "input.OCI.Annotations[\"io.kubernetes.pod.namespace\"] == \"cap-test-org-test-app\""
+    ));
+    assert!(toml.contains(
+        "input.OCI.Annotations[\"io.kubernetes.pod.service-account.name\"] == \"cap-test-app-sa\""
+    ));
+    assert!(
+        toml.contains("input.OCI.Annotations[\"tenant.flowforge.sh/instance\"] == \"test-app\"")
+    );
+}
+
+#[test]
 fn toml_contains_image_digest() {
     let app = sample_app();
     let toml = build_toml(&app);

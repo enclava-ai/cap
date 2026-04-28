@@ -80,6 +80,27 @@ fn tls_binding_has_namespace_service_account_and_identity_hash() {
 }
 
 #[test]
+fn tls_binding_anchors_image_init_data_and_signer_identity() {
+    let app = sample_app();
+    let (_key, val) = generate_tls_binding_entry(&app);
+    assert_eq!(
+        val["allowed_images"][0],
+        "ghcr.io/test/app@sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
+    );
+    let hashes = val["allowed_init_data_hashes"].as_array().unwrap();
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(hashes[0].as_str().unwrap().len(), 64);
+    assert_eq!(
+        val["allowed_signer_identity_subjects"][0],
+        "https://github.com/test/app/.github/workflows/build.yml@refs/heads/main"
+    );
+    assert_eq!(
+        val["allowed_signer_identity_issuers"][0],
+        "https://token.actions.githubusercontent.com"
+    );
+}
+
+#[test]
 fn full_policy_contains_package_declaration() {
     let app = sample_app();
     let apps = vec![&app];
@@ -108,6 +129,9 @@ fn full_policy_contains_tls_resource_bindings() {
     assert!(rego.contains("resource_bindings"));
     assert!(rego.contains("cap-test-org-test-app-test-app-tls"));
     assert!(rego.contains("\"tag\": \"workload-secret-seed\""));
+    assert!(rego.contains("\"allowed_images\": [\"ghcr.io/test/app@sha256:abcd"));
+    assert!(rego.contains("\"allowed_init_data_hashes\": [\""));
+    assert!(rego.contains("\"allowed_signer_identity_subjects\": [\"https://github.com/test/app"));
 }
 
 #[test]

@@ -42,16 +42,11 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
 
     // policy.rego
     toml.push_str("\"policy.rego\" = '''\n");
-    toml.push_str("package agent_policy\n");
-    toml.push('\n');
-    toml.push_str("default AllowRequestsFailingPolicy := true\n");
-    toml.push('\n');
-    toml.push_str(&format!(
-        "policy_data := {{\"containers\":[{{\"OCI\":{{\"Annotations\":{{\"io.kubernetes.cri.image-name\":\"{image_digest}\",\"io.kubernetes.pod.namespace\":\"{namespace}\",\"io.kubernetes.pod.service-account.name\":\"{service_account}\",\"tenant.flowforge.sh/instance\":\"{instance}\"}}}},\"image_name\":\"{image_digest}\"}}]}}\n",
-        image_digest = image_digest,
-        namespace = app.namespace,
-        service_account = app.service_account,
-        instance = app.name,
+    toml.push_str(&build_agent_policy(
+        &image_digest,
+        &app.namespace,
+        &app.service_account,
+        &app.name,
     ));
     toml.push_str("'''\n");
     toml.push('\n');
@@ -99,6 +94,89 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
 /// The SNP runtime class CAP requires. enclava-init reads this from cc_init_data
 /// at boot and refuses to start if the rendered Pod's `runtimeClassName` differs.
 pub const DEFAULT_RUNTIME_CLASS: &str = "kata-qemu-snp";
+
+fn build_agent_policy(
+    image_digest: &str,
+    namespace: &str,
+    service_account: &str,
+    instance: &str,
+) -> String {
+    let policy_data = serde_json::json!({
+        "containers": [{
+            "OCI": {
+                "Annotations": {
+                    "io.kubernetes.cri.image-name": image_digest,
+                    "io.kubernetes.pod.namespace": namespace,
+                    "io.kubernetes.pod.service-account.name": service_account,
+                    "tenant.flowforge.sh/instance": instance
+                }
+            },
+            "image_name": image_digest
+        }]
+    });
+
+    let mut rego = String::new();
+    rego.push_str("package agent_policy\n\n");
+    rego.push_str("default AddARPNeighborsRequest := false\n");
+    rego.push_str("default AddSwapRequest := false\n");
+    rego.push_str("default CloseStdinRequest := true\n");
+    rego.push_str("default CopyFileRequest := false\n");
+    rego.push_str("default CreateContainerRequest := false\n");
+    rego.push_str("default CreateSandboxRequest := true\n");
+    rego.push_str("default DestroySandboxRequest := true\n");
+    rego.push_str("default ExecProcessRequest := false\n");
+    rego.push_str("default GetOOMEventRequest := true\n");
+    rego.push_str("default GuestDetailsRequest := true\n");
+    rego.push_str("default ListInterfacesRequest := false\n");
+    rego.push_str("default ListRoutesRequest := false\n");
+    rego.push_str("default MemHotplugByProbeRequest := false\n");
+    rego.push_str("default OnlineCPUMemRequest := true\n");
+    rego.push_str("default PauseContainerRequest := false\n");
+    rego.push_str("default ReadStreamRequest := false\n");
+    rego.push_str("default RemoveContainerRequest := true\n");
+    rego.push_str("default RemoveStaleVirtiofsShareMountsRequest := true\n");
+    rego.push_str("default ReseedRandomDevRequest := false\n");
+    rego.push_str("default ResumeContainerRequest := false\n");
+    rego.push_str("default SetGuestDateTimeRequest := false\n");
+    rego.push_str("default SetPolicyRequest := false\n");
+    rego.push_str("default SignalProcessRequest := true\n");
+    rego.push_str("default StartContainerRequest := true\n");
+    rego.push_str("default StartTracingRequest := false\n");
+    rego.push_str("default StatsContainerRequest := true\n");
+    rego.push_str("default StopTracingRequest := false\n");
+    rego.push_str("default TtyWinResizeRequest := true\n");
+    rego.push_str("default UpdateContainerRequest := false\n");
+    rego.push_str("default UpdateEphemeralMountsRequest := false\n");
+    rego.push_str("default UpdateInterfaceRequest := false\n");
+    rego.push_str("default UpdateRoutesRequest := false\n");
+    rego.push_str("default WaitProcessRequest := true\n");
+    rego.push_str("default WriteStreamRequest := false\n\n");
+    rego.push_str("default AllowRequestsFailingPolicy := false\n\n");
+    rego.push_str("CreateContainerRequest {\n");
+    rego.push_str(&format!(
+        "  input.OCI.Annotations[\"io.kubernetes.cri.image-name\"] == {}\n",
+        rego_string(image_digest)
+    ));
+    rego.push_str(&format!(
+        "  input.OCI.Annotations[\"io.kubernetes.pod.namespace\"] == {}\n",
+        rego_string(namespace)
+    ));
+    rego.push_str(&format!(
+        "  input.OCI.Annotations[\"io.kubernetes.pod.service-account.name\"] == {}\n",
+        rego_string(service_account)
+    ));
+    rego.push_str(&format!(
+        "  input.OCI.Annotations[\"tenant.flowforge.sh/instance\"] == {}\n",
+        rego_string(instance)
+    ));
+    rego.push_str("}\n\n");
+    rego.push_str(&format!("policy_data := {}\n", policy_data));
+    rego
+}
+
+fn rego_string(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization is infallible")
+}
 
 /// Build the identity.toml content.
 fn build_identity_toml(
