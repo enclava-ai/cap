@@ -161,6 +161,10 @@ pub struct UpdateUnlockModeRequest {
     pub transition_receipt: Option<SignedReceiptResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transition_attestation: Option<TransitionReceiptAttestation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_descriptor_blob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_keyring_blob: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

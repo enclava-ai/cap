@@ -58,3 +58,15 @@ fn require_digest_accepts_pinned() {
     .unwrap();
     img.require_digest().unwrap(); // should not panic
 }
+
+#[test]
+fn parse_rejects_non_sha256_digest() {
+    let err = ImageRef::parse("ghcr.io/user/app@not-a-sha256-digest").unwrap_err();
+    assert!(err.to_string().contains("sha256"));
+}
+
+#[test]
+fn parse_rejects_short_sha256_digest() {
+    let err = ImageRef::parse("ghcr.io/user/app@sha256:abc").unwrap_err();
+    assert!(err.to_string().contains("64"));
+}

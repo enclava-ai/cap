@@ -123,6 +123,8 @@ fn unlock_mode_transition_request_contains_only_mode() {
         mode: "auto-unlock".to_string(),
         transition_receipt: None,
         transition_attestation: None,
+        customer_descriptor_blob: None,
+        org_keyring_blob: None,
     };
     let v: serde_json::Value = serde_json::to_value(&req).unwrap();
     assert_eq!(v, serde_json::json!({ "mode": "auto-unlock" }));

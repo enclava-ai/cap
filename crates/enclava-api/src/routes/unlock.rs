@@ -36,6 +36,10 @@ pub struct UpdateUnlockModeRequest {
     pub mode: String,
     pub transition_receipt: Option<SignedReceiptResponse>,
     pub transition_attestation: Option<TransitionReceiptAttestation>,
+    #[serde(default)]
+    pub customer_descriptor_blob: Option<String>,
+    #[serde(default)]
+    pub org_keyring_blob: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +114,13 @@ impl RequestedUnlockMode {
         match self {
             Self::Auto => "auto",
             Self::Password => "password",
+        }
+    }
+
+    fn model_value(self) -> UnlockMode {
+        match self {
+            Self::Auto => UnlockMode::Auto,
+            Self::Password => UnlockMode::Password,
         }
     }
 }
@@ -481,6 +492,103 @@ pub async fn update_unlock_mode(
     reject_replayed_transition_receipt(&state.db, app.id, verified_receipt.receipt_timestamp)
         .await?;
 
+    let signing_artifacts = crate::signing_service::decode_optional_blobs(
+        body.customer_descriptor_blob.clone(),
+        body.org_keyring_blob.clone(),
+    )
+    .map_err(crate::routes::deployments::signing_error_response)?;
+    if crate::routes::deployments::customer_signed_deploy_required(
+        state.attestation.as_ref(),
+        state.signing_service.is_some(),
+    ) && signing_artifacts.is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "signed unlock-mode redeployments require customer_descriptor_blob and org_keyring_blob; use a current enclava CLI to sign the updated deployment descriptor"
+            })),
+        ));
+    }
+
+    let image_digest: Option<String> = sqlx::query_scalar(
+        "SELECT image_digest FROM app_containers WHERE app_id = $1 AND is_primary = true LIMIT 1",
+    )
+    .bind(app.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?
+    .flatten();
+
+    let mut signed_app = app.clone();
+    signed_app.unlock_mode = requested.model_value();
+    let mut workload_artifact_binding = None;
+    let mut signed_policy_artifact = None;
+    if let Some(artifacts) = signing_artifacts.as_ref() {
+        let image_digest_ref = image_digest.as_deref().ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "signed unlock-mode redeployment requires an existing digest-pinned primary image"
+            })),
+        ))?;
+        artifacts
+            .validate_deployment_inputs(&signed_app, image_digest_ref)
+            .map_err(crate::routes::deployments::signing_error_response)?;
+        let attestation = state.attestation.as_ref().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "signed deployment artifacts require attestation runtime configuration"
+            })),
+        ))?;
+        let signing_service_pubkey_hex =
+            attestation.signing_service_pubkey_hex.as_deref().ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "signed deployment artifacts require SIGNING_SERVICE_PUBKEY_HEX"
+                })),
+            ))?;
+        let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+        let mut app_spec = crate::deploy::build_confidential_app(
+            &state.db,
+            &signed_app,
+            attestation,
+            &api_signing_pubkey,
+            &state.api_url,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
+        let binding = artifacts.binding();
+        app_spec.workload_artifact_binding = Some(binding.clone());
+        let (_encoded, cc_init_data_hash) =
+            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        artifacts
+            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+            .map_err(crate::routes::deployments::signing_error_response)?;
+
+        let signing_service = state.signing_service.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "platform signing service is not configured"})),
+        ))?;
+        let signed = signing_service
+            .sign(&artifacts.sign_request())
+            .await
+            .map_err(crate::routes::deployments::signing_error_response)?;
+        artifacts
+            .validate_signed_artifact(&signed, signing_service_pubkey_hex)
+            .map_err(crate::routes::deployments::signing_error_response)?;
+        workload_artifact_binding = Some(binding);
+        signed_policy_artifact = Some(signed);
+    }
+
     let receipt_json = serde_json::to_value(receipt).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -545,21 +653,10 @@ pub async fn update_unlock_mode(
             )
         })?;
 
-    let image_digest: Option<String> = sqlx::query_scalar(
-        "SELECT image_digest FROM app_containers WHERE app_id = $1 AND is_primary = true LIMIT 1",
-    )
-    .bind(app.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?
-    .flatten();
-
-    let deploy_id = Uuid::new_v4();
+    let deploy_id = signing_artifacts
+        .as_ref()
+        .map(|artifacts| artifacts.descriptor.deploy_id)
+        .unwrap_or_else(Uuid::new_v4);
     let spec_snapshot = serde_json::json!({
         "app_name": updated_app.name,
         "namespace": updated_app.namespace,
@@ -568,7 +665,10 @@ pub async fn update_unlock_mode(
         "transition": {
             "from": current.api_value(),
             "to": requested.api_value(),
-        }
+        },
+        "signed_descriptor_core_hash": signing_artifacts
+            .as_ref()
+            .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
     });
 
     sqlx::query(
@@ -587,6 +687,16 @@ pub async fn update_unlock_mode(
             Json(serde_json::json!({"error": "database error"})),
         )
     })?;
+
+    if let (Some(artifacts), Some(signed)) =
+        (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
+    {
+        crate::signing_service::persist_workload_artifacts(
+            &state.db, app.id, deploy_id, artifacts, signed,
+        )
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+    }
 
     let _ = sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
@@ -644,8 +754,8 @@ pub async fn update_unlock_mode(
                 kbs_policy_config: kbs_policy,
                 api_signing_pubkey,
                 api_url,
-                workload_artifact_binding: None,
-                signed_policy_artifact: None,
+                workload_artifact_binding,
+                signed_policy_artifact,
             },
         )
         .await

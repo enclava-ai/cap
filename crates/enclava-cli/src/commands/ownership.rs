@@ -44,12 +44,18 @@ pub enum AutoUnlockCommand {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
         app: Option<String>,
+        /// Digest-pinned container image to bind into the signed redeploy descriptor.
+        #[arg(long)]
+        image: String,
     },
     /// Remove sealed seed, require password on restart
     Disable {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
         app: Option<String>,
+        /// Digest-pinned container image to bind into the signed redeploy descriptor.
+        #[arg(long)]
+        image: String,
     },
 }
 
@@ -221,9 +227,26 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
 
 pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        AutoUnlockCommand::Enable { app } => {
+        AutoUnlockCommand::Enable { app, image } => {
             let app_name = resolve_app_name(&app)?;
-            let (api, _paths) = build_api_client()?;
+            let (api, paths) = build_api_client()?;
+            let cli_config = config::load_config(&paths)?;
+            let creds = config::load_credentials(&paths)?;
+            let app_config = AppConfig::find_and_load()?;
+            let app_meta = api.get_app(&app_name).await?;
+            println!("Signing auto-unlock redeploy descriptor for {app_name}...");
+            let signed_blobs =
+                super::app::build_signed_deploy_blobs(super::app::SignedDeployBlobParams {
+                    api: &api,
+                    paths: &paths,
+                    cli_config: &cli_config,
+                    creds: &creds,
+                    app: &app_meta,
+                    app_config: &app_config,
+                    image: &image,
+                    target_unlock_mode: Some("auto"),
+                })
+                .await?;
             let tee_url = resolve_tee_url(&api, &app_name).await?;
             let tee = TeeClient::new(&tee_url);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
@@ -236,7 +259,6 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             tee.enable_auto_unlock(&password).await?;
             println!("Sealed seed written inside the TEE.");
 
-            let app_meta = api.get_app(&app_name).await?;
             let transition_receipt = tee
                 .sign_unlock_mode_transition(
                     &app_meta.id,
@@ -252,6 +274,8 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                         mode: "auto-unlock".to_string(),
                         transition_receipt: Some(transition_receipt),
                         transition_attestation: Some(transition_attestation),
+                        customer_descriptor_blob: Some(signed_blobs.0),
+                        org_keyring_blob: Some(signed_blobs.1),
                     },
                 )
                 .await?;
@@ -265,9 +289,26 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             println!("Auto-unlock enabled. Restarts no longer require a password.");
             Ok(())
         }
-        AutoUnlockCommand::Disable { app } => {
+        AutoUnlockCommand::Disable { app, image } => {
             let app_name = resolve_app_name(&app)?;
-            let (api, _paths) = build_api_client()?;
+            let (api, paths) = build_api_client()?;
+            let cli_config = config::load_config(&paths)?;
+            let creds = config::load_credentials(&paths)?;
+            let app_config = AppConfig::find_and_load()?;
+            let app_meta = api.get_app(&app_name).await?;
+            println!("Signing password-mode redeploy descriptor for {app_name}...");
+            let signed_blobs =
+                super::app::build_signed_deploy_blobs(super::app::SignedDeployBlobParams {
+                    api: &api,
+                    paths: &paths,
+                    cli_config: &cli_config,
+                    creds: &creds,
+                    app: &app_meta,
+                    app_config: &app_config,
+                    image: &image,
+                    target_unlock_mode: Some("password"),
+                })
+                .await?;
             let tee_url = resolve_tee_url(&api, &app_name).await?;
             let tee = TeeClient::new(&tee_url);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
@@ -280,7 +321,6 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             tee.disable_auto_unlock(&password).await?;
             println!("Sealed seed removed inside the TEE.");
 
-            let app_meta = api.get_app(&app_name).await?;
             let transition_receipt = tee
                 .sign_unlock_mode_transition(
                     &app_meta.id,
@@ -296,6 +336,8 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                         mode: "password".to_string(),
                         transition_receipt: Some(transition_receipt),
                         transition_attestation: Some(transition_attestation),
+                        customer_descriptor_blob: Some(signed_blobs.0),
+                        org_keyring_blob: Some(signed_blobs.1),
                     },
                 )
                 .await?;

@@ -1,8 +1,8 @@
 //! `enclava descriptor` — debug subcommand for Phase 7 deployment descriptor work.
 //!
 //! Prints the canonical hex (full descriptor and core subset) for a JSON
-//! descriptor file. Wiring into `enclava deploy` is intentionally deferred
-//! until the platform-release.json signing pipeline exists.
+//! descriptor file. `enclava deploy` now generates and signs descriptors
+//! automatically; this command remains useful for byte-layout debugging.
 
 use clap::Subcommand;
 

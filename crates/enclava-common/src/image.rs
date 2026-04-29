@@ -21,6 +21,8 @@ impl ImageRef {
     pub fn parse(raw: &str) -> Result<Self, ImageRefError> {
         // Split on @ first (digest takes priority)
         if let Some((name, digest)) = raw.split_once('@') {
+            crate::validate::validate_image_digest(digest)
+                .map_err(|e| ImageRefError::Invalid(e.to_string()))?;
             let (registry, repository) = split_name(name)?;
             return Ok(Self {
                 registry,

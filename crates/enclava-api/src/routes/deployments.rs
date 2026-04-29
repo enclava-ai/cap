@@ -26,7 +26,7 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
     )
 }
 
-fn signing_error_response(
+pub(crate) fn signing_error_response(
     error: crate::signing_service::SigningServiceError,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use crate::signing_service::SigningServiceError;
@@ -48,6 +48,20 @@ fn signing_error_response(
         status,
         Json(serde_json::json!({"error": error.to_string()})),
     )
+}
+
+pub(crate) fn customer_signed_deploy_required(
+    attestation: Option<&enclava_engine::types::AttestationConfig>,
+    signing_service_configured: bool,
+) -> bool {
+    signing_service_configured
+        || attestation
+            .map(|cfg| {
+                cfg.trustee_policy_read_available
+                    || cfg.signing_service_pubkey_hex.is_some()
+                    || cfg.platform_trustee_policy_pubkey_hex.is_some()
+            })
+            .unwrap_or(false)
 }
 
 /// Pick the right cosign `VerificationPolicy` for a stored signer identity.
@@ -78,6 +92,23 @@ fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::Verif
 mod classifier_tests {
     use super::*;
     use crate::cosign::VerificationPolicy;
+    use enclava_common::image::ImageRef;
+    use enclava_engine::types::AttestationConfig;
+
+    fn attestation_config() -> AttestationConfig {
+        AttestationConfig {
+            proxy_image: ImageRef::parse("ghcr.io/enclava-ai/attestation-proxy@sha256:996c32b0726a90d82c08ae095b4bfbe01e47617cf929dc1eed3bd981f4e8155d")
+                .unwrap(),
+            caddy_image: ImageRef::parse("ghcr.io/enclava-ai/caddy-ingress@sha256:31a43cbfce0399cc83d22aabcb25346badcddfb46f4984eccd410c22e691ca6f")
+                .unwrap(),
+            acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+            trustee_policy_read_available: false,
+            workload_artifacts_url: None,
+            trustee_policy_url: None,
+            platform_trustee_policy_pubkey_hex: None,
+            signing_service_pubkey_hex: None,
+        }
+    }
 
     #[test]
     fn github_actions_oidc_url_with_at_is_url_policy() {
@@ -110,6 +141,26 @@ mod classifier_tests {
             policy,
             VerificationPolicy::FulcioUrlIdentity { .. }
         ));
+    }
+
+    #[test]
+    fn signed_deploy_required_when_policy_signing_boundary_is_configured() {
+        assert!(!customer_signed_deploy_required(None, false));
+        assert!(customer_signed_deploy_required(None, true));
+
+        let mut cfg = attestation_config();
+        assert!(!customer_signed_deploy_required(Some(&cfg), false));
+
+        cfg.signing_service_pubkey_hex = Some("11".repeat(32));
+        assert!(customer_signed_deploy_required(Some(&cfg), false));
+
+        cfg.signing_service_pubkey_hex = None;
+        cfg.platform_trustee_policy_pubkey_hex = Some("22".repeat(32));
+        assert!(customer_signed_deploy_required(Some(&cfg), false));
+
+        cfg.platform_trustee_policy_pubkey_hex = None;
+        cfg.trustee_policy_read_available = true;
+        assert!(customer_signed_deploy_required(Some(&cfg), false));
     }
 }
 
@@ -236,17 +287,13 @@ pub async fn deploy(
         body.org_keyring_blob.clone(),
     )
     .map_err(signing_error_response)?;
-    if state
-        .attestation
-        .as_ref()
-        .map(|cfg| cfg.trustee_policy_read_available)
-        .unwrap_or(false)
+    if customer_signed_deploy_required(state.attestation.as_ref(), state.signing_service.is_some())
         && signing_artifacts.is_none()
     {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "trustee policy verification requires customer_descriptor_blob and org_keyring_blob"
+                "error": "signed policy deployments require customer_descriptor_blob and org_keyring_blob; use a current enclava CLI to sign the deployment descriptor before deploy"
             })),
         ));
     }

@@ -137,6 +137,7 @@ struct ConfidentialAppForCcHash<'a> {
     image: enclava_common::image::ImageRef,
     release: &'a PlatformRelease,
     workload_artifact_binding: WorkloadArtifactBinding,
+    unlock_mode: &'a str,
     tenant_id: String,
     tenant_instance_identity_hash: [u8; 32],
     bootstrap_owner_pubkey_hash: String,
@@ -151,12 +152,13 @@ fn confidential_app_for_cc_hash(
         image,
         release,
         workload_artifact_binding,
+        unlock_mode,
         tenant_id,
         tenant_instance_identity_hash,
         bootstrap_owner_pubkey_hash,
     } = params;
 
-    let unlock_mode = match app.unlock_mode.as_str() {
+    let unlock_mode = match unlock_mode {
         "password" => UnlockMode::Password,
         "auto" | "auto-unlock" => UnlockMode::Auto,
         other => return Err(format!("unsupported unlock mode {other}").into()),
@@ -258,19 +260,35 @@ fn bootstrap_public_key_hash(
     ))))
 }
 
-async fn build_signed_deploy_blobs(
-    api: &ApiClient,
-    paths: &CliPaths,
-    cli_config: &config::CliConfig,
-    creds: &config::Credentials,
-    app: &AppResponse,
-    app_config: &AppConfig,
-    image: &str,
-) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+pub(crate) struct SignedDeployBlobParams<'a> {
+    pub api: &'a ApiClient,
+    pub paths: &'a CliPaths,
+    pub cli_config: &'a config::CliConfig,
+    pub creds: &'a config::Credentials,
+    pub app: &'a AppResponse,
+    pub app_config: &'a AppConfig,
+    pub image: &'a str,
+    pub target_unlock_mode: Option<&'a str>,
+}
+
+pub(crate) async fn build_signed_deploy_blobs(
+    params: SignedDeployBlobParams<'_>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let SignedDeployBlobParams {
+        api,
+        paths,
+        cli_config,
+        creds,
+        app,
+        app_config,
+        image,
+        target_unlock_mode,
+    } = params;
     let image_ref = enclava_common::image::ImageRef::parse(image)?;
     if !image_ref.has_digest() {
         return Err("deployment descriptor signing requires --image to be digest-pinned".into());
     }
+    let deploy_unlock_mode = target_unlock_mode.unwrap_or(app.unlock_mode.as_str());
 
     let release = PlatformRelease::load_verified()?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
@@ -324,7 +342,7 @@ async fn build_signed_deploy_blobs(
         parse_hex32("tenant_instance_identity_hash", value)?
     } else if let Some(value) = env_hex32("ENCLAVA_TENANT_INSTANCE_IDENTITY_HASH")? {
         value
-    } else if app.unlock_mode == "password" {
+    } else if deploy_unlock_mode == "password" {
         match bootstrap_identity_hash(paths, org_name, &app.name, &tenant_id, &app.instance_id)? {
             Some(hash) => hash,
             None => {
@@ -415,6 +433,7 @@ async fn build_signed_deploy_blobs(
             image: image_ref.clone(),
             release: &release,
             workload_artifact_binding,
+            unlock_mode: deploy_unlock_mode,
             tenant_id,
             tenant_instance_identity_hash: identity_hash,
             bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
@@ -432,10 +451,10 @@ async fn build_signed_deploy_blobs(
         format!("cli:{}", deployer_key.user_id),
     );
 
-    Ok(Some((
+    Ok((
         serde_json::to_string(&descriptor_envelope)?,
         serde_json::to_string(&keyring_envelope)?,
-    )))
+    ))
 }
 
 #[derive(Args)]
@@ -540,7 +559,7 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
     println!("  Status:    {}", resp.status);
     println!("  Unlock:    {}", resp.unlock_mode);
     println!();
-    println!("Next: run `enclava deploy --image <image>` to deploy.");
+    println!("Next: run `enclava deploy --image <image>@sha256:<digest>` to deploy.");
     if resp.unlock_mode == "password" {
         println!(
             "During deploy, you will be prompted for the initial storage password inside the TEE claim flow."
@@ -552,9 +571,9 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
 #[derive(Args)]
 pub struct DeployArgs {
-    /// Digest-pinned container image to deploy when signing deployment artifacts.
+    /// Digest-pinned container image to deploy and bind into the customer-signed descriptor.
     #[arg(long)]
-    pub image: Option<String>,
+    pub image: String,
     /// Set config key=value pairs delivered to TEE after boot
     #[arg(long = "set", value_name = "KEY=VALUE")]
     pub config_vars: Vec<String>,
@@ -574,22 +593,22 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     let creds = config::load_credentials(&paths)?;
     let app = api.get_app(&app_name).await?;
     let is_password_mode = app.unlock_mode == "password";
-    let signed_blobs = match args.image.as_deref() {
-        Some(image) => {
-            build_signed_deploy_blobs(&api, &paths, &cli_config, &creds, &app, &app_config, image)
-                .await?
-        }
-        None => None,
-    };
+    let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
+        api: &api,
+        paths: &paths,
+        cli_config: &cli_config,
+        creds: &creds,
+        app: &app,
+        app_config: &app_config,
+        image: &args.image,
+        target_unlock_mode: None,
+    })
+    .await?;
 
     let req = DeployRequest {
-        image: args.image.clone(),
-        customer_descriptor_blob: signed_blobs
-            .as_ref()
-            .map(|(descriptor_blob, _)| descriptor_blob.clone()),
-        org_keyring_blob: signed_blobs
-            .as_ref()
-            .map(|(_, keyring_blob)| keyring_blob.clone()),
+        image: Some(args.image.clone()),
+        customer_descriptor_blob: Some(signed_blobs.0),
+        org_keyring_blob: Some(signed_blobs.1),
     };
 
     // Phase 1: Deploy
