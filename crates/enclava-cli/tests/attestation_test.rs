@@ -58,6 +58,7 @@ fn fixed_descriptor() -> DeploymentDescriptor {
         policy_template_id: "kbs-release-policy-v3".to_string(),
         policy_template_sha256: [4; 32],
         platform_release_version: "platform-2026.04".to_string(),
+        expected_agent_policy_hash: [7; 32],
         expected_cc_init_data_hash: [0; 32],
         expected_kbs_policy_hash: [6; 32],
     }

@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
 use enclava_common::descriptor::{DeploymentDescriptor, descriptor_core_hash};
-use enclava_engine::types::WorkloadArtifactBinding;
+use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -115,6 +115,8 @@ pub struct SignedPolicyArtifact {
     pub metadata: PolicyMetadata,
     pub rego_text: String,
     pub rego_sha256: String,
+    pub agent_policy_text: String,
+    pub agent_policy_sha256: String,
     pub signature: String,
     pub verify_pubkey_b64: String,
 }
@@ -128,6 +130,8 @@ pub struct PolicyMetadata {
     pub platform_release_version: String,
     pub policy_template_id: String,
     pub policy_template_sha256: String,
+    pub agent_policy_sha256: String,
+    pub genpolicy_version_pin: String,
     pub signed_at: String,
     pub key_id: String,
 }
@@ -280,15 +284,57 @@ impl DeploymentSigningArtifacts {
                 "artifact.metadata.policy_template_sha256".into(),
             ));
         }
+        if metadata.agent_policy_sha256 != artifact.agent_policy_sha256 {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.agent_policy_sha256".into(),
+            ));
+        }
 
         let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
         let artifact_rego_hash = decode_hex32("rego_sha256", &artifact.rego_sha256)?;
         if artifact_rego_hash != rego_hash {
             return Err(SigningServiceError::Mismatch("artifact.rego_sha256".into()));
         }
+        let agent_policy_hash: [u8; 32] =
+            Sha256::digest(artifact.agent_policy_text.as_bytes()).into();
+        let artifact_agent_policy_hash =
+            decode_hex32("agent_policy_sha256", &artifact.agent_policy_sha256)?;
+        if artifact_agent_policy_hash != agent_policy_hash {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.agent_policy_sha256".into(),
+            ));
+        }
+        if self.descriptor.expected_agent_policy_hash != agent_policy_hash {
+            return Err(SigningServiceError::Mismatch(
+                "expected_agent_policy_hash".into(),
+            ));
+        }
 
         verify_signed_policy_artifact(artifact, &rego_hash, signing_service_pubkey_hex)?;
         Ok(())
+    }
+
+    pub fn generated_agent_policy(
+        &self,
+        artifact: &SignedPolicyArtifact,
+    ) -> Result<GeneratedAgentPolicy, SigningServiceError> {
+        let policy_sha256 = decode_hex32("agent_policy_sha256", &artifact.agent_policy_sha256)?;
+        let actual: [u8; 32] = Sha256::digest(artifact.agent_policy_text.as_bytes()).into();
+        if actual != policy_sha256 {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.agent_policy_sha256".into(),
+            ));
+        }
+        if self.descriptor.expected_agent_policy_hash != policy_sha256 {
+            return Err(SigningServiceError::Mismatch(
+                "expected_agent_policy_hash".into(),
+            ));
+        }
+        Ok(GeneratedAgentPolicy {
+            policy_text: artifact.agent_policy_text.clone(),
+            policy_sha256,
+            genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
+        })
     }
 }
 
@@ -333,6 +379,10 @@ fn canonical_policy_metadata_hash(
         "metadata.policy_template_sha256",
         &metadata.policy_template_sha256,
     )?;
+    let agent_policy_sha256 = decode_hex32(
+        "metadata.agent_policy_sha256",
+        &metadata.agent_policy_sha256,
+    )?;
 
     Ok(ce_v1_hash(&[
         ("app_id", app_id.as_bytes().as_slice()),
@@ -345,6 +395,11 @@ fn canonical_policy_metadata_hash(
         ),
         ("policy_template_id", metadata.policy_template_id.as_bytes()),
         ("policy_template_sha256", &policy_template_sha256),
+        ("agent_policy_sha256", &agent_policy_sha256),
+        (
+            "genpolicy_version_pin",
+            metadata.genpolicy_version_pin.as_bytes(),
+        ),
         ("signed_at", metadata.signed_at.as_bytes()),
         ("key_id", metadata.key_id.as_bytes()),
     ]))
@@ -624,6 +679,12 @@ mod tests {
         Capabilities, EnvVar, Mount, OciRuntimeSpec, Port, Resources, SecurityContext, Sidecars,
         SignerIdentity,
     };
+    use enclava_common::image::ImageRef;
+    use enclava_common::types::{Durability, ResourceLimits, UnlockMode};
+    use enclava_engine::types::{
+        AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
+        VolumeSpec,
+    };
 
     fn descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {
@@ -684,6 +745,10 @@ mod tests {
             policy_template_id: "enclava-kbs-policy-v1".to_string(),
             policy_template_sha256: [4; 32],
             platform_release_version: "cap-test".to_string(),
+            expected_agent_policy_hash: Sha256::digest(
+                b"package agent_policy\n\ndefault CreateContainerRequest := true\n",
+            )
+            .into(),
             expected_cc_init_data_hash: [5; 32],
             expected_kbs_policy_hash: [6; 32],
         }
@@ -715,6 +780,9 @@ mod tests {
     ) -> SignedPolicyArtifact {
         let rego_text = "package policy\n\ndefault allow := false\n".to_string();
         let rego_hash: [u8; 32] = Sha256::digest(rego_text.as_bytes()).into();
+        let agent_policy_text =
+            "package agent_policy\n\ndefault CreateContainerRequest := true\n".to_string();
+        let agent_policy_hash: [u8; 32] = Sha256::digest(agent_policy_text.as_bytes()).into();
         let metadata = PolicyMetadata {
             app_id: artifacts.descriptor.app_id.to_string(),
             deploy_id: artifacts.descriptor.deploy_id.to_string(),
@@ -723,6 +791,8 @@ mod tests {
             platform_release_version: artifacts.descriptor.platform_release_version.clone(),
             policy_template_id: artifacts.descriptor.policy_template_id.clone(),
             policy_template_sha256: hex::encode(artifacts.descriptor.policy_template_sha256),
+            agent_policy_sha256: hex::encode(agent_policy_hash),
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
             signed_at: "2026-04-01T12:30:00+00:00".to_string(),
             key_id: "policy-test-key-v1".to_string(),
         };
@@ -732,6 +802,8 @@ mod tests {
             metadata,
             rego_text,
             rego_sha256: hex::encode(rego_hash),
+            agent_policy_text,
+            agent_policy_sha256: hex::encode(agent_policy_hash),
             signature: hex::encode(signature.to_bytes()),
             verify_pubkey_b64: B64.encode(signing_key.verifying_key().to_bytes()),
         }
@@ -796,6 +868,9 @@ mod tests {
             policy_template_id: "trustee-resource-policy-v1".to_string(),
             policy_template_sha256:
                 "e808dd6a40402bad50ea9522cdcd60b6739b78e21006942f4072a08355a24f10".to_string(),
+            agent_policy_sha256: "749bf91b70ba77fff6ad79581c0b3319cbff946e8f3783f8a44517fa50d470e9"
+                .to_string(),
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
             signed_at: "2026-04-01T12:30:00+00:00".to_string(),
         };
         let rego_hash: [u8; 32] =
@@ -806,11 +881,11 @@ mod tests {
 
         assert_eq!(
             hex::encode(canonical_policy_metadata_hash(&metadata).unwrap()),
-            "59b54ef5ba2b87cd5c4bebd94a350e8e20992ef5404f3f4f11705791bac48a20"
+            "364f70ca857400a41077c5e875579ef5bd2aafe2f373ffa17ac4d7cc621f0a83"
         );
         assert_eq!(
             hex::encode(policy_artifact_signing_input(&metadata, &rego_hash).unwrap()),
-            "0007707572706f73650000001a656e636c6176612d706f6c6963792d61727469666163742d763100086d657461646174610000002059b54ef5ba2b87cd5c4bebd94a350e8e20992ef5404f3f4f11705791bac48a20000b7265676f5f73686132353600000020244b1092b2392d188d72f06ac69347b7c8ae89777619a8e95f523a041f6e5372"
+            "0007707572706f73650000001a656e636c6176612d706f6c6963792d61727469666163742d763100086d6574616461746100000020364f70ca857400a41077c5e875579ef5bd2aafe2f373ffa17ac4d7cc621f0a83000b7265676f5f73686132353600000020244b1092b2392d188d72f06ac69347b7c8ae89777619a8e95f523a041f6e5372"
         );
     }
 
@@ -838,5 +913,113 @@ mod tests {
             .validate_signed_artifact(&artifact, &configured_pubkey_hex)
             .unwrap_err();
         assert!(matches!(err, SigningServiceError::InvalidSignature));
+    }
+
+    #[test]
+    fn signed_artifact_agent_policy_drives_cc_init_data_hash() {
+        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let mut artifacts = signing_artifacts(descriptor());
+        let artifact = signed_policy_artifact(&artifacts, &signing_key);
+        let configured_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        artifacts
+            .validate_signed_artifact(&artifact, &configured_pubkey_hex)
+            .unwrap();
+
+        let generated = artifacts.generated_agent_policy(&artifact).unwrap();
+        let mut app = confidential_app_for_descriptor(&artifacts.descriptor);
+        app.workload_artifact_binding = Some(artifacts.binding());
+        app.generated_agent_policy = Some(generated);
+
+        let toml = enclava_engine::manifest::cc_init_data::build_toml(&app);
+        assert!(toml.contains(&format!(
+            "\"policy.rego\" = '''\n{}'''",
+            artifact.agent_policy_text
+        )));
+
+        artifacts.descriptor.expected_cc_init_data_hash = Sha256::digest(toml.as_bytes()).into();
+        let (_encoded, hash_hex) =
+            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app);
+        artifacts
+            .validate_rendered_cc_init_data_hash(&hash_hex)
+            .unwrap();
+    }
+
+    fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialApp {
+        let image = format!("ghcr.io/enclava-ai/demo@{}", descriptor.image_digest);
+        ConfidentialApp {
+            app_id: descriptor.app_id,
+            name: descriptor.app_name.clone(),
+            namespace: descriptor.namespace.clone(),
+            instance_id: "demo-instance".to_string(),
+            tenant_id: descriptor.org_slug.clone(),
+            bootstrap_owner_pubkey_hash: "aa".repeat(32),
+            tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
+            service_account: descriptor.service_account.clone(),
+            signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
+            signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
+            containers: vec![Container {
+                name: descriptor.app_name.clone(),
+                image: ImageRef::parse(&image).unwrap(),
+                port: Some(3000),
+                command: None,
+                env: std::collections::HashMap::new(),
+                storage_paths: vec!["/app/data".to_string()],
+                is_primary: true,
+            }],
+            storage: StorageSpec {
+                app_data: VolumeSpec {
+                    size: "10Gi".to_string(),
+                    device_path: "/dev/csi0".to_string(),
+                    mount_path: "/data".to_string(),
+                    durability: Durability::DurableState,
+                    bootstrap_policy: enclava_common::types::BootstrapPolicy::FirstBootOnly,
+                    bind_mounts: vec![BindMount {
+                        source: "/data/app".to_string(),
+                        destination: "/app/data".to_string(),
+                    }],
+                },
+                tls_data: VolumeSpec {
+                    size: "1Gi".to_string(),
+                    device_path: "/dev/csi1".to_string(),
+                    mount_path: "/tls".to_string(),
+                    durability: Durability::DisposableState,
+                    bootstrap_policy: enclava_common::types::BootstrapPolicy::AllowReinit,
+                    bind_mounts: vec![],
+                },
+            },
+            unlock_mode: UnlockMode::Password,
+            domain: DomainSpec {
+                platform_domain: descriptor.app_domain.clone(),
+                tee_domain: descriptor.tee_domain.clone(),
+                custom_domain: None,
+            },
+            api_signing_pubkey: String::new(),
+            api_url: String::new(),
+            resources: ResourceLimits {
+                cpu: "1".to_string(),
+                memory: "512Mi".to_string(),
+            },
+            attestation: AttestationConfig {
+                proxy_image: ImageRef::parse(&format!(
+                    "ghcr.io/enclava-ai/attestation-proxy@{}",
+                    descriptor.sidecars.attestation_proxy_digest
+                ))
+                .unwrap(),
+                caddy_image: ImageRef::parse(&format!(
+                    "ghcr.io/enclava-ai/caddy-ingress@{}",
+                    descriptor.sidecars.caddy_digest
+                ))
+                .unwrap(),
+                acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                trustee_policy_read_available: true,
+                workload_artifacts_url: Some("https://api.example.test/artifacts".to_string()),
+                trustee_policy_url: Some("https://kbs.example.test/policy".to_string()),
+                platform_trustee_policy_pubkey_hex: Some("bb".repeat(32)),
+                signing_service_pubkey_hex: Some("bb".repeat(32)),
+            },
+            egress_allowlist: vec![],
+            workload_artifact_binding: None,
+            generated_agent_policy: None,
+        }
     }
 }

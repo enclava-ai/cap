@@ -1490,6 +1490,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "base64 0.22.1",
+ "chrono",
  "ed25519-dalek",
  "enclava-common",
  "hex",
@@ -1507,6 +1508,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeroize",
 ]
 

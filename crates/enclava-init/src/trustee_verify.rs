@@ -16,16 +16,16 @@
 //! Descriptor hashing uses `enclava_common::descriptor`, the same module the
 //! CLI signer uses, so signer + verifier agree byte-for-byte across crates.
 
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use enclava_common::canonical::ce_v1_bytes;
-#[cfg(test)]
-use enclava_common::canonical::ce_v1_hash;
+use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
 use enclava_common::descriptor::{
     DeploymentDescriptor, descriptor_canonical_bytes, descriptor_core_hash,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use uuid::Uuid;
 
 use crate::errors::{InitError, Result};
 
@@ -35,6 +35,8 @@ use crate::errors::{InitError, Result};
 pub struct PolicyEnvelope {
     pub metadata: PolicyMetadata,
     pub rego_text: String,
+    pub agent_policy_text: String,
+    pub agent_policy_sha256: String,
     /// Detached Ed25519 signature over the CE-v1 raw bytes of (purpose,
     /// canonical_policy_metadata_hash, sha256(rego_text)). rev13 finding #5.
     #[serde(with = "hex::serde")]
@@ -50,6 +52,8 @@ pub struct PolicyMetadata {
     pub platform_release_version: String,
     pub policy_template_id: String,
     pub policy_template_sha256: String,
+    pub agent_policy_sha256: String,
+    pub genpolicy_version_pin: String,
     pub signed_at: String,
     pub key_id: String,
 }
@@ -160,6 +164,26 @@ pub fn verify_chain(inputs: &VerifyInputs<'_>) -> Result<()> {
     if !ct_eq_hex(expected_kbs_policy_hash, &actual_rego_hash) {
         return Err(InitError::TrusteePolicy(
             "step 6: rego_text hash != descriptor.expected_kbs_policy_hash".into(),
+        ));
+    }
+    let expected_agent_policy_hash = descriptor
+        .get("expected_agent_policy_hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            InitError::TrusteePolicy("descriptor missing expected_agent_policy_hash".into())
+        })?;
+    let actual_agent_hash = sha256_hex(inputs.policy_envelope.agent_policy_text.as_bytes());
+    if !ct_eq_hex(expected_agent_policy_hash, &actual_agent_hash) {
+        return Err(InitError::TrusteePolicy(
+            "step 6: agent_policy_text hash != descriptor.expected_agent_policy_hash".into(),
+        ));
+    }
+    if !ct_eq_hex(
+        &inputs.policy_envelope.agent_policy_sha256,
+        &actual_agent_hash,
+    ) {
+        return Err(InitError::TrusteePolicy(
+            "step 6: agent_policy_sha256 mismatch".into(),
         ));
     }
 
@@ -292,7 +316,7 @@ fn is_descriptor_signing_pubkey_in_keyring(keyring: &serde_json::Value, pubkey: 
     members.iter().any(|m| {
         let pk = m.get("pubkey").and_then(|p| p.as_str()).unwrap_or("");
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        ct_eq_hex(pk, &pubkey_hex) && (role == "deployer" || role == "owner")
+        ct_eq_hex(pk, &pubkey_hex) && (role == "deployer" || role == "admin" || role == "owner")
     })
 }
 
@@ -322,6 +346,10 @@ fn verify_signed_policy_artifact_metadata(
         .unwrap_or("");
     let want_template_sha = descriptor
         .get("policy_template_sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let want_agent_sha = descriptor
+        .get("expected_agent_policy_hash")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -358,6 +386,11 @@ fn verify_signed_policy_artifact_metadata(
             "step 5: policy_template_sha256 mismatch".into(),
         ));
     }
+    if m.agent_policy_sha256 != want_agent_sha {
+        return Err(InitError::TrusteePolicy(
+            "step 5: agent_policy_sha256 mismatch".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -377,14 +410,7 @@ fn parse_descriptor(descriptor: &serde_json::Value) -> Result<DeploymentDescript
 }
 
 fn ce_v1_policy_envelope_message(env: &PolicyEnvelope) -> Result<Vec<u8>> {
-    let metadata_value =
-        serde_json::to_value(&env.metadata).map_err(|e| InitError::Serde(e.to_string()))?;
-    let metadata_obj = metadata_value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| InitError::Serde("metadata not an object".into()))?;
-    let metadata_bytes = encode_json_object_ce_v1("enclava-policy-metadata-v1", &metadata_obj);
-    let metadata_hash: [u8; 32] = Sha256::digest(&metadata_bytes).into();
+    let metadata_hash = canonical_policy_metadata_hash(&env.metadata)?;
     let rego_hash: [u8; 32] = Sha256::digest(env.rego_text.as_bytes()).into();
     Ok(ce_v1_bytes(&[
         ("purpose", b"enclava-policy-artifact-v1"),
@@ -394,34 +420,115 @@ fn ce_v1_policy_envelope_message(env: &PolicyEnvelope) -> Result<Vec<u8>> {
 }
 
 fn ce_v1_keyring_bytes(keyring: &serde_json::Value) -> Result<Vec<u8>> {
-    let obj = keyring
-        .as_object()
-        .cloned()
-        .ok_or_else(|| InitError::TrusteePolicy("keyring not an object".into()))?;
-    Ok(encode_json_object_ce_v1("enclava-org-keyring-v1", &obj))
+    let keyring: InitOrgKeyring = serde_json::from_value(keyring.clone())
+        .map_err(|e| InitError::TrusteePolicy(format!("keyring schema: {e}")))?;
+    canonical_keyring_bytes(&keyring)
 }
 
-/// Encode a JSON object as CE-v1 records: one `purpose` record then one
-/// record per top-level field in lexicographic order. Each value is the
-/// minified JSON encoding of the field. Cross-crate parity with the
-/// signing service is asserted via the byte-parity tests below.
-fn encode_json_object_ce_v1(
-    purpose: &str,
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Vec<u8> {
-    let mut keys: Vec<&String> = obj.keys().collect();
-    keys.sort();
-    let mut owned: Vec<(String, Vec<u8>)> = Vec::with_capacity(keys.len() + 1);
-    owned.push(("purpose".to_string(), purpose.as_bytes().to_vec()));
-    for k in keys {
-        let v_json = serde_json::to_vec(&obj[k]).expect("value is serializable");
-        owned.push((k.clone(), v_json));
-    }
-    let records: Vec<(&str, &[u8])> = owned
+fn canonical_policy_metadata_hash(metadata: &PolicyMetadata) -> Result<[u8; 32]> {
+    let app_id = Uuid::parse_str(&metadata.app_id)
+        .map_err(|e| InitError::TrusteePolicy(format!("metadata.app_id: {e}")))?;
+    let deploy_id = Uuid::parse_str(&metadata.deploy_id)
+        .map_err(|e| InitError::TrusteePolicy(format!("metadata.deploy_id: {e}")))?;
+    let descriptor_core_hash = decode_hex32(
+        "metadata.descriptor_core_hash",
+        &metadata.descriptor_core_hash,
+    )?;
+    let descriptor_signing_pubkey = decode_hex32(
+        "metadata.descriptor_signing_pubkey",
+        &metadata.descriptor_signing_pubkey,
+    )?;
+    let policy_template_sha256 = decode_hex32(
+        "metadata.policy_template_sha256",
+        &metadata.policy_template_sha256,
+    )?;
+    let agent_policy_sha256 = decode_hex32(
+        "metadata.agent_policy_sha256",
+        &metadata.agent_policy_sha256,
+    )?;
+
+    Ok(ce_v1_hash(&[
+        ("app_id", app_id.as_bytes().as_slice()),
+        ("deploy_id", deploy_id.as_bytes().as_slice()),
+        ("descriptor_core_hash", &descriptor_core_hash),
+        ("descriptor_signing_pubkey", &descriptor_signing_pubkey),
+        (
+            "platform_release_version",
+            metadata.platform_release_version.as_bytes(),
+        ),
+        ("policy_template_id", metadata.policy_template_id.as_bytes()),
+        ("policy_template_sha256", &policy_template_sha256),
+        ("agent_policy_sha256", &agent_policy_sha256),
+        (
+            "genpolicy_version_pin",
+            metadata.genpolicy_version_pin.as_bytes(),
+        ),
+        ("signed_at", metadata.signed_at.as_bytes()),
+        ("key_id", metadata.key_id.as_bytes()),
+    ]))
+}
+
+#[derive(Debug, Deserialize)]
+struct InitOrgKeyring {
+    org_id: Uuid,
+    version: u64,
+    members: Vec<InitMember>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InitMember {
+    user_id: Uuid,
+    pubkey: String,
+    role: String,
+    added_at: DateTime<Utc>,
+}
+
+fn canonical_keyring_bytes(keyring: &InitOrgKeyring) -> Result<Vec<u8>> {
+    let members_hash = canonical_members_hash(&keyring.members)?;
+    let version = keyring.version.to_be_bytes();
+    let updated = keyring.updated_at.to_rfc3339();
+    Ok(ce_v1_bytes(&[
+        ("purpose", b"enclava-org-keyring-v1"),
+        ("org_id", keyring.org_id.as_bytes().as_slice()),
+        ("version", &version),
+        ("members", &members_hash),
+        ("updated_at", updated.as_bytes()),
+    ]))
+}
+
+fn canonical_member_hash(member: &InitMember) -> Result<[u8; 32]> {
+    let pubkey = decode_hex32("keyring.member.pubkey", &member.pubkey)?;
+    let added = member.added_at.to_rfc3339();
+    Ok(ce_v1_hash(&[
+        ("user_id", member.user_id.as_bytes().as_slice()),
+        ("pubkey", &pubkey),
+        ("role", member.role.as_bytes()),
+        ("added_at", added.as_bytes()),
+    ]))
+}
+
+fn canonical_members_hash(members: &[InitMember]) -> Result<[u8; 32]> {
+    let mut sorted: Vec<&InitMember> = members.iter().collect();
+    sorted.sort_by_key(|member| member.user_id);
+    let records: Vec<(String, [u8; 32])> = sorted
         .iter()
-        .map(|(k, v)| (k.as_str(), v.as_slice()))
+        .map(|member| Ok((member.user_id.to_string(), canonical_member_hash(member)?)))
+        .collect::<Result<_>>()?;
+    let refs: Vec<(&str, &[u8])> = records
+        .iter()
+        .map(|(label, value)| (label.as_str(), value.as_slice()))
         .collect();
-    ce_v1_bytes(&records)
+    Ok(ce_v1_hash(&refs))
+}
+
+fn decode_hex32(name: &str, value: &str) -> Result<[u8; 32]> {
+    hex::decode(value.trim())
+        .map_err(|e| InitError::TrusteePolicy(format!("{name}: {e}")))?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| {
+            InitError::TrusteePolicy(format!("{name} must be 32 bytes, got {}", bytes.len()))
+        })
 }
 
 fn sha256_bytes(b: &[u8]) -> [u8; 32] {
@@ -450,15 +557,19 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
+    const AGENT_POLICY: &str = "package agent_policy\n\ndefault CreateContainerRequest := true\n";
+
     fn metadata_for(rego: &str) -> PolicyMetadata {
         PolicyMetadata {
-            app_id: "a".into(),
-            deploy_id: "d".into(),
+            app_id: "22222222-2222-2222-2222-222222222222".into(),
+            deploy_id: "33333333-3333-3333-3333-333333333333".into(),
             descriptor_core_hash: "00".repeat(32),
             descriptor_signing_pubkey: "00".repeat(32),
             platform_release_version: "v1".into(),
             policy_template_id: "tmpl".into(),
             policy_template_sha256: hex::encode(Sha256::digest(rego.as_bytes())),
+            agent_policy_sha256: hex::encode(Sha256::digest(AGENT_POLICY.as_bytes())),
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".into(),
             signed_at: "2026-01-01T00:00:00Z".into(),
             key_id: "k1".into(),
         }
@@ -468,6 +579,8 @@ mod tests {
         let mut env = PolicyEnvelope {
             metadata,
             rego_text: rego.to_string(),
+            agent_policy_text: AGENT_POLICY.to_string(),
+            agent_policy_sha256: hex::encode(Sha256::digest(AGENT_POLICY.as_bytes())),
             signature: [0u8; 64],
         };
         let msg = ce_v1_policy_envelope_message(&env).unwrap();
@@ -525,8 +638,25 @@ mod tests {
             "policy_template_id": "tmpl-default",
             "policy_template_sha256": "04".repeat(32),
             "platform_release_version": "v1.2.3",
+            "expected_agent_policy_hash": hex::encode(Sha256::digest(AGENT_POLICY.as_bytes())),
             "expected_cc_init_data_hash": "05".repeat(32),
             "expected_kbs_policy_hash": "06".repeat(32)
+        })
+    }
+
+    fn keyring_json(deployer: &SigningKey, role: &str) -> serde_json::Value {
+        serde_json::json!({
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "version": 1,
+            "updated_at": "2026-04-01T12:00:00Z",
+            "members": [
+                {
+                    "user_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "pubkey": hex::encode(deployer.verifying_key().to_bytes()),
+                    "role": role,
+                    "added_at": "2026-04-01T12:00:00Z"
+                }
+            ]
         })
     }
 
@@ -556,9 +686,58 @@ mod tests {
     }
 
     #[test]
+    fn policy_artifact_signing_input_matches_cap_vector() {
+        let env = PolicyEnvelope {
+            metadata: PolicyMetadata {
+                app_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                deploy_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                descriptor_core_hash:
+                    "0de9db2fd278a795754120604b68a1fae95d1ba19a66ed9a1df3a76df76f0eea".to_string(),
+                descriptor_signing_pubkey:
+                    "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0".to_string(),
+                platform_release_version: "platform-2026.04".to_string(),
+                policy_template_id: "trustee-resource-policy-v1".to_string(),
+                policy_template_sha256:
+                    "e808dd6a40402bad50ea9522cdcd60b6739b78e21006942f4072a08355a24f10".to_string(),
+                agent_policy_sha256:
+                    "749bf91b70ba77fff6ad79581c0b3319cbff946e8f3783f8a44517fa50d470e9".to_string(),
+                genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+                signed_at: "2026-04-01T12:30:00+00:00".to_string(),
+                key_id: "policy-test-key-v1".to_string(),
+            },
+            rego_text: "package policy\n\ndefault allow := false\n".to_string(),
+            agent_policy_text: AGENT_POLICY.to_string(),
+            agent_policy_sha256: "749bf91b70ba77fff6ad79581c0b3319cbff946e8f3783f8a44517fa50d470e9"
+                .to_string(),
+            signature: [0u8; 64],
+        };
+
+        assert_eq!(
+            hex::encode(canonical_policy_metadata_hash(&env.metadata).unwrap()),
+            "364f70ca857400a41077c5e875579ef5bd2aafe2f373ffa17ac4d7cc621f0a83"
+        );
+        let metadata_hash = canonical_policy_metadata_hash(&env.metadata).unwrap();
+        let rego_hash: [u8; 32] =
+            hex::decode("244b1092b2392d188d72f06ac69347b7c8ae89777619a8e95f523a041f6e5372")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let signing_input = ce_v1_bytes(&[
+            ("purpose", b"enclava-policy-artifact-v1"),
+            ("metadata", metadata_hash.as_slice()),
+            ("rego_sha256", rego_hash.as_slice()),
+        ]);
+        assert_eq!(
+            hex::encode(signing_input),
+            "0007707572706f73650000001a656e636c6176612d706f6c6963792d61727469666163742d763100086d6574616461746100000020364f70ca857400a41077c5e875579ef5bd2aafe2f373ffa17ac4d7cc621f0a83000b7265676f5f73686132353600000020244b1092b2392d188d72f06ac69347b7c8ae89777619a8e95f523a041f6e5372"
+        );
+    }
+
+    #[test]
     fn descriptor_core_hash_excludes_expected_fields() {
         let v1 = descriptor_json();
         let mut v2 = v1.clone();
+        v2["expected_agent_policy_hash"] = serde_json::Value::String("cc".repeat(32));
         v2["expected_cc_init_data_hash"] = serde_json::Value::String("aa".repeat(32));
         v2["expected_kbs_policy_hash"] = serde_json::Value::String("bb".repeat(32));
         let h1 = compute_descriptor_core_hash(&v1).unwrap();
@@ -622,6 +801,12 @@ mod tests {
             .as_str()
             .unwrap()
             .into();
+        metadata.agent_policy_sha256 = descriptor
+            .get("expected_agent_policy_hash")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .into();
 
         let env = mk_envelope(signing_sk, metadata, rego);
 
@@ -652,11 +837,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
-        let keyring = serde_json::json!({
-            "members": [
-                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
-            ]
-        });
+        let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\ndefault allow := false\n";
         let cc_toml = b"placeholder cc_init_data";
         let (bundle, env, cc, signer_pk, _) =
@@ -678,11 +859,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
-        let keyring = serde_json::json!({
-            "members": [
-                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
-            ]
-        });
+        let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\ndefault allow := false\n";
         let cc_toml = b"placeholder cc_init_data";
         let (mut bundle, env, cc, signer_pk, _) =
@@ -712,11 +889,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
-        let keyring = serde_json::json!({
-            "members": [
-                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
-            ]
-        });
+        let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\n";
         let cc_toml = b"x";
         let (bundle, env, mut cc, signer_pk, _) =
@@ -740,11 +913,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
-        let keyring = serde_json::json!({
-            "members": [
-                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
-            ]
-        });
+        let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\n";
         let cc_toml = b"x";
         let (mut bundle, mut env, cc, signer_pk, _) =
@@ -775,11 +944,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
-        let keyring = serde_json::json!({
-            "members": [
-                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
-            ]
-        });
+        let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\n";
         let cc_toml = b"x";
         let (bundle, mut env, cc, signer_pk, _) =
@@ -808,11 +973,7 @@ mod tests {
         let other_signer = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
-        let keyring = serde_json::json!({
-            "members": [
-                {"pubkey": hex::encode(deployer.verifying_key().to_bytes()), "role": "deployer"}
-            ]
-        });
+        let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\n";
         let cc_toml = b"x";
         let (bundle, env, cc, signer_pk, _) =

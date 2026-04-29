@@ -94,12 +94,28 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
 
     // policy.rego
     toml.push_str("\"policy.rego\" = '''\n");
-    toml.push_str(&build_agent_policy(
-        &image_digest,
-        &app.namespace,
-        &app.service_account,
-        &app.name,
-    ));
+    if let Some(agent_policy) = &app.generated_agent_policy {
+        let actual_hash: [u8; 32] = Sha256::digest(agent_policy.policy_text.as_bytes()).into();
+        assert_eq!(
+            actual_hash, agent_policy.policy_sha256,
+            "generated_agent_policy.policy_sha256 must match policy_text"
+        );
+        assert_non_empty(
+            "generated_agent_policy.genpolicy_version_pin",
+            &agent_policy.genpolicy_version_pin,
+        );
+        toml.push_str(&agent_policy.policy_text);
+        if !agent_policy.policy_text.ends_with('\n') {
+            toml.push('\n');
+        }
+    } else {
+        toml.push_str(&build_agent_policy(
+            &image_digest,
+            &app.namespace,
+            &app.service_account,
+            &app.name,
+        ));
+    }
     toml.push_str("'''\n");
     toml.push('\n');
 

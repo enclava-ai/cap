@@ -568,11 +568,6 @@ pub async fn update_unlock_mode(
         })?;
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
-        let (_encoded, cc_init_data_hash) =
-            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
-        artifacts
-            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
-            .map_err(crate::routes::deployments::signing_error_response)?;
 
         let signing_service = state.signing_service.as_ref().ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -584,6 +579,16 @@ pub async fn update_unlock_mode(
             .map_err(crate::routes::deployments::signing_error_response)?;
         artifacts
             .validate_signed_artifact(&signed, signing_service_pubkey_hex)
+            .map_err(crate::routes::deployments::signing_error_response)?;
+        app_spec.generated_agent_policy = Some(
+            artifacts
+                .generated_agent_policy(&signed)
+                .map_err(crate::routes::deployments::signing_error_response)?,
+        );
+        let (_encoded, cc_init_data_hash) =
+            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        artifacts
+            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
             .map_err(crate::routes::deployments::signing_error_response)?;
         workload_artifact_binding = Some(binding);
         signed_policy_artifact = Some(signed);

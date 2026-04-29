@@ -119,6 +119,9 @@ pub struct DeploymentDescriptor {
 
     /// Forward-chain anchors. Excluded from descriptor_core_canonical_bytes.
     #[serde(with = "hex_bytes32")]
+    #[serde(default)]
+    pub expected_agent_policy_hash: [u8; 32],
+    #[serde(with = "hex_bytes32")]
     pub expected_cc_init_data_hash: [u8; 32],
     #[serde(with = "hex_bytes32")]
     pub expected_kbs_policy_hash: [u8; 32],
@@ -309,6 +312,7 @@ fn descriptor_records<'a>(
         ),
     ];
     if include_chain_anchors {
+        r.push(("expected_agent_policy_hash", &d.expected_agent_policy_hash));
         r.push(("expected_cc_init_data_hash", &d.expected_cc_init_data_hash));
         r.push(("expected_kbs_policy_hash", &d.expected_kbs_policy_hash));
     }

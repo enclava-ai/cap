@@ -705,11 +705,16 @@ owner_resource_bindings := {}
                 platform_release_version: "platform-2026.04".to_string(),
                 policy_template_id: "trustee-resource-policy-v1".to_string(),
                 policy_template_sha256: "cc".repeat(32),
+                agent_policy_sha256: "11".repeat(32),
+                genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
                 signed_at: "2026-04-01T12:30:00+00:00".to_string(),
                 key_id: "policy-test-key-v1".to_string(),
             },
             rego_text: "package policy\n\ndefault allow := false\n".to_string(),
             rego_sha256: "dd".repeat(32),
+            agent_policy_text: "package agent_policy\n\ndefault CreateContainerRequest := true\n"
+                .to_string(),
+            agent_policy_sha256: "11".repeat(32),
             signature: "ee".repeat(64),
             verify_pubkey_b64: "ZmFrZS1wdWJrZXk=".to_string(),
         };

@@ -1,6 +1,7 @@
 use enclava_engine::manifest::cc_init_data::{build_toml, encode_cc_init_data, sha256_hex};
 use enclava_engine::testutil::sample_app;
-use enclava_engine::types::WorkloadArtifactBinding;
+use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
+use sha2::{Digest, Sha256};
 
 #[test]
 fn toml_contains_policy_rego() {
@@ -8,6 +9,29 @@ fn toml_contains_policy_rego() {
     let toml = build_toml(&app);
     assert!(toml.contains("package agent_policy"));
     assert!(toml.contains("AllowRequestsFailingPolicy"));
+}
+
+#[test]
+fn toml_embeds_generated_agent_policy_when_present() {
+    let mut app = sample_app();
+    let policy_text = "package agent_policy\n\ndefault CreateContainerRequest := true\n";
+    app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_text: policy_text.to_string(),
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+
+    let toml = build_toml(&app);
+    let parsed: toml::Value = toml::from_str(&toml).unwrap();
+    let embedded = parsed
+        .get("data")
+        .and_then(toml::Value::as_table)
+        .and_then(|data| data.get("policy.rego"))
+        .and_then(toml::Value::as_str)
+        .unwrap();
+
+    assert_eq!(embedded, policy_text);
+    assert!(!embedded.contains("AllowRequestsFailingPolicy"));
 }
 
 #[test]

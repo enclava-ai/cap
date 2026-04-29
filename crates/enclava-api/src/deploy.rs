@@ -159,6 +159,7 @@ pub async fn build_confidential_app(
         attestation: attestation_config.clone(),
         egress_allowlist: Vec::new(),
         workload_artifact_binding: None,
+        generated_agent_policy: None,
     })
 }
 
@@ -349,6 +350,25 @@ pub async fn apply_deployment_manifests(
     )
     .await?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
+    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+        let policy_sha256: [u8; 32] = hex::decode(&signed_policy_artifact.agent_policy_sha256)
+            .map_err(|err| DeployError::Validation(format!("agent_policy_sha256: {err}")))?
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                DeployError::Validation(format!(
+                    "agent_policy_sha256 must be 32 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+        app_spec.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
+            policy_text: signed_policy_artifact.agent_policy_text.clone(),
+            policy_sha256,
+            genpolicy_version_pin: signed_policy_artifact
+                .metadata
+                .genpolicy_version_pin
+                .clone(),
+        });
+    }
 
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;

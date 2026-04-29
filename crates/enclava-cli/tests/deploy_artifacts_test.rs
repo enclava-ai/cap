@@ -214,6 +214,7 @@ fn deploy_descriptor_and_keyring_envelopes_serialize_for_deploy_request() {
         policy_template_id: "enclava-kbs-policy-v1".to_string(),
         policy_template_sha256: [3; 32],
         platform_release_version: "0.1.0".to_string(),
+        expected_agent_policy_hash: [6; 32],
         expected_cc_init_data_hash: [4; 32],
         expected_kbs_policy_hash: [5; 32],
     });

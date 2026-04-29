@@ -41,6 +41,7 @@ pub struct DeploymentDescriptorBuildInput {
     pub policy_template_id: String,
     pub policy_template_sha256: [u8; 32],
     pub platform_release_version: String,
+    pub expected_agent_policy_hash: [u8; 32],
     pub expected_cc_init_data_hash: [u8; 32],
     pub expected_kbs_policy_hash: [u8; 32],
 }
@@ -245,6 +246,7 @@ pub fn build_descriptor(input: DeploymentDescriptorBuildInput) -> DeploymentDesc
         policy_template_id: input.policy_template_id,
         policy_template_sha256: input.policy_template_sha256,
         platform_release_version: input.platform_release_version,
+        expected_agent_policy_hash: input.expected_agent_policy_hash,
         expected_cc_init_data_hash: input.expected_cc_init_data_hash,
         expected_kbs_policy_hash: input.expected_kbs_policy_hash,
     }
@@ -325,6 +327,7 @@ mod tests {
             policy_template_id: "kbs-release-policy-v3".to_string(),
             policy_template_sha256: [4; 32],
             platform_release_version: "platform-2026.04".to_string(),
+            expected_agent_policy_hash: [7; 32],
             expected_cc_init_data_hash: [5; 32],
             expected_kbs_policy_hash: [6; 32],
         }
@@ -341,6 +344,7 @@ mod tests {
     fn descriptor_core_excludes_chain_anchors() {
         let mut d = fixed_descriptor();
         let h1 = descriptor_core_hash(&d);
+        d.expected_agent_policy_hash = [0xEE; 32];
         d.expected_cc_init_data_hash = [0xFF; 32];
         d.expected_kbs_policy_hash = [0xFE; 32];
         let h2 = descriptor_core_hash(&d);
@@ -351,6 +355,16 @@ mod tests {
     fn full_signature_changes_when_chain_anchor_changes() {
         let mut d_a = fixed_descriptor();
         let mut d_b = d_a.clone();
+        d_b.expected_agent_policy_hash = [0xEE; 32];
+        assert_ne!(
+            descriptor_canonical_bytes(&d_a),
+            descriptor_canonical_bytes(&d_b)
+        );
+        d_a.expected_agent_policy_hash = [0xEE; 32];
+        assert_eq!(
+            descriptor_canonical_bytes(&d_a),
+            descriptor_canonical_bytes(&d_b)
+        );
         d_b.expected_cc_init_data_hash = [0xFF; 32];
         assert_ne!(
             descriptor_canonical_bytes(&d_a),

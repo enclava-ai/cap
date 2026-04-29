@@ -27,7 +27,8 @@ use enclava_cli::tee_client::TeeClient;
 use enclava_common::types::{ResourceLimits, UnlockMode};
 use enclava_engine::manifest::cc_init_data;
 use enclava_engine::types::{
-    AttestationConfig, ConfidentialApp, Container, DomainSpec, StorageSpec, WorkloadArtifactBinding,
+    AttestationConfig, ConfidentialApp, Container, DomainSpec, GeneratedAgentPolicy, StorageSpec,
+    WorkloadArtifactBinding,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -137,6 +138,7 @@ struct ConfidentialAppForCcHash<'a> {
     image: enclava_common::image::ImageRef,
     release: &'a PlatformRelease,
     workload_artifact_binding: WorkloadArtifactBinding,
+    generated_agent_policy: GeneratedAgentPolicy,
     unlock_mode: &'a str,
     tenant_id: String,
     tenant_instance_identity_hash: [u8; 32],
@@ -152,6 +154,7 @@ fn confidential_app_for_cc_hash(
         image,
         release,
         workload_artifact_binding,
+        generated_agent_policy,
         unlock_mode,
         tenant_id,
         tenant_instance_identity_hash,
@@ -212,6 +215,63 @@ fn confidential_app_for_cc_hash(
         },
         egress_allowlist: Vec::new(),
         workload_artifact_binding: Some(workload_artifact_binding),
+        generated_agent_policy: Some(generated_agent_policy),
+    })
+}
+
+#[derive(serde::Serialize)]
+struct AgentPolicyRequest<'a> {
+    descriptor: &'a enclava_cli::descriptor::DeploymentDescriptor,
+}
+
+#[derive(serde::Deserialize)]
+struct AgentPolicyResponse {
+    agent_policy_text: String,
+    agent_policy_sha256: String,
+    genpolicy_version_pin: String,
+}
+
+async fn fetch_generated_agent_policy(
+    release: &PlatformRelease,
+    descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
+) -> Result<GeneratedAgentPolicy, Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/agent-policy",
+        release.signing_service_url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&AgentPolicyRequest { descriptor })
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(
+            format!("policy signing service genpolicy preflight failed: {status}: {body}").into(),
+        );
+    }
+    let response: AgentPolicyResponse = response.json().await?;
+    if response.genpolicy_version_pin != release.genpolicy_version {
+        return Err(format!(
+            "policy signing service genpolicy version {} does not match signed platform release {}",
+            response.genpolicy_version_pin, release.genpolicy_version
+        )
+        .into());
+    }
+    let policy_sha256: [u8; 32] = hex::decode(&response.agent_policy_sha256)?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| {
+            format!("agent_policy_sha256 must be 32 bytes, got {}", bytes.len())
+        })?;
+    let actual: [u8; 32] = Sha256::digest(response.agent_policy_text.as_bytes()).into();
+    if actual != policy_sha256 {
+        return Err("policy signing service returned agent_policy_sha256 that does not match agent_policy_text".into());
+    }
+    Ok(GeneratedAgentPolicy {
+        policy_text: response.agent_policy_text,
+        policy_sha256,
+        genpolicy_version_pin: response.genpolicy_version_pin,
     })
 }
 
@@ -416,6 +476,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         policy_template_id: release.policy_template_id.clone(),
         policy_template_sha256,
         platform_release_version: release.platform_release_version.clone(),
+        expected_agent_policy_hash: [0; 32],
         expected_cc_init_data_hash: [0; 32],
         expected_kbs_policy_hash: [0; 32],
     });
@@ -426,6 +487,8 @@ pub(crate) async fn build_signed_deploy_blobs(
         descriptor_signing_pubkey: deployer_key.public.to_bytes(),
         org_keyring_fingerprint,
     };
+    let generated_agent_policy = fetch_generated_agent_policy(&release, &descriptor).await?;
+    descriptor.expected_agent_policy_hash = generated_agent_policy.policy_sha256;
     let cc_app = confidential_app_for_cc_hash(
         app,
         app_config,
@@ -433,6 +496,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             image: image_ref.clone(),
             release: &release,
             workload_artifact_binding,
+            generated_agent_policy,
             unlock_mode: deploy_unlock_mode,
             tenant_id,
             tenant_instance_identity_hash: identity_hash,

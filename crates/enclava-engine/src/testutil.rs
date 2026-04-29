@@ -74,6 +74,7 @@ pub fn sample_app() -> ConfidentialApp {
         },
         egress_allowlist: Vec::new(),
         workload_artifact_binding: None,
+        generated_agent_policy: None,
     }
 }
 
