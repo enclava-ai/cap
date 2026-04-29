@@ -19,7 +19,7 @@ const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../platform-release.json");
 // Production release builds can replace this by setting
 // ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX at compile time.
 const FALLBACK_RELEASE_ROOT_PUBKEY_HEX: &str =
-    "315cccc23a8435e197e6be17bcc01cccaf91010aa9b8093e4b727b112806171b";
+    "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd";
 
 #[derive(Debug, Error)]
 pub enum PlatformReleaseError {
@@ -204,6 +204,16 @@ mod tests {
             release.policy_template_sha256,
             hex::encode(Sha256::digest(release.policy_template_text.as_bytes()))
         );
+    }
+
+    #[test]
+    fn bundled_release_uses_ghcr_digest_pinned_sidecars() {
+        let release = PlatformRelease::load_verified().unwrap();
+        for image in [release.attestation_proxy_image, release.caddy_ingress_image] {
+            assert!(image.starts_with("ghcr.io/enclava-ai/"));
+            assert!(image.contains("@sha256:"));
+            assert!(!image.contains("ttl.sh/"));
+        }
     }
 
     #[test]
