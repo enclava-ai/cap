@@ -334,16 +334,17 @@ the Cloudflare DNS module.
 4. Schedule CT monitoring and alert on unexpected issuers.
 
 **Temporary rollout caveats:**
-- cap-test01 currently uses validation image refs for CAP API,
-  attestation-proxy, caddy-ingress, Trustee KBS, and enclava-init
-  (`ttl.sh/...@sha256:...` where applicable). These are digest-pinned and
-  sidecar-verified where configured, but they are not durable release
-  provenance.
-- cap-test01 sidecar provenance validation is active via public-key cosign
-  policy over signed digest-pinned sidecar images. The remaining blocker is
-  durable platform-release data carrying sidecar image digests, signing-service
-  pubkey, policy template text/hash, and genpolicy pin before M1/M4/M5 can be
-  claimed broadly.
+- cap-test01 has been promoted from `ttl.sh` validation refs to repo-owned GHCR
+  digests for CAP API, enclava-init, attestation-proxy, caddy-ingress, and
+  Trustee KBS. The remaining upstream images in the live Trustee pod are the
+  Confidential Containers AS/RVPS images.
+- cap-test01 sidecar provenance validation is active via GitHub Actions OIDC
+  cosign policy over signed GHCR digest-pinned sidecar images. The remaining
+  blocker is bundled platform-release data carrying sidecar image digests,
+  signing-service pubkey, policy template text/hash, and genpolicy pin before
+  M1/M4/M5 can be claimed broadly.
+- Flux reconciliation is intentionally suspended and the Flux controllers are
+  scaled to zero during manual rollout validation.
 - The active ops overlay removed `kbs-resource-writer` and patches out the old
   writer token Secret. `overlays/cap-test01/kbs-resource-writer.yaml` remains
   as an unreferenced stale file and should be deleted by the ops owner.
@@ -363,20 +364,21 @@ the Cloudflare DNS module.
 ```
 
 Tracks 1 and 2 are the dominant critical path. Both have local v1 code; the
-critical path has moved to durable image publishing, key custody, sidecar
-provenance, and the upstream-vs-fork decision for Trustee.
+critical path has moved to key custody, bundled platform-release data, legacy
+policy fate decisions, storage-level CAS, and the upstream-vs-fork decision for
+Trustee.
 
 ## Execution status
 
-Last updated: 2026-04-28 by Codex external-track implementation pass, live Kata SNP validation, cap-test01 signed-policy cutover, and legacy namespace cleanup.
+Last updated: 2026-04-29 by Codex external-track implementation pass, live Kata SNP validation, cap-test01 signed-policy cutover, legacy namespace cleanup, and GHCR signed-image promotion.
 
 | Track | Owner | State | Started | ETA | Notes |
 |---|---|---|---|---|---|
 | 1 — Signing service | platform-eng | V1 + CAP-TEST01 SERVICE | 2026-04-27 | durable deployment TBD | `../policy-templates/signing-service` now has CE-v1 canonical bytes, descriptor/keyring verification, durable SQLite owner DB, `/sign`, signed metadata, artifact verification, genpolicy adapter, receipt-gated Rego rules, deterministic vector, docs, CI, tests, and clippy. CAP verifies returned policy artifacts against `SIGNING_SERVICE_PUBKEY_HEX` and writes the signed artifact to Trustee. cap-test01 currently points to the off-cluster validation service at `http://10.0.0.2:18080`; `policy-signing-service.yaml` exists but is not included in the active kustomization and still has placeholder image/key/genpolicy fields. Remaining: key custody, deployment target, release publishing, real `genpolicy` pin/execution, and bundled release distribution. |
-| 2 — Trustee patches | platform-eng / Trustee maintainer | CAP-TEST01 LIVE VALIDATED | 2026-04-27 | durable rollout/upstream TBD | `../trustee` now has SNP `init_data_hash`, signed-policy write/evaluation enforcement, workload-attested policy body read, receipt/body policy inputs, required `If-None-Match`/`If-Match` preconditions, insert-if-absent storage writes, and attestation verify callback. cap-test01 runs the patched KBS image with signed-policy enforcement enabled, a signed CAP-managed `resource-policy` artifact, and KBS probes. Tenant GitOps keeps the namespace but no longer applies the historical resource-policy ConfigMap; CAP is configured with Trustee policy/body/artifact URLs and `TRUSTEE_POLICY_READ_AVAILABLE=true`. `../attestation-proxy` now binds receipt pubkey hash into REPORT_DATA and exposes external attested TLS on 8443 while preserving internal HTTP 8081. `key-value-storage` tests pass locally; KBS/verifier focused tests are blocked in this workstation by missing Intel DCAP headers (`sgx_dcap_quoteverify.h`). Remaining: upstream-vs-fork decision, durable image publish/rollout, legacy-policy fate decisions, and per-resource version/ETag CAS. |
+| 2 — Trustee patches | platform-eng / Trustee maintainer | CAP-TEST01 LIVE VALIDATED | 2026-04-27 | upstream TBD | `../trustee` now has SNP `init_data_hash`, signed-policy write/evaluation enforcement, workload-attested policy body read, receipt/body policy inputs, required `If-None-Match`/`If-Match` preconditions, insert-if-absent storage writes, and attestation verify callback. cap-test01 runs the patched GHCR KBS image with signed-policy enforcement enabled, a signed CAP-managed `resource-policy` artifact, and KBS probes. Tenant GitOps keeps the namespace but no longer applies the historical resource-policy ConfigMap; CAP is configured with Trustee policy/body/artifact URLs and `TRUSTEE_POLICY_READ_AVAILABLE=true`. `../attestation-proxy` now binds receipt pubkey hash into REPORT_DATA, exposes external attested TLS on 8443 while preserving internal HTTP 8081, and publishes/signs its GHCR image from the repo workflow. `key-value-storage` tests pass locally; KBS/verifier focused tests are blocked in this workstation by missing Intel DCAP headers (`sgx_dcap_quoteverify.h`). Remaining: upstream-vs-fork decision, legacy-policy fate decisions, and per-resource version/ETag CAS. |
 | 3 — Kata SNP LUKS handoff | infra / CAP | LIVE VALIDATED | 2026-04-27 | monitor per Kata bump | `../enclava-infra/ansible` now renders the actual Kata config paths, repairs shim aliases, removes stale `kernel_modules`, rejects future module overrides, and adds preflight/recover/validate playbooks. Syntax checks pass, host preflight passes on `worker-1`, and `runbooks/validate-kata-dm-crypt.yml` passes live. Verified contract: workload container starts first and waits, mounter sidecar opens/mounts LUKS, marks ready, and workload sees `/state` from `/dev/mapper/cap-smoke`. |
 | 4 — Production audit | operator on-call | COMPLETED — FATE DECISIONS BLOCK FOR BROADER PROD | 2026-04-27 | fate decisions required | Ran via `ssh control1.encl`. Artifacts in `runbooks/audits/trustee-policy-audit-20260427T194217Z/`. The pre-cutover live ConfigMap and KBS-loaded policy matched except trailing newline; CAP DB keys matched CAP-managed Rego keys. cap-test01 now uses a signed CAP-managed policy artifact, so the legacy/operator policy is no longer live there. Fate decisions remain for 1,156 lines of legacy/operator-owned policy before durable template rollout. KBS admin metadata endpoint could not be queried because KBS admin is `DenyAll` (401). |
-| 5 — Tenant TLS-ALPN cutover | platform-eng / CAP | LOCAL V1 + VALIDATION IMAGE ROLLOUT | 2026-04-28 | production DNS/image rollout TBD | `../caddy-ingress` now builds without DNS-provider plugins and smoke-tests absence of the Cloudflare module. `../enclava-tenant-manifests` templates/generated instances no longer mount tenant Cloudflare tokens, render TLS-ALPN-only Caddyfiles, keep Caddy loopback proxying on HTTP 8081, and expose the public attestation Service port 8081 to attestation-proxy targetPort 8443. The legacy `flowforge-1` static overlay was removed from root GitOps and stale tenant/CAP namespaces were deleted, so no old tenant pod remains live. cap-test01 currently uses digest-pinned validation images for CAP/API and sidecars, with sidecar cosign verification active via public-key policy; durable image publication and platform-release distribution remain blockers. CAP has `runbooks/ct-monitoring.sh`. Remaining: publish CAA records, publish/deploy durable images, reconcile future CAP-generated tenants, schedule CT alerting. |
+| 5 — Tenant TLS-ALPN cutover | platform-eng / CAP | CAP-TEST01 SIGNED GHCR ROLLOUT | 2026-04-28 | production DNS/platform-release TBD | `../caddy-ingress` now builds without DNS-provider plugins, smoke-tests absence of the Cloudflare module, publishes to GHCR, and signs the pushed digest through GitHub Actions OIDC. `../enclava-tenant-manifests` templates/generated instances no longer mount tenant Cloudflare tokens, render TLS-ALPN-only Caddyfiles, keep Caddy loopback proxying on HTTP 8081, and expose the public attestation Service port 8081 to attestation-proxy targetPort 8443. The legacy `flowforge-1` static overlay was removed from root GitOps and stale tenant/CAP namespaces were deleted, so no old tenant pod remains live. cap-test01 now uses repo-owned digest-pinned GHCR images for CAP/API and sidecars, with sidecar cosign verification pinned to the repo workflow identities. CAP has `runbooks/ct-monitoring.sh`. Remaining: publish CAA records, reconcile future CAP-generated tenants, schedule CT alerting, and publish bundled platform-release anchors. |
 
 ## Status field for each track
 
