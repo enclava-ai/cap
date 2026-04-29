@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::types::ConfidentialApp;
 
-/// Generate a ResourceQuota matching the live shape at
-/// enclava-tenant-manifests/infra/resource-quota.yaml.
+/// Generate a ResourceQuota matching the live tenant shape now rendered by CAP.
 ///
 /// Includes the full resource set: CPU, memory, storage, PVCs, pods, services,
 /// load balancers (0), node ports (0), secrets, configmaps.

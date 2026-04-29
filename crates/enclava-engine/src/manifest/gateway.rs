@@ -38,9 +38,9 @@ pub fn sni_route_name(app: &ConfidentialApp) -> String {
 
 /// Generate the SNI route ConfigMap consumed by the tenant HAProxy renderer.
 ///
-/// The edge HAProxy still discovers tenant routes from `caddy-sni-route=true`
-/// ConfigMaps. CAP emits the same contract so a tenant created by CAP can be
-/// exposed without `enclava-tenant-manifests` owning the workload manifests.
+/// The edge HAProxy discovers tenant routes from `caddy-sni-route=true`
+/// ConfigMaps. CAP emits that contract directly; tenant resources must not
+/// impersonate Flux-managed objects.
 pub fn generate_sni_route_configmap(app: &ConfidentialApp) -> ConfigMap {
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -53,16 +53,6 @@ pub fn generate_sni_route_configmap(app: &ConfidentialApp) -> ConfigMap {
         "sni-route".to_string(),
     );
     labels.insert("caddy-sni-route".to_string(), "true".to_string());
-    // Compatibility with the current HAProxy discovery task, which still
-    // filters route ConfigMaps by the historical Flux kustomization label.
-    labels.insert(
-        "kustomize.toolkit.fluxcd.io/name".to_string(),
-        "enclava-tenant-manifests".to_string(),
-    );
-    labels.insert(
-        "kustomize.toolkit.fluxcd.io/namespace".to_string(),
-        "flux-system".to_string(),
-    );
 
     let mut data = BTreeMap::new();
     data.insert("host".to_string(), app.primary_domain().to_string());

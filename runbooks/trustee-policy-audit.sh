@@ -93,8 +93,9 @@ Review:
 1. \`cap-binding-key-diff.patch\` must be empty.
 2. Classify every rule in \`non-cap.rego\` using
    \`cap/runbooks/investigations/B4-trustee-policy-audit-playbook.md\`.
-3. Diff \`live-policy.rego\` against
-   \`enclava-tenant-manifests/infra/trustee-kbs-policy/resource-policy.rego\`.
+3. If needed, diff \`live-policy.rego\` against the retired
+   \`enclava-tenant-manifests/infra/trustee-kbs-policy/resource-policy.rego\`
+   as a historical baseline only; CAP-signed artifacts are the live source of truth.
 4. Record each operator-added rule as merge, drop, or known deviation before
    enabling \`KBS_REQUIRE_SIGNED_POLICY=true\`.
 EOF

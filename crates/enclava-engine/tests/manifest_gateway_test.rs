@@ -31,12 +31,8 @@ fn sni_route_configmap_matches_haproxy_discovery_contract() {
         labels.get("caddy-sni-route").map(String::as_str),
         Some("true")
     );
-    assert_eq!(
-        labels
-            .get("kustomize.toolkit.fluxcd.io/name")
-            .map(String::as_str),
-        Some("enclava-tenant-manifests")
-    );
+    assert!(!labels.contains_key("kustomize.toolkit.fluxcd.io/name"));
+    assert!(!labels.contains_key("kustomize.toolkit.fluxcd.io/namespace"));
     assert_eq!(
         data.get("host").map(String::as_str),
         Some("test-app.abcd1234.enclava.dev")

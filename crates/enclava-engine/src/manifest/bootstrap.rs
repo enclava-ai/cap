@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use crate::types::ConfidentialApp;
 
 /// The LUKS bootstrap script, embedded at compile time.
-/// Source: enclava-tenant-manifests/components/templates/confidential-workload/
-///         secure-pv-bootstrap-configmap.yaml (the data.bootstrap.sh field).
+/// Historical source: secure-pv-bootstrap-configmap.yaml from the retired
+/// tenant-manifest flow. CAP now owns rendering and applying this ConfigMap.
 pub const BOOTSTRAP_SCRIPT: &str = include_str!("bootstrap_script.sh");
 
 /// Generate the bootstrap ConfigMap containing the LUKS init script.

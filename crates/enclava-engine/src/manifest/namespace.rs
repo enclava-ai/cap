@@ -6,7 +6,7 @@ use crate::types::ConfidentialApp;
 
 /// Generate a Namespace resource with pod-security labels.
 ///
-/// Matches the live shape at enclava-tenant-manifests/infra/namespace.yaml.
+/// Matches the live tenant namespace shape now rendered by CAP.
 /// CoCo workloads require privileged pod-security because the app container
 /// runs as root with SYS_ADMIN for LUKS operations.
 pub fn generate_namespace(app: &ConfidentialApp) -> Namespace {
