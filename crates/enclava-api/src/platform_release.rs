@@ -1,9 +1,8 @@
-//! Signed platform-release metadata bundled with the CLI.
+//! Signed platform-release metadata consumed by the API at startup.
 //!
-//! The descriptor signer must not learn release anchors from the CAP API or
-//! environment. It verifies this artifact against a pinned Ed25519 release
-//! root, then uses the signed template/image/measurement constants to derive
-//! deployment descriptors.
+//! The CLI already signs deployment descriptors from this artifact. The API
+//! uses the same signed anchors to reject drift in platform-controlled release
+//! values before it can mint cc_init_data or verify signed policy artifacts.
 
 use std::path::Path;
 
@@ -13,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../platform-release.json");
+const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../../enclava-cli/platform-release.json");
 
 // Fixture release root used for the checked-in development release artifact.
 // Production release builds can replace this by setting
@@ -183,22 +182,50 @@ pub fn canonical_platform_release_bytes(
     ]))
 }
 
-fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseError> {
-    let bytes = hex::decode(value.trim())?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| PlatformReleaseError::InvalidField {
-            field,
-            message: format!("expected 32 bytes, got {}", bytes.len()),
-        })
-}
-
 fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformReleaseError> {
     if release.schema_version != "v1" {
         return Err(PlatformReleaseError::InvalidField {
             field: "schema_version",
             message: "expected v1".to_string(),
         });
+    }
+    let signing_url = reqwest::Url::parse(&release.signing_service_url).map_err(|err| {
+        PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: err.to_string(),
+        }
+    })?;
+    if !matches!(signing_url.scheme(), "http" | "https") {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: "scheme must be http or https".to_string(),
+        });
+    }
+    hex32(
+        "signing_service_pubkey_hex",
+        &release.signing_service_pubkey_hex,
+    )?;
+    hex32("policy_template_sha256", &release.policy_template_sha256)?;
+    hex32(
+        "expected_firmware_measurement",
+        &release.expected_firmware_measurement,
+    )?;
+    for (field, image) in [
+        ("attestation_proxy_image", &release.attestation_proxy_image),
+        ("caddy_ingress_image", &release.caddy_ingress_image),
+    ] {
+        let parsed = enclava_common::image::ImageRef::parse(image).map_err(|err| {
+            PlatformReleaseError::InvalidField {
+                field,
+                message: err.to_string(),
+            }
+        })?;
+        parsed
+            .require_digest()
+            .map_err(|err| PlatformReleaseError::InvalidField {
+                field,
+                message: err.to_string(),
+            })?;
     }
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
@@ -210,6 +237,16 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
         });
     }
     Ok(())
+}
+
+fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseError> {
+    let bytes = hex::decode(value.trim())?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| PlatformReleaseError::InvalidField {
+            field,
+            message: format!("expected 32 bytes, got {}", bytes.len()),
+        })
 }
 
 #[cfg(test)]
@@ -225,16 +262,6 @@ mod tests {
             hex::encode(Sha256::digest(release.policy_template_text.as_bytes()))
         );
         assert!(!release.genpolicy_version.contains("unpinned"));
-    }
-
-    #[test]
-    fn bundled_release_uses_ghcr_digest_pinned_sidecars() {
-        let release = PlatformRelease::load_verified().unwrap();
-        for image in [release.attestation_proxy_image, release.caddy_ingress_image] {
-            assert!(image.starts_with("ghcr.io/enclava-ai/"));
-            assert!(image.contains("@sha256:"));
-            assert!(!image.contains("ttl.sh/"));
-        }
     }
 
     #[test]

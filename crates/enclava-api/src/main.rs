@@ -6,7 +6,9 @@ use rand::rngs::OsRng;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use enclava_api::{auth::jwt, build_router, dns::DnsConfig, state::AppState};
+use enclava_api::{
+    auth::jwt, build_router, dns::DnsConfig, platform_release::PlatformRelease, state::AppState,
+};
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -113,50 +115,116 @@ fn load_hmac_key() -> anyhow::Result<[u8; 32]> {
     anyhow::bail!("missing session HMAC key: set SESSION_HMAC_KEY_PATH or SESSION_HMAC_KEY_BASE64")
 }
 
-fn load_required_image_ref(env_name: &str) -> anyhow::Result<ImageRef> {
-    let value = std::env::var(env_name).map_err(|_| anyhow::anyhow!("missing {env_name}"))?;
-    let image = ImageRef::parse(&value)
-        .map_err(|e| anyhow::anyhow!("invalid {env_name} image reference: {}", e))?;
+fn parse_image_ref(name: &str, value: &str) -> anyhow::Result<ImageRef> {
+    let image = ImageRef::parse(value)
+        .map_err(|e| anyhow::anyhow!("invalid {name} image reference: {}", e))?;
     image
         .require_digest()
-        .map_err(|e| anyhow::anyhow!("invalid {env_name}: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("invalid {name}: {}", e))?;
     Ok(image)
 }
 
 fn load_url_env(env_name: &str, required: bool) -> anyhow::Result<Option<String>> {
-    let Some(value) = env_nonempty(env_name) else {
+    load_url_value(env_name, env_nonempty(env_name), required)
+}
+
+fn load_url_value(
+    name: &str,
+    value: Option<String>,
+    required: bool,
+) -> anyhow::Result<Option<String>> {
+    let Some(value) = value else {
         if required {
-            anyhow::bail!("missing {env_name}");
+            anyhow::bail!("missing {name}");
         }
         return Ok(None);
     };
-    let url = reqwest::Url::parse(&value)
-        .map_err(|e| anyhow::anyhow!("invalid {env_name} URL: {}", e))?;
+    let url =
+        reqwest::Url::parse(&value).map_err(|e| anyhow::anyhow!("invalid {name} URL: {}", e))?;
     if !matches!(url.scheme(), "http" | "https") {
-        anyhow::bail!("invalid {env_name}: URL scheme must be http or https");
+        anyhow::bail!("invalid {name}: URL scheme must be http or https");
     }
     Ok(Some(value))
 }
 
-fn load_pubkey_hex_env(env_name: &str, required: bool) -> anyhow::Result<Option<String>> {
-    let Some(value) = env_nonempty(env_name) else {
+fn load_pubkey_hex_value(
+    name: &str,
+    value: Option<String>,
+    required: bool,
+) -> anyhow::Result<Option<String>> {
+    let Some(value) = value else {
         if required {
-            anyhow::bail!("missing {env_name}");
+            anyhow::bail!("missing {name}");
         }
         return Ok(None);
     };
-    let raw = hex::decode(&value).map_err(|e| anyhow::anyhow!("invalid {env_name}: {}", e))?;
+    let raw = hex::decode(&value).map_err(|e| anyhow::anyhow!("invalid {name}: {}", e))?;
     if raw.len() != 32 {
-        anyhow::bail!("invalid {env_name}: expected 32-byte Ed25519 public key hex");
+        anyhow::bail!("invalid {name}: expected 32-byte Ed25519 public key hex");
     }
     Ok(Some(value.to_ascii_lowercase()))
 }
 
-fn load_attestation_config() -> anyhow::Result<Option<AttestationConfig>> {
+fn platform_release_enabled(trustee_policy_read_available: bool) -> bool {
+    trustee_policy_read_available
+        || env_flag("ENCLAVA_USE_PLATFORM_RELEASE")
+        || env_nonempty("ENCLAVA_PLATFORM_RELEASE_PATH").is_some()
+}
+
+fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformRelease>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let release = PlatformRelease::load_verified()
+        .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {}", e))?;
+    if release.expected_runtime_class
+        != enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
+    {
+        anyhow::bail!(
+            "signed platform release runtime class `{}` does not match API runtime class `{}`",
+            release.expected_runtime_class,
+            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
+        );
+    }
+    Ok(Some(release))
+}
+
+fn release_env_value(
+    env_name: &str,
+    release_value: Option<&str>,
+    required: bool,
+) -> anyhow::Result<Option<String>> {
+    match (env_nonempty(env_name), release_value) {
+        (Some(value), Some(expected)) => {
+            if value != expected {
+                anyhow::bail!(
+                    "{env_name} conflicts with signed platform release: env `{value}` != release `{expected}`"
+                );
+            }
+            Ok(Some(value))
+        }
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(expected)) => Ok(Some(expected.to_string())),
+        (None, None) if required => anyhow::bail!("missing {env_name}"),
+        (None, None) => Ok(None),
+    }
+}
+
+fn load_attestation_config(
+    platform_release: Option<&PlatformRelease>,
+) -> anyhow::Result<Option<AttestationConfig>> {
     let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
-    let has_any = ["ATTESTATION_PROXY_IMAGE", "CADDY_INGRESS_IMAGE"]
-        .iter()
-        .any(|name| std::env::var(name).is_ok());
+    let proxy_image_ref = release_env_value(
+        "ATTESTATION_PROXY_IMAGE",
+        platform_release.map(|release| release.attestation_proxy_image.as_str()),
+        false,
+    )?;
+    let caddy_image_ref = release_env_value(
+        "CADDY_INGRESS_IMAGE",
+        platform_release.map(|release| release.caddy_ingress_image.as_str()),
+        false,
+    )?;
+    let has_any = proxy_image_ref.is_some() || caddy_image_ref.is_some();
     if !has_any {
         if trustee_policy_read_available {
             anyhow::bail!(
@@ -168,16 +236,36 @@ fn load_attestation_config() -> anyhow::Result<Option<AttestationConfig>> {
         );
         return Ok(None);
     }
+    let Some(proxy_image_ref) = proxy_image_ref else {
+        anyhow::bail!("missing ATTESTATION_PROXY_IMAGE");
+    };
+    let Some(caddy_image_ref) = caddy_image_ref else {
+        anyhow::bail!("missing CADDY_INGRESS_IMAGE");
+    };
 
     let workload_artifacts_url =
         load_url_env("WORKLOAD_ARTIFACTS_URL", trustee_policy_read_available)?;
     let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
-    let platform_trustee_policy_pubkey_hex = load_pubkey_hex_env(
+    let release_pubkey =
+        platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
+    let platform_trustee_policy_pubkey_hex = load_pubkey_hex_value(
         "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+        release_env_value(
+            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+            release_pubkey,
+            trustee_policy_read_available,
+        )?,
         trustee_policy_read_available,
     )?;
-    let signing_service_pubkey_hex =
-        load_pubkey_hex_env("SIGNING_SERVICE_PUBKEY_HEX", trustee_policy_read_available)?;
+    let signing_service_pubkey_hex = load_pubkey_hex_value(
+        "SIGNING_SERVICE_PUBKEY_HEX",
+        release_env_value(
+            "SIGNING_SERVICE_PUBKEY_HEX",
+            release_pubkey,
+            trustee_policy_read_available,
+        )?,
+        trustee_policy_read_available,
+    )?;
     if trustee_policy_read_available
         && platform_trustee_policy_pubkey_hex != signing_service_pubkey_hex
     {
@@ -187,8 +275,8 @@ fn load_attestation_config() -> anyhow::Result<Option<AttestationConfig>> {
     }
 
     Ok(AttestationConfig {
-        proxy_image: load_required_image_ref("ATTESTATION_PROXY_IMAGE")?,
-        caddy_image: load_required_image_ref("CADDY_INGRESS_IMAGE")?,
+        proxy_image: parse_image_ref("ATTESTATION_PROXY_IMAGE", &proxy_image_ref)?,
+        caddy_image: parse_image_ref("CADDY_INGRESS_IMAGE", &caddy_image_ref)?,
         acme_ca_url: std::env::var("TENANT_CADDY_ACME_CA")
             .ok()
             .filter(|url| !url.trim().is_empty())
@@ -254,11 +342,57 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
+    let platform_release =
+        match load_platform_release(platform_release_enabled(trustee_policy_read_available)) {
+            Ok(release) => release,
+            Err(e) => {
+                eprintln!("startup refused: {e}");
+                std::process::exit(1);
+            }
+        };
+    if let Some(release) = &platform_release {
+        tracing::info!(
+            platform_release_version = %release.platform_release_version,
+            genpolicy_version = %release.genpolicy_version,
+            "signed platform release loaded"
+        );
+    }
+
     // Phase 11: cosign-verify the platform-controlled sidecars before serving
     // any deploy/unlock requests. Refusing to start prevents an operator who
     // has swapped a sidecar image from booting CAP and minting cc_init_data
     // that anchors the swapped digest.
-    match enclava_api::cosign::sidecar_pins_from_env() {
+    let startup_proxy_image = match release_env_value(
+        "ATTESTATION_PROXY_IMAGE",
+        platform_release
+            .as_ref()
+            .map(|release| release.attestation_proxy_image.as_str()),
+        false,
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("startup refused: {e}");
+            std::process::exit(1);
+        }
+    };
+    let startup_caddy_image = match release_env_value(
+        "CADDY_INGRESS_IMAGE",
+        platform_release
+            .as_ref()
+            .map(|release| release.caddy_ingress_image.as_str()),
+        false,
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("startup refused: {e}");
+            std::process::exit(1);
+        }
+    };
+    match enclava_api::cosign::sidecar_pins_from_images(
+        startup_proxy_image.as_deref(),
+        startup_caddy_image.as_deref(),
+    ) {
         Ok(Some(pins)) => match enclava_api::cosign::verify_sidecars_at_startup(&pins).await {
             Ok(v) => tracing::info!(
                 attestation_proxy = %v.attestation_proxy,
@@ -307,7 +441,8 @@ async fn main() {
 
     let hmac_key = load_hmac_key().expect("failed to load session HMAC key");
     tracing::info!("Loaded session HMAC key");
-    let attestation = load_attestation_config().expect("failed to load attestation config");
+    let attestation = load_attestation_config(platform_release.as_ref())
+        .expect("failed to load attestation config");
     let dns = load_dns_config().expect("failed to load DNS config");
     let kbs_policy = enclava_api::kbs::config_from_env();
     let trustee_required = attestation
@@ -317,8 +452,19 @@ async fn main() {
     let trustee_attestation_verify_url =
         load_url_env("TRUSTEE_ATTESTATION_VERIFY_URL", trustee_required)
             .expect("failed to load Trustee attestation verify URL");
-    let signing_service_url = load_url_env("PLATFORM_SIGNING_SERVICE_URL", trustee_required)
-        .expect("failed to load platform signing service URL");
+    let signing_service_url = load_url_value(
+        "PLATFORM_SIGNING_SERVICE_URL",
+        release_env_value(
+            "PLATFORM_SIGNING_SERVICE_URL",
+            platform_release
+                .as_ref()
+                .map(|release| release.signing_service_url.as_str()),
+            trustee_required,
+        )
+        .expect("failed to resolve platform signing service URL"),
+        trustee_required,
+    )
+    .expect("failed to load platform signing service URL");
     let signing_service = signing_service_url.map(|url| {
         enclava_api::signing_service::SigningServiceClient::new(
             url,

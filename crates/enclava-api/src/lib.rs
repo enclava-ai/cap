@@ -9,6 +9,7 @@ pub mod edge;
 pub mod env_gates;
 pub mod kbs;
 pub mod models;
+pub mod platform_release;
 pub mod ratelimit;
 pub mod registry;
 pub mod routes;

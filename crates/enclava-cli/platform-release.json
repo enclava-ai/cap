@@ -1,7 +1,7 @@
 {
   "payload": {
     "schema_version": "v1",
-    "platform_release_version": "dev-2026.04.29-ghcr-sidecars",
+    "platform_release_version": "dev-2026.04.29-kata-3.28.0-release-anchors",
     "signing_service_url": "http://10.0.0.2:18080",
     "signing_service_pubkey_hex": "50bc3000f8aaba75b5aa47e45d64d5cf24c891e9711336e881797fe8a63c575d",
     "policy_template_id": "trustee-resource-policy-v1",
@@ -11,9 +11,9 @@
     "caddy_ingress_image": "ghcr.io/enclava-ai/caddy-ingress@sha256:31a43cbfce0399cc83d22aabcb25346badcddfb46f4984eccd410c22e691ca6f",
     "expected_firmware_measurement": "0000000000000000000000000000000000000000000000000000000000000000",
     "expected_runtime_class": "kata-qemu-snp",
-    "genpolicy_version": "kata-containers/genpolicy-unpinned-dev",
-    "created_at": "2026-04-29T07:55:00Z"
+    "genpolicy_version": "kata-containers/genpolicy@3.28.0+660e3bb6535b141c84430acb25b159857278d596",
+    "created_at": "2026-04-29T13:28:05Z"
   },
-  "signature": "e19e1b33e9f93ecd85056c9b80d2810373272c72f1b408f2e79d4f13577d87b915d53b64e471f9d2ea8119ebb641d3b87950ddd1e30ec35b880546c0cd85510d",
+  "signature": "48d1ef94d733e5d1e44e0ad8eea8b8d6a936f817b9632f9671c083dfdff3521d9a7f79db9c3e63c654d0432ca09fe91f6f466bfce81e73994f31b9169f47f808",
   "signing_pubkey": "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd"
 }

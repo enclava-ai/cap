@@ -474,6 +474,16 @@ pub async fn verify_sidecars_at_startup(
 pub fn sidecar_pins_from_env() -> Result<Option<Vec<SidecarPin>>, CosignError> {
     let proxy_image = std::env::var("ATTESTATION_PROXY_IMAGE").ok();
     let caddy_image = std::env::var("CADDY_INGRESS_IMAGE").ok();
+    sidecar_pins_from_images(proxy_image.as_deref(), caddy_image.as_deref())
+}
+
+/// Build sidecar pins from resolved image references while still reading the
+/// signer policy from environment. This lets the API use signed platform
+/// release image anchors instead of trusting image refs only from env.
+pub fn sidecar_pins_from_images(
+    proxy_image: Option<&str>,
+    caddy_image: Option<&str>,
+) -> Result<Option<Vec<SidecarPin>>, CosignError> {
     if proxy_image.is_none() && caddy_image.is_none() {
         return Ok(None);
     }
@@ -482,7 +492,7 @@ pub fn sidecar_pins_from_env() -> Result<Option<Vec<SidecarPin>>, CosignError> {
     if let Some(image) = proxy_image {
         pins.push(build_pin_from_env(
             "attestation_proxy",
-            &image,
+            image,
             "ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_BASE64",
             "ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_PEM",
             "ATTESTATION_PROXY_SIGNER_SUBJECT",
@@ -492,7 +502,7 @@ pub fn sidecar_pins_from_env() -> Result<Option<Vec<SidecarPin>>, CosignError> {
     if let Some(image) = caddy_image {
         pins.push(build_pin_from_env(
             "caddy_ingress",
-            &image,
+            image,
             "CADDY_INGRESS_SIGNER_PUBLIC_KEY_BASE64",
             "CADDY_INGRESS_SIGNER_PUBLIC_KEY_PEM",
             "CADDY_INGRESS_SIGNER_SUBJECT",
