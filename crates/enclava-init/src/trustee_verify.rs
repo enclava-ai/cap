@@ -83,30 +83,18 @@ pub struct VerifyInputs<'a> {
     pub artifacts: &'a ArtifactsBundle,
     pub cc_init_data_claims: &'a CcInitDataClaims,
     pub local_cc_init_data_toml: &'a [u8],
-    pub platform_trustee_policy_pubkey: &'a VerifyingKey,
-    pub signing_service_pubkey: &'a VerifyingKey,
+    pub platform_trustee_policy_pubkey: Option<&'a VerifyingKey>,
+    pub signing_service_pubkey: Option<&'a VerifyingKey>,
 }
 
 /// Run all six in-TEE verification steps. Returns Ok(()) only if every step
 /// passes; any mismatch returns `InitError::TrusteePolicy(<step>)`.
 pub fn verify_chain(inputs: &VerifyInputs<'_>) -> Result<()> {
-    if inputs.platform_trustee_policy_pubkey.to_bytes() != inputs.signing_service_pubkey.to_bytes()
-    {
-        return Err(InitError::TrusteePolicy(
-            "policy verification pubkey mismatch".into(),
-        ));
-    }
-
     if inputs.policy_envelope != &inputs.artifacts.signed_policy_artifact {
         return Err(InitError::TrusteePolicy(
             "active Trustee policy does not match workload artifact bundle".into(),
         ));
     }
-
-    verify_policy_envelope_signature(
-        inputs.policy_envelope,
-        inputs.platform_trustee_policy_pubkey,
-    )?;
 
     let core_hash = compute_descriptor_core_hash(&inputs.artifacts.descriptor_payload)?;
     if core_hash != inputs.cc_init_data_claims.descriptor_core_hash {
@@ -147,6 +135,13 @@ pub fn verify_chain(inputs: &VerifyInputs<'_>) -> Result<()> {
             "step 4: descriptor_signing_pubkey not a deployer member of keyring".into(),
         ));
     }
+
+    verify_policy_envelope_signature(
+        inputs.policy_envelope,
+        &inputs.cc_init_data_claims.descriptor_signing_pubkey,
+        inputs.platform_trustee_policy_pubkey,
+        inputs.signing_service_pubkey,
+    )?;
 
     verify_signed_policy_artifact_metadata(
         inputs.policy_envelope,
@@ -278,11 +273,35 @@ fn parse_kbs_attestation_token_payload(payload: &serde_json::Value) -> Result<St
     Ok(token.to_string())
 }
 
-fn verify_policy_envelope_signature(env: &PolicyEnvelope, pk: &VerifyingKey) -> Result<()> {
+fn verify_policy_envelope_signature(
+    env: &PolicyEnvelope,
+    descriptor_signing_pubkey: &[u8; 32],
+    platform_trustee_policy_pubkey: Option<&VerifyingKey>,
+    signing_service_pubkey: Option<&VerifyingKey>,
+) -> Result<()> {
     let msg = ce_v1_policy_envelope_message(env)?;
     let sig = Signature::from_bytes(&env.signature);
-    pk.verify(&msg, &sig)
-        .map_err(|e| InitError::TrusteePolicy(format!("policy envelope sig: {e}")))
+    let descriptor_key = VerifyingKey::from_bytes(descriptor_signing_pubkey)
+        .map_err(|e| InitError::TrusteePolicy(format!("descriptor policy pubkey: {e}")))?;
+    if descriptor_key.verify(&msg, &sig).is_ok() {
+        return Ok(());
+    }
+
+    for fallback in [platform_trustee_policy_pubkey, signing_service_pubkey]
+        .into_iter()
+        .flatten()
+    {
+        if fallback.verify(&msg, &sig).is_ok() {
+            tracing::warn!(
+                "accepted policy artifact signature through platform fallback key; customer-signed artifacts should use descriptor_signing_pubkey"
+            );
+            return Ok(());
+        }
+    }
+
+    Err(InitError::TrusteePolicy(
+        "policy envelope sig did not verify with descriptor key or configured fallback key".into(),
+    ))
 }
 
 fn verify_descriptor_full_signature(
@@ -673,7 +692,7 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let pk = sk.verifying_key();
         let env = mk_envelope(&sk, metadata_for("package x\n"), "package x\n");
-        verify_policy_envelope_signature(&env, &pk).unwrap();
+        verify_policy_envelope_signature(&env, &[0u8; 32], Some(&pk), None).unwrap();
     }
 
     #[test]
@@ -682,7 +701,7 @@ mod tests {
         let pk = sk.verifying_key();
         let mut env = mk_envelope(&sk, metadata_for("package x\n"), "package x\n");
         env.rego_text = "package y\n".into();
-        assert!(verify_policy_envelope_signature(&env, &pk).is_err());
+        assert!(verify_policy_envelope_signature(&env, &[0u8; 32], Some(&pk), None).is_err());
     }
 
     #[test]
@@ -833,6 +852,27 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_chain_passes_for_customer_signed_artifact_without_fallback() {
+        let deployer = SigningKey::generate(&mut OsRng);
+        let descriptor = descriptor_json();
+        let keyring = keyring_json(&deployer, "deployer");
+        let rego = "package enclava\ndefault allow := false\n";
+        let cc_toml = b"placeholder cc_init_data";
+        let (bundle, env, cc, _, _) =
+            build_inputs(&descriptor, keyring, rego, &deployer, &deployer, cc_toml);
+
+        let inputs = VerifyInputs {
+            policy_envelope: &env,
+            artifacts: &bundle,
+            cc_init_data_claims: &cc,
+            local_cc_init_data_toml: cc_toml,
+            platform_trustee_policy_pubkey: None,
+            signing_service_pubkey: None,
+        };
+        verify_chain(&inputs).expect("customer-signed chain should pass");
+    }
+
+    #[test]
     fn end_to_end_chain_passes_for_valid_inputs() {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
@@ -848,8 +888,8 @@ mod tests {
             artifacts: &bundle,
             cc_init_data_claims: &cc,
             local_cc_init_data_toml: cc_toml,
-            platform_trustee_policy_pubkey: &signer_pk,
-            signing_service_pubkey: &signer_pk,
+            platform_trustee_policy_pubkey: Some(&signer_pk),
+            signing_service_pubkey: Some(&signer_pk),
         };
         verify_chain(&inputs).expect("chain should pass");
     }
@@ -872,8 +912,8 @@ mod tests {
             artifacts: &bundle,
             cc_init_data_claims: &cc,
             local_cc_init_data_toml: cc_toml,
-            platform_trustee_policy_pubkey: &signer_pk,
-            signing_service_pubkey: &signer_pk,
+            platform_trustee_policy_pubkey: Some(&signer_pk),
+            signing_service_pubkey: Some(&signer_pk),
         };
         let err = verify_chain(&inputs).unwrap_err();
         match err {
@@ -901,8 +941,8 @@ mod tests {
             artifacts: &bundle,
             cc_init_data_claims: &cc,
             local_cc_init_data_toml: cc_toml,
-            platform_trustee_policy_pubkey: &signer_pk,
-            signing_service_pubkey: &signer_pk,
+            platform_trustee_policy_pubkey: Some(&signer_pk),
+            signing_service_pubkey: Some(&signer_pk),
         };
         let err = verify_chain(&inputs).unwrap_err();
         assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("step 4a")));
@@ -932,8 +972,8 @@ mod tests {
             artifacts: &bundle,
             cc_init_data_claims: &cc,
             local_cc_init_data_toml: cc_toml,
-            platform_trustee_policy_pubkey: &signer_pk,
-            signing_service_pubkey: &signer_pk,
+            platform_trustee_policy_pubkey: Some(&signer_pk),
+            signing_service_pubkey: Some(&signer_pk),
         };
         let err = verify_chain(&inputs).unwrap_err();
         assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("step 6")));
@@ -958,8 +998,8 @@ mod tests {
             artifacts: &bundle,
             cc_init_data_claims: &cc,
             local_cc_init_data_toml: cc_toml,
-            platform_trustee_policy_pubkey: &signer_pk,
-            signing_service_pubkey: &signer_pk,
+            platform_trustee_policy_pubkey: Some(&signer_pk),
+            signing_service_pubkey: Some(&signer_pk),
         };
         let err = verify_chain(&inputs).unwrap_err();
         assert!(
@@ -976,7 +1016,7 @@ mod tests {
         let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\n";
         let cc_toml = b"x";
-        let (bundle, env, cc, signer_pk, _) =
+        let (bundle, env, cc, _signer_pk, _) =
             build_inputs(&descriptor, keyring, rego, &signing, &deployer, cc_toml);
         let other_pk = other_signer.verifying_key();
 
@@ -985,11 +1025,11 @@ mod tests {
             artifacts: &bundle,
             cc_init_data_claims: &cc,
             local_cc_init_data_toml: cc_toml,
-            platform_trustee_policy_pubkey: &signer_pk,
-            signing_service_pubkey: &other_pk,
+            platform_trustee_policy_pubkey: None,
+            signing_service_pubkey: Some(&other_pk),
         };
         let err = verify_chain(&inputs).unwrap_err();
-        assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("pubkey mismatch")));
+        assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("policy envelope sig")));
     }
 
     #[test]

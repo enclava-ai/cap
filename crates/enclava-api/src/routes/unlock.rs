@@ -40,6 +40,8 @@ pub struct UpdateUnlockModeRequest {
     pub customer_descriptor_blob: Option<String>,
     #[serde(default)]
     pub org_keyring_blob: Option<String>,
+    #[serde(default)]
+    pub signed_policy_artifact: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -497,9 +499,14 @@ pub async fn update_unlock_mode(
         body.org_keyring_blob.clone(),
     )
     .map_err(crate::routes::deployments::signing_error_response)?;
+    if body.signed_policy_artifact.is_some() && signing_artifacts.is_none() {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
+        ));
+    }
     if crate::routes::deployments::customer_signed_deploy_required(
         state.attestation.as_ref(),
-        state.signing_service.is_some(),
+        state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
     ) && signing_artifacts.is_none()
     {
         return Err((
@@ -544,13 +551,7 @@ pub async fn update_unlock_mode(
                 "error": "signed deployment artifacts require attestation runtime configuration"
             })),
         ))?;
-        let signing_service_pubkey_hex =
-            attestation.signing_service_pubkey_hex.as_deref().ok_or((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "signed deployment artifacts require SIGNING_SERVICE_PUBKEY_HEX"
-                })),
-            ))?;
+        let signing_service_pubkey_hex = attestation.signing_service_pubkey_hex.as_deref();
         let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         let mut app_spec = crate::deploy::build_confidential_app(
             &state.db,
@@ -569,17 +570,13 @@ pub async fn update_unlock_mode(
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
 
-        let signing_service = state.signing_service.as_ref().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "platform signing service is not configured"})),
-        ))?;
-        let signed = signing_service
-            .sign(&artifacts.sign_request())
-            .await
-            .map_err(crate::routes::deployments::signing_error_response)?;
-        artifacts
-            .validate_signed_artifact(&signed, signing_service_pubkey_hex)
-            .map_err(crate::routes::deployments::signing_error_response)?;
+        let signed = crate::routes::deployments::resolve_signed_policy_artifact(
+            &state,
+            artifacts,
+            body.signed_policy_artifact.clone(),
+            signing_service_pubkey_hex,
+        )
+        .await?;
         app_spec.generated_agent_policy = Some(
             artifacts
                 .generated_agent_policy(&signed)

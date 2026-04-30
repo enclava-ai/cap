@@ -106,14 +106,14 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         out.push_str(
             "kbs-attestation-token-url = \"http://127.0.0.1:8006/aa/token?token_type=kbs\"\n",
         );
-        push_required_option(
+        push_optional_option(
             &mut out,
             "platform-trustee-policy-pubkey-hex",
             app.attestation
                 .platform_trustee_policy_pubkey_hex
                 .as_deref(),
         );
-        push_required_option(
+        push_optional_option(
             &mut out,
             "signing-service-pubkey-hex",
             app.attestation.signing_service_pubkey_hex.as_deref(),
@@ -161,4 +161,10 @@ fn toml_string(s: &str) -> String {
 fn push_required_option(out: &mut String, key: &str, value: Option<&str>) {
     let value = value.unwrap_or_else(|| panic!("missing required enclava-init config key {key}"));
     out.push_str(&format!("{key} = {}\n", toml_string(value)));
+}
+
+fn push_optional_option(out: &mut String, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        out.push_str(&format!("{key} = {}\n", toml_string(value)));
+    }
 }

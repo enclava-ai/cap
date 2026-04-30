@@ -1,8 +1,37 @@
 # Enclava CAP Security Mitigation Plan
 
-Date: 2026-04-27 (rev14)
+Date: 2026-04-30 (rev15)
 Source: `SECURITY_REVIEW.md` (2026-04-25)
 Scope: Restore the confidentiality chain end-to-end while preserving the "Heroku for confidential applications" UX.
+
+## Current implementation status (2026-04-30)
+
+This file is both the target architecture and the implementation tracker. The
+current code no longer requires the platform signing service to be the active
+policy authorization boundary:
+
+- CAP CLI can generate a customer/CI-signed `SignedPolicyArtifact` locally from
+  the signed platform-release template bytes, pinned Kata `genpolicy` output,
+  the customer-signed deployment descriptor, and the owner-signed org keyring.
+- CAP API accepts that artifact on deploy and unlock-mode redeploy, verifies
+  the descriptor/keyring chain, requires the submitted keyring to match CAP's
+  latest stored org keyring, verifies the artifact with
+  `descriptor_signing_pubkey`, verifies the Rego hash against
+  `descriptor.expected_kbs_policy_hash`, and writes the signed artifact to
+  Trustee. `REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT=true` disables the
+  transitional platform signing-service fallback.
+- `enclava-init` verifies customer-signed artifacts with the
+  descriptor-signing key after it proves descriptor and keyring membership; the
+  old platform signing-service public keys are optional fallback keys only.
+- The local Trustee fork accepts descriptor-key-signed policy artifacts only
+  when the descriptor key is independently configured in Trustee's trust-anchor
+  allowlist; a configured platform policy key remains a fallback for legacy
+  artifacts.
+
+Remaining blockers before the public M5-strict claim are production release-root
+custody, production platform-release publishing, broader production rollout of
+the patched Trustee/fork, legacy Trustee-policy fate decisions, storage-level
+CAS for resource writes, and full Phase 7 raw SNP/VCEK verification hardening.
 
 ## Revision history
 
@@ -121,6 +150,7 @@ Scope: Restore the confidentiality chain end-to-end while preserving the "Heroku
     - There is no TOFU step in enclava-init, and the owner pubkey itself is never directly trusted in the TEE — only the (keyring fingerprint) → (signing service authorization) chain. **Fix:** replace step 4's wording.
   - **Finding 4 (LOW): metadata canonicalization naming is misleading.** D9 prose says `canonical_metadata_bytes` (suggesting raw bytes); D11 defines `canonical_policy_metadata_bytes` (rev12) as a 32-byte CE-v1 hash used as a record value. Both names suggest raw bytes; the value is actually a hash. Implementer reading the pseudocode could pass raw bytes and break interop. **Fix:** rename throughout to **`canonical_policy_metadata_hash`** (it's a hash, not raw bytes); D11 row updated.
   - **Finding 5 (LOW): footer sections still labeled rev10/rev9.** Rollout Strategy header, Open Decisions header, Effort Summary header, and Confidence statement header all still say "(rev10)" or reference rev9 in column headings. **Fix:** bump to rev14 throughout (and add brief notes for any meaningful change since rev10).
+- **rev15 (this revision):** implements the pragmatic customer/CI-signed policy-artifact path. The descriptor signing key can now sign the final Trustee artifact directly after local `genpolicy` and template rendering. CAP verifies the keyring/descriptor chain and Rego/agent-policy hashes before writing to Trustee. `enclava-init` verifies descriptor-key signatures first and keeps platform keys as compatibility fallbacks; Trustee accepts descriptor-key signatures only when that descriptor key is independently configured as a Trustee trust anchor. This removes the platform signing service from the steady-state authorization boundary while keeping `/sign` available for transition and test environments.
 
 ## Implementation Status (living section — update on every PR merge)
 
@@ -337,11 +367,24 @@ allow {
 | Runtime class | `init_data_claims.runtime_class` | Customer-signed deployment descriptor |
 | Signer identity | `init_data_claims.signer_identity` | Customer-signed deployment descriptor |
 
-### D9. Trustee policy ownership and signing (rev6: signing service is authoritative for Rego AND maintains its own pubkey state)
+### D9. Trustee policy ownership and signing (rev15: customer/CI artifacts are the preferred authorization path)
 
 **Threat:** rev4 had API submit arbitrary Rego to the signing service (signing oracle). Rev5 fixed by having the service reconstruct from templates, but still verified customer pubkeys against a "read-only DB mirror" — operator-controlled, so operator could swap pubkeys to authorize malicious intent.
 
-**Rev6 model — signing service is fully sovereign:**
+**Rev15 model — two artifact producers, same signed envelope:**
+
+The steady-state path is customer/CI-signed. The customer-controlled deploy
+key that signs the `DeploymentDescriptor` also signs the final
+`SignedPolicyArtifact` after rendering the signed platform-release template and
+running the pinned Kata `genpolicy` adapter. CAP verifies the artifact, stores
+it, and transports it to Trustee; CAP API still never authors Rego.
+
+The off-cluster signing service remains as a transitional producer for
+environments that have not moved policy artifact generation into customer CI.
+It signs the same envelope and is verified by the same code paths, but
+`REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT=true` disables that fallback.
+
+**Rev6 transitional model — signing service is sovereign when used:**
 
 The off-cluster signing service is the **sole author** of CAP-managed Trustee policy text. It maintains:
 1. **Rego templates** baked into its container image (from a separate platform-controlled repo, code-reviewed)
@@ -360,7 +403,8 @@ The signing service:
 2. Verifies the **deployment descriptor's signature** against a deployer pubkey from the verified keyring (and that the deployer has appropriate role).
 3. Looks up the Rego template for the requested platform release (baked into the service's image).
 4. Substitutes verified-descriptor values (`image_digest`, `signer_identity`, etc.) into the template deterministically.
-5. Signs the reconstructed Rego with the service's private key.
+5. Signs the reconstructed Rego with the service's private key, or in the
+   customer/CI path verifies locally and signs with `descriptor_signing_pubkey`.
 6. Returns a **`SignedPolicyArtifact`** (rev13 — adds `policy_template_id` / `policy_template_sha256` to metadata so the customer-pinned template version is bound through the artifact; rev12 introduced the explicit shape):
    ```
    SignedPolicyArtifact {
@@ -372,17 +416,27 @@ The signing service:
            platform_release_version: String,
            policy_template_id: String,            // (rev13) which template was rendered
            policy_template_sha256: 32 bytes,      // (rev13) hash of the template text
+           agent_policy_sha256: 32 bytes,         // (rev15) generated Kata policy hash
+           genpolicy_version_pin: String,         // (rev15) pinned generator identity
            signed_at: RFC3339,
-           key_id: String,                        // signing-service key version
+           key_id: String,                        // signing-service key version or customer CI key id
        },
        rego_text: String,
+       rego_sha256: 32 bytes,                     // diagnostic; signer still signs computed hash
+       agent_policy_text: String,                 // generated Kata agent policy carried into cc_init_data
        signature: 64 bytes,                       // Ed25519 PureEdDSA over RAW CE-v1 message bytes (rev13 finding #5 — NOT the 32-byte hash)
+       verify_pubkey_b64: String,                 // diagnostic key hint; verifiers use anchored expected keys
    }
    ```
    The signing service builds `sign_message = ce_v1_bytes([("purpose","enclava-policy-artifact-v1"), ("metadata", canonical_policy_metadata_hash), ("rego_sha256", sha256(rego_text))])` (raw TLV-encoded record stream — note `canonical_policy_metadata_hash` is the 32-byte CE-v1 hash of the metadata fields, embedded as a record value here; rev14 finding #4 renamed from rev12/rev13 `canonical_metadata_bytes` / `canonical_policy_metadata_bytes` to make explicit that it's a hash, not raw bytes) and signs **those bytes** with Ed25519 (RFC 8032 PureEd25519 — internal SHA-512 in Ed25519 handles compression). Verifiers reconstruct `sign_message` from the wire-format and call `ed25519_verify(pubkey, sign_message, signature)`. The Phase 3 acceptance criteria require committing reference test vectors (signer + verifier) to the policy-templates repo so cross-implementation interop is mechanical.
 
 CAP API:
-- Receives the signed artifact, verifies the signing-service signature (defense-in-depth — even if the artifact was tampered with in transit), writes it to Trustee via `set_policy`.
+- Receives the signed artifact, verifies the descriptor/keyring chain, verifies
+  the signature against `descriptor_signing_pubkey` for customer/CI artifacts
+  or against the configured signing-service pubkey for transitional artifacts,
+  verifies `rego_sha256 == SHA256(rego_text)`, verifies
+  `descriptor.expected_kbs_policy_hash == SHA256(rego_text)`, verifies the
+  generated agent policy hash, then writes it to Trustee via `set_policy`.
 - **Never composes, modifies, or re-renders Rego.**
 
 **Bootstrap of the signing service's owner-pubkey state:**
@@ -397,10 +451,15 @@ CAP API:
 
 A stolen API credential cannot ask for arbitrary Rego because the input space is bounded by what customers actually signed and what the signing service's own owner-pubkey state authorizes. The worst-case operator action is *replay* of a previous signed artifact — which already matches the workload's attestation, so it's a no-op.
 
-**Verification (in API and `enclava-init`):**
-- Signing-service public key is published with the CAP release artifact (non-secret; in ConfigMap or compiled in)
-- `enclava-init` verifies the signature against the compiled-in public key before any KBS read
-- Key rotation: append-only list of valid pubkeys with `since` timestamps
+**Verification (in API, Trustee, and `enclava-init`):**
+- Customer/CI artifacts verify against `descriptor_signing_pubkey`, after the
+  verifier proves the descriptor signature and org-keyring membership chain.
+- Transitional signing-service artifacts verify against the signing-service
+  public key published with the CAP release artifact.
+- `enclava-init` tries the descriptor key first and treats platform keys as
+  fallback compatibility keys only.
+- Key rotation: org keyring rotation for customer keys; append-only platform
+  public-key list with `since` timestamps for transitional platform keys.
 
 **Operational requirement:** before Phase 3 starts, set up the signing service container image + CI/CD pipeline + private signing key + owner-pubkey storage in a separate platform-controlled repo + deployment. Signing service has its own DB (small — one row per org). ~1.5 weeks of platform-eng work; can run in parallel with Phase 0.
 
@@ -633,7 +692,7 @@ fn ce_v1_hash(records: &[(&str, &[u8])]) -> [u8; 32] {
 | Rekey receipt (Phase 6, signed by attestation-proxy) | `("purpose","enclava-rekey-v1")`, `("app_id", uuid_16B)`, `("resource_path", path_utf8)`, `("new_value_sha256", hash_32B)`, `("timestamp", rfc3339_utf8)` |
 | Teardown receipt (Phase 6) | `("purpose","enclava-teardown-v1")`, `("app_id", uuid_16B)`, `("resource_path", path_utf8)`, `("timestamp", rfc3339_utf8)` |
 | Signed policy artifact (rev12/rev13/rev14 — Phase 3 / D9; signing service signs the **raw CE-v1 bytes** of these records, not the hash) | `("purpose","enclava-policy-artifact-v1")`, `("metadata", canonical_policy_metadata_hash)`, `("rego_sha256", sha256_of_rego_text_32B)` — **Ed25519 signs `ce_v1_bytes(records)`, the raw TLV-encoded message; verifiers reconstruct the same byte stream and pass it directly to `ed25519_verify`.** |
-| `canonical_policy_metadata_hash` (rev14 finding #4 — renamed from rev12/rev13 `canonical_policy_metadata_bytes` to make explicit that it's a 32-byte hash used as a record value, not raw bytes) | 32-byte CE-v1 **hash** of: `("app_id", uuid_16B)`, `("deploy_id", uuid_16B)`, `("descriptor_core_hash", hash_32B)`, `("descriptor_signing_pubkey", pubkey_32B)`, `("platform_release_version", version_utf8)`, `("policy_template_id", id_utf8)`, `("policy_template_sha256", hash_32B)`, `("signed_at", rfc3339_utf8)`, `("key_id", key_id_utf8)` |
+| `canonical_policy_metadata_hash` (rev15 — includes generated-agent-policy fields) | 32-byte CE-v1 **hash** of: `("app_id", uuid_16B)`, `("deploy_id", uuid_16B)`, `("descriptor_core_hash", hash_32B)`, `("descriptor_signing_pubkey", pubkey_32B)`, `("platform_release_version", version_utf8)`, `("policy_template_id", id_utf8)`, `("policy_template_sha256", hash_32B)`, `("agent_policy_sha256", hash_32B)`, `("genpolicy_version_pin", pin_utf8)`, `("signed_at", rfc3339_utf8)`, `("key_id", key_id_utf8)` |
 
 **Sub-canonicalizations:**
 - `canonical_signer_bytes` for `signer_identity` = CE-v1 hash of `[("subject", utf8), ("issuer", utf8)]` (32 bytes)
@@ -847,9 +906,9 @@ Two viable shapes; pick before Phase 3 starts:
 
 **Option A — patch Trustee directly (REQUIRED for M1/M5; ~1.5 weeks):**
 - Fork `trustee/kbs` or upstream a feature flag `KBS_REQUIRE_SIGNED_POLICY=true`
-- New code path in `api_server.rs::set_policy`: parse the incoming policy as the rev12 `SignedPolicyArtifact` envelope (D9 — `{metadata, rego_text, signature}`); reconstruct `sign_message = ce_v1_bytes([("purpose","enclava-policy-artifact-v1"), ("metadata", canonical_policy_metadata_hash), ("rego_sha256", sha256(rego_text))])` (rev13 finding #5 — raw CE-v1 message bytes, NOT the 32-byte hash; rev14 finding #4 — `canonical_policy_metadata_hash` is the 32-byte CE-v1 hash of the metadata fields per D11); call `ed25519_verify(KBS_POLICY_VERIFY_PUBKEY, sign_message, signature)`; reject with 400 if missing/invalid
+- New code path in `api_server.rs::set_policy`: parse the incoming policy as the rev15 `SignedPolicyArtifact` envelope (D9 — `{metadata, rego_text, signature}`); reconstruct `sign_message = ce_v1_bytes([("purpose","enclava-policy-artifact-v1"), ("metadata", canonical_policy_metadata_hash), ("rego_sha256", sha256(rego_text))])` (rev13 finding #5 — raw CE-v1 message bytes, NOT the 32-byte hash; rev15 — metadata includes `agent_policy_sha256` and `genpolicy_version_pin`). Verification must use an independent Trustee trust anchor: either the configured platform `signed_policy_public_key` for transitional platform-signed artifacts or a configured allowlist entry matching `metadata.descriptor_signing_pubkey` for customer/CI-signed artifacts. **Never accept `metadata.descriptor_signing_pubkey` as self-authenticating input.** Reject with 400 if missing/invalid.
 - New code path in policy evaluation: only evaluate policies whose stored envelope verifies; refuse to load any legacy unsigned policy
-- Verify pubkey is configured at Trustee startup; fail if missing in production mode
+- At least one policy-signing trust anchor is configured at Trustee startup; fail if `require_signed_policy=true` with no `signed_policy_public_key` and no trusted descriptor-pubkey allowlist
 - Storage backend stores the full envelope; on read, the evaluator unwraps and verifies before passing the Rego text to `regorus`
 - **New endpoint** `GET /resource-policy/<id>/body` (rev8 finding #8 / rev9 finding #2 — workload-attested, NOT admin auth). `enclava-init` needs to read the active policy text to verify it; current Trustee `GET /resource-policy` returns only `list_policies()` (`trustee/kbs/src/api_server.rs:345`) and requires admin auth — workload pods cannot carry Trustee admin credentials. Rev9 endpoint:
   - Accepts the same workload attestation token already used for `GET /resource/...` (KBS resource read)
@@ -888,7 +947,7 @@ Two viable shapes; pick before Phase 3 starts:
 
 **In-TEE verification (in `enclava-init`)** (rev13 — corrects the metadata-comparison anchors and pulls all artifacts from a workload-readable endpoint):
 - Reads the policy currently in effect from Trustee (workload-attested `GET /resource-policy/<id>/body` from rev9 finding #2)
-- Verifies the policy envelope's signature against the compiled-in `PLATFORM_TRUSTEE_POLICY_PUBKEY`
+- Verifies the policy envelope's signature against `descriptor_signing_pubkey` after proving the descriptor/keyring chain; compiled-in platform keys are fallback compatibility keys for transitional platform-signed artifacts
 - Reads cc_init_data, which carries `(descriptor_core_hash, descriptor_signing_pubkey, org_keyring_fingerprint)` — but **not** the descriptor's full signature (rev11 cycle fix)
 - Fetches the bundle from CAP API's workload-attested artifact endpoint **`GET /api/v1/workload/artifacts`** (rev14 finding #2 — workload-attested, scoped by `descriptor_core_hash` from validated SNP claims). Workload presents its KBS attestation token; CAP API validates it via Trustee callback and returns the artifacts whose `descriptor_core_hash` matches `init_data_claims.descriptor_core_hash`. Returns `{descriptor_payload, descriptor_signature, descriptor_signing_key_id, org_keyring_payload, org_keyring_signature, signed_policy_artifact}`. Then verifies, in order:
   1. Computes `descriptor_core_canonical_bytes` from the read descriptor (purpose label `"enclava-deployment-descriptor-core-v1"`, all fields EXCEPT `expected_cc_init_data_hash` and `expected_kbs_policy_hash`); CE-v1 hashes it; asserts `result == cc_init_data.descriptor_core_hash`. If the operator substituted a descriptor with different core fields (image, signer, namespace, template id, release version, …), this fails.

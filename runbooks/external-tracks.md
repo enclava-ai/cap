@@ -6,8 +6,9 @@ platform-eng / infra side, not the CAP application engineers. Created
 2026-04-27 from `SECURITY_MITIGATION_PLAN.md` rev14 + the
 `runbooks/investigations/B*` reports. Updated 2026-04-28 after the
 cross-repo implementation pass, tenant TLS-ALPN cleanup, live Kata SNP LUKS
-validation, cap-test01 signed-policy cutover, legacy namespace cleanup, and
-Kata 3.28.0 genpolicy pinning.
+validation, cap-test01 signed-policy cutover, legacy namespace cleanup,
+Kata 3.28.0 genpolicy pinning, and the customer/CI-signed policy-artifact
+path.
 
 The tracks below run **in parallel** with this repo's coding. PR #2, PR #3,
 and PR #4 have landed in `cap`; these external tracks now gate production
@@ -19,22 +20,27 @@ cutover for Phase 0/2/3/6 and are required for the M5-strict claim.
 
 **Why it exists.** Per D9 of the plan, CAP API is not allowed to compose
 authoritative Trustee Rego under the threat model — an operator with cluster
-root could swap the rendered Rego on the way to Trustee. The fix is an
-off-cluster signing service that owns the Rego templates, owns its own
-per-org owner-pubkey state, and signs reconstructed Rego with a key the
-operator cannot reach.
+root could swap the rendered Rego on the way to Trustee. The preferred v1 fix
+is customer/CI-generated policy artifacts: the customer-controlled descriptor
+key signs the final Trustee artifact after rendering signed platform-release
+template bytes and running the pinned Kata `genpolicy` adapter. The off-cluster
+signing service remains a transitional artifact producer for environments that
+have not moved generation into customer CI.
 
 **Gates:** Phase 2 (CAP signing-client + Kata fail-closed), Phase 3
 (Trustee-side signed-policy enforcement), all of M1 and M5.
 
-**Effort estimate:** coding v1 implemented; production deployment and key
-custody remain platform work. cap-test01 currently points CAP at
+**Effort estimate:** coding v1 implemented; production release-root custody and
+customer CI workflow publication remain platform work. cap-test01 currently points CAP at
 `http://10.0.0.2:18080`; the off-cluster validation service behind that URL now
 runs the public, keyless-signed `ghcr.io/enclava-ai/policy-signing-service`
 digest with checksum-pinned Kata 3.28.0 `genpolicy` baked into the image. The
 checked-in signing-service manifest is a scaffold and is not yet part of the
 active cap-test01 kustomization because durable key custody and the deployment
-target remain unresolved.
+target remain unresolved. CAP now has a strict mode
+(`REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT=true`) that disables the platform
+signing-service fallback once the customer/CI artifact path is the only desired
+deployment contract.
 
 **What needs to happen, ordered:**
 
@@ -88,6 +94,11 @@ target remain unresolved.
      Do not include it until key custody/deployment target are chosen; otherwise
      the rollout would move the signing key into the same trust boundary the
      plan is trying to remove.
+   - **Customer/CI artifact status 2026-04-30:** `../policy-templates/signing-service`
+     also ships a standalone `policy-artifact` generator, and CAP CLI signs the
+     deploy artifact locally with the descriptor key. CAP API verifies that
+     descriptor/keyring chain, the artifact signature, the KBS Rego hash, and
+     the generated agent-policy hash before writing to Trustee.
 4. **Decide deployment target.** Open question.
    - Separate cluster (highest isolation) — operationally heaviest.
    - Separate cloud account on the same K8s control plane —
@@ -110,7 +121,8 @@ target remain unresolved.
   vectors.
 - Signing service deployed at a stable URL listed in
   `platform-release.json`.
-- Verify pubkey published.
+- Verify pubkey published for transitional platform-signed artifacts, plus a
+  documented customer/CI workflow for descriptor-key-signed artifacts.
 - Runbook for owner-pubkey bootstrap + rotation.
 
 **Open questions for the platform leads:**
@@ -397,12 +409,12 @@ storage-level CAS, and the upstream-vs-fork decision for Trustee.
 
 ## Execution status
 
-Last updated: 2026-04-29 by Codex external-track implementation pass, live Kata SNP validation, cap-test01 signed-policy cutover, legacy namespace cleanup, GHCR signed-image promotion, platform-release generator work, signing-service GHCR promotion, and Kata 3.28.0 genpolicy execution.
+Last updated: 2026-04-30 by Codex customer/CI policy-artifact implementation pass, CAP no-platform-signer contract cleanup, and Trustee trust-anchor hardening.
 
 | Track | Owner | State | Started | ETA | Notes |
 |---|---|---|---|---|---|
-| 1 — Signing service | platform-eng | V1 + CAP-TEST01 SERVICE | 2026-04-27 | durable deployment TBD | `../policy-templates/signing-service` now has CE-v1 canonical bytes, descriptor/keyring verification, durable SQLite owner DB, `/agent-policy`, `/sign`, signed metadata, artifact verification, real Kata 3.28.0 genpolicy execution, receipt-gated Rego rules, deterministic vector, docs, CI, tests, clippy, workflow-dispatch support, and a retrying GHCR publish/sign workflow. The latest signed image digest is `sha256:025f6c4449a86952232b8f4e1a7d9be8cab6af98cc4cd802b395edb1894422af`, and anonymous pulls work after the GHCR package was made public. CAP verifies returned policy artifacts against `SIGNING_SERVICE_PUBKEY_HEX`, writes the signed artifact to Trustee, and renders `cc_init_data` from the signed artifact's generated agent policy. cap-test01 points to the off-cluster validation service at `http://10.0.0.2:18080`; that Docker service runs the signed GHCR digest with the same signing-key env and owner DB mount. A live `/agent-policy` smoke against a known public image returned agent-policy SHA-256 `15c77ae11a0a71079355a2f9085f7f20368bce6ee1642b678fe7603077e11b50`, confirming generated policy output exists before deploy signing. CAP rejects unsigned deploys and unlock-mode redeploys whenever signed-policy/signing-service infrastructure is configured, and the CLI sends customer-signed descriptor/keyring blobs for digest-pinned deploys plus auto-unlock mode transitions. CAP API consumes the same signed development platform-release anchors in signed-policy mode. cap-test01 CAP API is live on `ghcr.io/enclava-ai/enclava-api@sha256:abecfc55316e908aeb41d64ca7a9ebd7dc81ccd46bf69e0ad90528394a6d17d2`, and its `ENCLAVA_INIT_IMAGE` env points to `ghcr.io/enclava-ai/enclava-init@sha256:f7510ec7d8c7d6f595caad6e03a59f3280a5b291dbad39e0c64393b4715e27b3`. The active ops overlay pins these refs in commit `643fa98`; `policy-signing-service.yaml` exists but is not included in the active kustomization because in-cluster deployment would move key custody into the cluster trust boundary. Remaining: durable key custody or customer/CI-signed policy artifact replacement, deployment target, production release publishing, and production release-root custody. |
-| 2 — Trustee patches | platform-eng / Trustee maintainer | CAP-TEST01 LIVE VALIDATED | 2026-04-27 | upstream TBD | `../trustee` now has SNP `init_data_hash`, signed-policy write/evaluation enforcement, workload-attested policy body read, receipt/body policy inputs, required `If-None-Match`/`If-Match` preconditions, insert-if-absent storage writes, and attestation verify callback. cap-test01 runs the patched GHCR KBS image with signed-policy enforcement enabled, a signed CAP-managed `resource-policy` artifact, and KBS probes. Tenant Flux/GitOps has been retired on cap-test01; CAP is configured with Trustee policy/body/artifact URLs and `TRUSTEE_POLICY_READ_AVAILABLE=true`. `../attestation-proxy` now binds receipt pubkey hash into REPORT_DATA, exposes external attested TLS on 8443 while preserving internal HTTP 8081, and publishes/signs its GHCR image from the repo workflow. `key-value-storage` tests pass locally; KBS/verifier focused tests are blocked in this workstation by missing Intel DCAP headers (`sgx_dcap_quoteverify.h`). Remaining: upstream-vs-fork decision, legacy-policy fate decisions, and per-resource version/ETag CAS. |
+| 1 — Signing service / customer artifact generation | platform-eng | V1 + CUSTOMER PATH IMPLEMENTED | 2026-04-27 | release workflow TBD | `../policy-templates/signing-service` now has CE-v1 canonical bytes, descriptor/keyring verification, durable SQLite owner DB, `/agent-policy`, `/sign`, signed metadata, artifact verification, real Kata 3.28.0 genpolicy execution, receipt-gated Rego rules, deterministic vector, docs, CI, tests, clippy, workflow-dispatch support, and a retrying GHCR publish/sign workflow. The latest signed image digest is `sha256:025f6c4449a86952232b8f4e1a7d9be8cab6af98cc4cd802b395edb1894422af`, and anonymous pulls work after the GHCR package was made public. New on 2026-04-30: CAP CLI signs `SignedPolicyArtifact` locally with the descriptor key, CAP API accepts `signed_policy_artifact` on deploy and unlock-mode redeploy, verifies descriptor/keyring authority, matches the submitted keyring to CAP's latest org keyring, verifies the artifact signature with `descriptor_signing_pubkey`, verifies KBS Rego and generated-agent-policy hashes, and can run with `REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT=true` to disable platform `/sign` fallback. cap-test01 still has the off-cluster validation service at `http://10.0.0.2:18080` for transitional `/agent-policy` and `/sign` usage. Remaining: publish the customer CI workflow, enable strict mode after image rollout, production platform-release publishing, and production release-root custody. |
+| 2 — Trustee patches | platform-eng / Trustee maintainer | PATCHED, TRUST-ANCHOR HARDENED | 2026-04-27 | upstream TBD | `../trustee` now has SNP `init_data_hash`, signed-policy write/evaluation enforcement, workload-attested policy body read, receipt/body policy inputs, required `If-None-Match`/`If-Match` preconditions, insert-if-absent storage writes, and attestation verify callback. The 2026-04-30 review found and fixed a self-authentication risk: Trustee no longer accepts `metadata.descriptor_signing_pubkey` by itself. Descriptor-key-signed artifacts are accepted only when that public key is independently configured in `trusted_descriptor_public_keys`; otherwise Trustee requires the configured platform `signed_policy_public_key`. cap-test01 runs the patched GHCR KBS image with signed-policy enforcement enabled, a signed CAP-managed `resource-policy` artifact, and KBS probes. Tenant Flux/GitOps has been retired on cap-test01; CAP is configured with Trustee policy/body/artifact URLs and `TRUSTEE_POLICY_READ_AVAILABLE=true`. `../attestation-proxy` now binds receipt pubkey hash into REPORT_DATA, exposes external attested TLS on 8443 while preserving internal HTTP 8081, and publishes/signs its GHCR image from the repo workflow. `key-value-storage` tests pass locally; KBS/verifier focused tests are blocked in this workstation by missing Intel DCAP headers (`sgx_dcap_quoteverify.h`). Remaining: upstream-vs-fork decision, legacy-policy fate decisions, per-resource version/ETag CAS, and production policy for how customer descriptor keys become Trustee trust anchors without CAP self-authentication. |
 | 3 — Kata SNP LUKS handoff | infra / CAP | LIVE VALIDATED | 2026-04-27 | monitor per Kata bump | `../enclava-infra/ansible` now renders the actual Kata config paths, repairs shim aliases, removes stale `kernel_modules`, rejects future module overrides, and adds preflight/recover/validate playbooks. Syntax checks pass, host preflight passes on `worker-1`, and `runbooks/validate-kata-dm-crypt.yml` passes live. Verified contract: workload container starts first and waits, mounter sidecar opens/mounts LUKS, marks ready, and workload sees `/state` from `/dev/mapper/cap-smoke`. |
 | 4 — Production audit | operator on-call | COMPLETED — FATE DECISIONS BLOCK FOR BROADER PROD | 2026-04-27 | fate decisions required | Ran via `ssh control1.encl`. Artifacts in `runbooks/audits/trustee-policy-audit-20260427T194217Z/`. The pre-cutover live ConfigMap and KBS-loaded policy matched except trailing newline; CAP DB keys matched CAP-managed Rego keys. cap-test01 now uses a signed CAP-managed policy artifact, so the legacy/operator policy is no longer live there. Fate decisions remain for 1,156 lines of legacy/operator-owned policy before durable template rollout. KBS admin metadata endpoint could not be queried because KBS admin is `DenyAll` (401). |
 | 5 — Tenant TLS-ALPN cutover | platform-eng / CAP | CAP-TEST01 SIGNED GHCR ROLLOUT | 2026-04-28 | production DNS/platform-release TBD | `../caddy-ingress` now builds without DNS-provider plugins, smoke-tests absence of the Cloudflare module, publishes to GHCR, and signs the pushed digest through GitHub Actions OIDC. CAP-rendered tenant manifests no longer mount tenant Cloudflare tokens, render TLS-ALPN-only Caddyfiles, keep Caddy loopback proxying on HTTP 8081, and expose the public attestation Service port 8081 to attestation-proxy targetPort 8443. The legacy `flowforge-1` static overlay was removed and stale tenant/CAP namespaces were deleted, so no old tenant pod remains live; the tenant Flux source/Kustomization/deploy key are now removed from the cluster. cap-test01 now uses repo-owned digest-pinned GHCR images for CAP/API and sidecars, with sidecar cosign verification pinned to the repo workflow identities. CAP has `runbooks/ct-monitoring.sh` and a signed development platform-release artifact for the cap-test01 sidecar/template/genpolicy anchors; CAP API consumes the same release anchors in signed-policy mode. Remaining: publish CAA records, reconcile future CAP-generated tenants, schedule CT alerting, and productionize platform-release signing-root custody. |

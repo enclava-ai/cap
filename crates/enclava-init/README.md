@@ -66,9 +66,12 @@ configured. The generated ConfigMap also includes `cc-init-data.toml`, and
 `enclava-init` checks its SHA-256 against the customer-signed descriptor while
 CAP's workload artifact endpoint checks the same descriptor hash against
 Trustee-verified attestation claims.
-For v1 artifacts, `platform-trustee-policy-pubkey-hex` and
-`signing-service-pubkey-hex` must be the same Ed25519 public key; mismatches
-are treated as configuration errors.
+
+For customer/CI-signed artifacts, `enclava-init` verifies the policy artifact
+with the descriptor signing key after proving the descriptor and keyring
+membership chain. `platform-trustee-policy-pubkey-hex` and
+`signing-service-pubkey-hex` are optional compatibility fallback keys for
+legacy platform-signed artifacts.
 
 Until Phase 3's Trustee patches deploy, the flag defaults to false and the
 binary releases seeds with a loud `tracing::error!` saying verification was

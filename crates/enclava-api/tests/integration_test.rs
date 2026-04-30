@@ -61,6 +61,7 @@ async fn setup_test_state() -> (AppState, PgPool) {
         kbs_policy: None,
         trustee_attestation_verify_url: None,
         signing_service: None,
+        require_customer_signed_policy_artifact: false,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
     };
 

@@ -105,6 +105,7 @@ fn deploy_request_serializes_signed_artifact_blobs() {
         image: Some("registry.example.com/acme/web@sha256:abc".to_string()),
         customer_descriptor_blob: Some(r#"{"descriptor":{}}"#.to_string()),
         org_keyring_blob: Some(r#"{"keyring":{}}"#.to_string()),
+        signed_policy_artifact: Some(r#"{"metadata":{}}"#.to_string()),
     };
     let value = serde_json::to_value(&req).unwrap();
     assert_eq!(
@@ -114,6 +115,10 @@ fn deploy_request_serializes_signed_artifact_blobs() {
     assert_eq!(
         value["org_keyring_blob"],
         serde_json::json!(r#"{"keyring":{}}"#)
+    );
+    assert_eq!(
+        value["signed_policy_artifact"],
+        serde_json::json!(r#"{"metadata":{}}"#)
     );
 }
 
@@ -125,6 +130,7 @@ fn unlock_mode_transition_request_contains_only_mode() {
         transition_attestation: None,
         customer_descriptor_blob: None,
         org_keyring_blob: None,
+        signed_policy_artifact: None,
     };
     let v: serde_json::Value = serde_json::to_value(&req).unwrap();
     assert_eq!(v, serde_json::json!({ "mode": "auto-unlock" }));

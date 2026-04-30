@@ -250,29 +250,14 @@ fn load_attestation_config(
         platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
     let platform_trustee_policy_pubkey_hex = load_pubkey_hex_value(
         "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
-        release_env_value(
-            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
-            release_pubkey,
-            trustee_policy_read_available,
-        )?,
-        trustee_policy_read_available,
+        release_env_value("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", release_pubkey, false)?,
+        false,
     )?;
     let signing_service_pubkey_hex = load_pubkey_hex_value(
         "SIGNING_SERVICE_PUBKEY_HEX",
-        release_env_value(
-            "SIGNING_SERVICE_PUBKEY_HEX",
-            release_pubkey,
-            trustee_policy_read_available,
-        )?,
-        trustee_policy_read_available,
+        release_env_value("SIGNING_SERVICE_PUBKEY_HEX", release_pubkey, false)?,
+        false,
     )?;
-    if trustee_policy_read_available
-        && platform_trustee_policy_pubkey_hex != signing_service_pubkey_hex
-    {
-        anyhow::bail!(
-            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX and SIGNING_SERVICE_PUBKEY_HEX must match for v1 signed policy artifacts"
-        );
-    }
 
     Ok(AttestationConfig {
         proxy_image: parse_image_ref("ATTESTATION_PROXY_IMAGE", &proxy_image_ref)?,
@@ -472,6 +457,8 @@ async fn main() {
         )
         .expect("failed to configure platform signing service client")
     });
+    let require_customer_signed_policy_artifact =
+        env_flag("REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT");
     let max_concurrent_applies = std::env::var("CAP_MAX_CONCURRENT_APPLIES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -508,6 +495,7 @@ async fn main() {
         kbs_policy,
         trustee_attestation_verify_url,
         signing_service,
+        require_customer_signed_policy_artifact,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
     };
 

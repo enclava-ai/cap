@@ -7,4 +7,5 @@ pub mod descriptor;
 pub mod keyring;
 pub mod keys;
 pub mod platform_release;
+pub mod policy_artifact;
 pub mod tee_client;

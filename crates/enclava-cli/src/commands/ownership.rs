@@ -274,8 +274,9 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                         mode: "auto-unlock".to_string(),
                         transition_receipt: Some(transition_receipt),
                         transition_attestation: Some(transition_attestation),
-                        customer_descriptor_blob: Some(signed_blobs.0),
-                        org_keyring_blob: Some(signed_blobs.1),
+                        customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
+                        org_keyring_blob: Some(signed_blobs.org_keyring_blob),
+                        signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
                     },
                 )
                 .await?;
@@ -336,8 +337,9 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                         mode: "password".to_string(),
                         transition_receipt: Some(transition_receipt),
                         transition_attestation: Some(transition_attestation),
-                        customer_descriptor_blob: Some(signed_blobs.0),
-                        org_keyring_blob: Some(signed_blobs.1),
+                        customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
+                        org_keyring_blob: Some(signed_blobs.org_keyring_blob),
+                        signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
                     },
                 )
                 .await?;

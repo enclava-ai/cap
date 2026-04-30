@@ -331,9 +331,15 @@ pub(crate) struct SignedDeployBlobParams<'a> {
     pub target_unlock_mode: Option<&'a str>,
 }
 
+pub(crate) struct SignedDeployBlobs {
+    pub customer_descriptor_blob: String,
+    pub org_keyring_blob: String,
+    pub signed_policy_artifact: String,
+}
+
 pub(crate) async fn build_signed_deploy_blobs(
     params: SignedDeployBlobParams<'_>,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
+) -> Result<SignedDeployBlobs, Box<dyn std::error::Error>> {
     let SignedDeployBlobParams {
         api,
         paths,
@@ -496,7 +502,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             image: image_ref.clone(),
             release: &release,
             workload_artifact_binding,
-            generated_agent_policy,
+            generated_agent_policy: generated_agent_policy.clone(),
             unlock_mode: deploy_unlock_mode,
             tenant_id,
             tenant_instance_identity_hash: identity_hash,
@@ -508,17 +514,24 @@ pub(crate) async fn build_signed_deploy_blobs(
     descriptor.expected_cc_init_data_hash = cc_init_data_hash;
     let rendered_policy = render_trustee_policy(&release.policy_template_text, &descriptor)?;
     descriptor.expected_kbs_policy_hash = Sha256::digest(rendered_policy.as_bytes()).into();
-
-    let descriptor_envelope = enclava_cli::descriptor::sign(
+    let signing_key_id = format!("cli:{}", deployer_key.user_id);
+    let signed_policy_artifact = enclava_cli::policy_artifact::sign_policy_artifact(
+        &descriptor,
         &deployer_key,
-        descriptor,
-        format!("cli:{}", deployer_key.user_id),
+        signing_key_id.clone(),
+        rendered_policy,
+        &generated_agent_policy,
+        Utc::now(),
     );
 
-    Ok((
-        serde_json::to_string(&descriptor_envelope)?,
-        serde_json::to_string(&keyring_envelope)?,
-    ))
+    let descriptor_envelope =
+        enclava_cli::descriptor::sign(&deployer_key, descriptor, signing_key_id);
+
+    Ok(SignedDeployBlobs {
+        customer_descriptor_blob: serde_json::to_string(&descriptor_envelope)?,
+        org_keyring_blob: serde_json::to_string(&keyring_envelope)?,
+        signed_policy_artifact: serde_json::to_string(&signed_policy_artifact)?,
+    })
 }
 
 #[derive(Args)]
@@ -671,8 +684,9 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let req = DeployRequest {
         image: Some(args.image.clone()),
-        customer_descriptor_blob: Some(signed_blobs.0),
-        org_keyring_blob: Some(signed_blobs.1),
+        customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
+        org_keyring_blob: Some(signed_blobs.org_keyring_blob),
+        signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
     };
 
     // Phase 1: Deploy

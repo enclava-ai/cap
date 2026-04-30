@@ -24,6 +24,8 @@ use crate::models::App;
 pub enum SigningServiceError {
     #[error("customer_descriptor_blob and org_keyring_blob must be provided together")]
     PartialBlobs,
+    #[error("signed_policy_artifact requires customer_descriptor_blob and org_keyring_blob")]
+    ArtifactWithoutBlobs,
     #[error("invalid signing service URL: {0}")]
     InvalidUrl(String),
     #[error("blob decode error: {0}")]
@@ -147,6 +149,7 @@ pub struct DeploymentSigningArtifacts {
     pub descriptor_core_hash: [u8; 32],
     pub org_keyring: OrgKeyring,
     pub org_keyring_signature: [u8; 64],
+    pub org_keyring_signing_pubkey: [u8; 32],
     pub org_keyring_fingerprint: [u8; 32],
 }
 
@@ -295,6 +298,11 @@ impl DeploymentSigningArtifacts {
         if artifact_rego_hash != rego_hash {
             return Err(SigningServiceError::Mismatch("artifact.rego_sha256".into()));
         }
+        if self.descriptor.expected_kbs_policy_hash != rego_hash {
+            return Err(SigningServiceError::Mismatch(
+                "expected_kbs_policy_hash".into(),
+            ));
+        }
         let agent_policy_hash: [u8; 32] =
             Sha256::digest(artifact.agent_policy_text.as_bytes()).into();
         let artifact_agent_policy_hash =
@@ -311,6 +319,185 @@ impl DeploymentSigningArtifacts {
         }
 
         verify_signed_policy_artifact(artifact, &rego_hash, signing_service_pubkey_hex)?;
+        Ok(())
+    }
+
+    pub async fn validate_customer_authority(
+        &self,
+        pool: &PgPool,
+    ) -> Result<(), SigningServiceError> {
+        self.verify_keyring_signature()?;
+        self.verify_descriptor_signature()?;
+        if !self.descriptor_signing_key_is_authorized() {
+            return Err(SigningServiceError::Mismatch(
+                "descriptor_signing_pubkey not authorized by org_keyring".into(),
+            ));
+        }
+        self.verify_matches_latest_cap_keyring(pool).await?;
+        Ok(())
+    }
+
+    pub fn validate_customer_signed_artifact(
+        &self,
+        artifact: &SignedPolicyArtifact,
+    ) -> Result<(), SigningServiceError> {
+        self.validate_signed_artifact_common(artifact)?;
+        let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
+        verify_signed_policy_artifact_with_pubkey(
+            artifact,
+            &rego_hash,
+            &self.descriptor_signing_pubkey,
+            "artifact.verify_pubkey_b64",
+        )?;
+        Ok(())
+    }
+
+    fn validate_signed_artifact_common(
+        &self,
+        artifact: &SignedPolicyArtifact,
+    ) -> Result<(), SigningServiceError> {
+        let metadata = &artifact.metadata;
+        if metadata.app_id != self.descriptor.app_id.to_string() {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.app_id".into(),
+            ));
+        }
+        if metadata.deploy_id != self.descriptor.deploy_id.to_string() {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.deploy_id".into(),
+            ));
+        }
+        if metadata.descriptor_core_hash != hex::encode(self.descriptor_core_hash) {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.descriptor_core_hash".into(),
+            ));
+        }
+        if metadata.descriptor_signing_pubkey != hex::encode(self.descriptor_signing_pubkey) {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.descriptor_signing_pubkey".into(),
+            ));
+        }
+        if metadata.platform_release_version != self.descriptor.platform_release_version {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.platform_release_version".into(),
+            ));
+        }
+        if metadata.policy_template_id != self.descriptor.policy_template_id {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.policy_template_id".into(),
+            ));
+        }
+        if metadata.policy_template_sha256 != hex::encode(self.descriptor.policy_template_sha256) {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.policy_template_sha256".into(),
+            ));
+        }
+        if metadata.agent_policy_sha256 != artifact.agent_policy_sha256 {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.metadata.agent_policy_sha256".into(),
+            ));
+        }
+
+        let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
+        let artifact_rego_hash = decode_hex32("rego_sha256", &artifact.rego_sha256)?;
+        if artifact_rego_hash != rego_hash {
+            return Err(SigningServiceError::Mismatch("artifact.rego_sha256".into()));
+        }
+        if self.descriptor.expected_kbs_policy_hash != rego_hash {
+            return Err(SigningServiceError::Mismatch(
+                "expected_kbs_policy_hash".into(),
+            ));
+        }
+        let agent_policy_hash: [u8; 32] =
+            Sha256::digest(artifact.agent_policy_text.as_bytes()).into();
+        let artifact_agent_policy_hash =
+            decode_hex32("agent_policy_sha256", &artifact.agent_policy_sha256)?;
+        if artifact_agent_policy_hash != agent_policy_hash {
+            return Err(SigningServiceError::Mismatch(
+                "artifact.agent_policy_sha256".into(),
+            ));
+        }
+        if self.descriptor.expected_agent_policy_hash != agent_policy_hash {
+            return Err(SigningServiceError::Mismatch(
+                "expected_agent_policy_hash".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_keyring_signature(&self) -> Result<(), SigningServiceError> {
+        if !self.org_keyring.members.iter().any(|member| {
+            member.pubkey == self.org_keyring_signing_pubkey
+                && matches!(member.role, KeyringRole::Owner)
+        }) {
+            return Err(SigningServiceError::Mismatch(
+                "org_keyring.signing_pubkey owner member".into(),
+            ));
+        }
+        let verifying_key = VerifyingKey::from_bytes(&self.org_keyring_signing_pubkey)
+            .map_err(|_| SigningServiceError::Mismatch("org_keyring.signing_pubkey".into()))?;
+        let signature = Signature::from_bytes(&self.org_keyring_signature);
+        verifying_key
+            .verify(&canonical_keyring_bytes(&self.org_keyring), &signature)
+            .map_err(|_| SigningServiceError::InvalidSignature)
+    }
+
+    fn verify_descriptor_signature(&self) -> Result<(), SigningServiceError> {
+        let verifying_key = VerifyingKey::from_bytes(&self.descriptor_signing_pubkey)
+            .map_err(|_| SigningServiceError::Mismatch("descriptor.signing_pubkey".into()))?;
+        let signature = Signature::from_bytes(&self.descriptor_signature);
+        verifying_key
+            .verify(
+                &enclava_common::descriptor::descriptor_canonical_bytes(&self.descriptor),
+                &signature,
+            )
+            .map_err(|_| SigningServiceError::InvalidSignature)
+    }
+
+    fn descriptor_signing_key_is_authorized(&self) -> bool {
+        self.org_keyring
+            .members
+            .iter()
+            .any(|member| member.pubkey == self.descriptor_signing_pubkey && member.allows_deploy())
+    }
+
+    async fn verify_matches_latest_cap_keyring(
+        &self,
+        pool: &PgPool,
+    ) -> Result<(), SigningServiceError> {
+        let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT ok.keyring_payload, ok.signature, usk.pubkey
+             FROM org_keyrings ok
+             JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+             WHERE ok.org_id = $1
+             ORDER BY ok.version DESC
+             LIMIT 1",
+        )
+        .bind(self.org_keyring.org_id)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some((payload, signature, signing_pubkey)) = row else {
+            return Err(SigningServiceError::Mismatch(
+                "org_keyring not registered with CAP".into(),
+            ));
+        };
+        let stored: OrgKeyring = serde_json::from_slice(&payload)?;
+        if keyring_fingerprint(&stored) != self.org_keyring_fingerprint {
+            return Err(SigningServiceError::Mismatch(
+                "org_keyring does not match latest CAP keyring".into(),
+            ));
+        }
+        if signature.as_slice() != self.org_keyring_signature.as_slice() {
+            return Err(SigningServiceError::Mismatch(
+                "org_keyring.signature does not match latest CAP keyring".into(),
+            ));
+        }
+        if signing_pubkey.as_slice() != self.org_keyring_signing_pubkey.as_slice() {
+            return Err(SigningServiceError::Mismatch(
+                "org_keyring.signing_pubkey does not match latest CAP keyring".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -344,15 +531,27 @@ fn verify_signed_policy_artifact(
     signing_service_pubkey_hex: &str,
 ) -> Result<(), SigningServiceError> {
     let expected_pubkey = decode_hex32("signing_service_pubkey_hex", signing_service_pubkey_hex)?;
+    verify_signed_policy_artifact_with_pubkey(
+        artifact,
+        rego_hash,
+        &expected_pubkey,
+        "artifact.verify_pubkey_b64",
+    )
+}
+
+fn verify_signed_policy_artifact_with_pubkey(
+    artifact: &SignedPolicyArtifact,
+    rego_hash: &[u8; 32],
+    expected_pubkey: &[u8; 32],
+    pubkey_field: &'static str,
+) -> Result<(), SigningServiceError> {
     let diagnostic_pubkey = decode_pubkey_b64("verify_pubkey_b64", &artifact.verify_pubkey_b64)?;
-    if diagnostic_pubkey != expected_pubkey {
-        return Err(SigningServiceError::Mismatch(
-            "artifact.verify_pubkey_b64".into(),
-        ));
+    if &diagnostic_pubkey != expected_pubkey {
+        return Err(SigningServiceError::Mismatch(pubkey_field.into()));
     }
 
-    let verifying_key = VerifyingKey::from_bytes(&expected_pubkey)
-        .map_err(|_| SigningServiceError::Mismatch("signing_service_pubkey_hex".into()))?;
+    let verifying_key = VerifyingKey::from_bytes(expected_pubkey)
+        .map_err(|_| SigningServiceError::Mismatch(pubkey_field.into()))?;
     let signature = Signature::from_bytes(&decode_signature(&artifact.signature)?);
     let signing_input = policy_artifact_signing_input(&artifact.metadata, rego_hash)?;
     verifying_key
@@ -447,8 +646,17 @@ pub fn decode_optional_blobs(
         descriptor_core_hash,
         org_keyring: keyring_envelope.keyring,
         org_keyring_signature: keyring_envelope.signature,
+        org_keyring_signing_pubkey: keyring_envelope.signing_pubkey,
         org_keyring_fingerprint,
     }))
+}
+
+pub fn decode_optional_policy_artifact(
+    signed_policy_artifact: Option<String>,
+) -> Result<Option<SignedPolicyArtifact>, SigningServiceError> {
+    signed_policy_artifact
+        .map(|artifact| decode_json_blob("signed_policy_artifact", &artifact))
+        .transpose()
 }
 
 pub async fn persist_workload_artifacts(
@@ -546,6 +754,15 @@ impl KeyringRole {
             Self::Admin => "admin",
             Self::Deployer => "deployer",
         }
+    }
+}
+
+impl KeyringMember {
+    fn allows_deploy(&self) -> bool {
+        matches!(
+            self.role,
+            KeyringRole::Owner | KeyringRole::Admin | KeyringRole::Deployer
+        )
     }
 }
 
@@ -750,7 +967,8 @@ mod tests {
             )
             .into(),
             expected_cc_init_data_hash: [5; 32],
-            expected_kbs_policy_hash: [6; 32],
+            expected_kbs_policy_hash: Sha256::digest(b"package policy\n\ndefault allow := false\n")
+                .into(),
         }
     }
 
@@ -770,6 +988,7 @@ mod tests {
                 updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
             },
             org_keyring_signature: [0xcc; 64],
+            org_keyring_signing_pubkey: [0xdd; 32],
             org_keyring_fingerprint: [0xdd; 32],
         }
     }
@@ -899,6 +1118,48 @@ mod tests {
         artifacts
             .validate_signed_artifact(&artifact, &configured_pubkey_hex)
             .unwrap();
+    }
+
+    #[test]
+    fn validates_customer_signed_policy_artifact_with_descriptor_key() {
+        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let mut artifacts = signing_artifacts(descriptor());
+        artifacts.descriptor_signing_pubkey = signing_key.verifying_key().to_bytes();
+        let artifact = signed_policy_artifact(&artifacts, &signing_key);
+
+        artifacts
+            .validate_customer_signed_artifact(&artifact)
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_customer_signed_policy_artifact_from_other_key() {
+        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let other_key = SigningKey::from_bytes(&[0x44; 32]);
+        let mut artifacts = signing_artifacts(descriptor());
+        artifacts.descriptor_signing_pubkey = signing_key.verifying_key().to_bytes();
+        let artifact = signed_policy_artifact(&artifacts, &other_key);
+
+        let err = artifacts
+            .validate_customer_signed_artifact(&artifact)
+            .unwrap_err();
+        assert!(matches!(err, SigningServiceError::Mismatch(_)));
+    }
+
+    #[test]
+    fn rejects_signed_policy_artifact_with_wrong_expected_kbs_hash() {
+        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let mut artifacts = signing_artifacts(descriptor());
+        artifacts.descriptor.expected_kbs_policy_hash = [0xee; 32];
+        artifacts.descriptor_signing_pubkey = signing_key.verifying_key().to_bytes();
+        let artifact = signed_policy_artifact(&artifacts, &signing_key);
+
+        let err = artifacts
+            .validate_customer_signed_artifact(&artifact)
+            .unwrap_err();
+        assert!(
+            matches!(err, SigningServiceError::Mismatch(field) if field == "expected_kbs_policy_hash")
+        );
     }
 
     #[test]

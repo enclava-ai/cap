@@ -108,6 +108,8 @@ pub struct DeployRequest {
     pub customer_descriptor_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_keyring_blob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_policy_artifact: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +167,8 @@ pub struct UpdateUnlockModeRequest {
     pub customer_descriptor_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_keyring_blob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_policy_artifact: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

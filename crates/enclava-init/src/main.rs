@@ -342,20 +342,19 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
         .cc_init_data_path
         .as_deref()
         .ok_or_else(|| anyhow!("verification requires cc_init_data_path"))?;
-    let signer_pk_hex = cfg
-        .platform_trustee_policy_pubkey_hex
-        .as_deref()
-        .ok_or_else(|| anyhow!("verification requires platform_trustee_policy_pubkey_hex"))?;
-    let signing_pk_hex = cfg
-        .signing_service_pubkey_hex
-        .as_deref()
-        .ok_or_else(|| anyhow!("verification requires signing_service_pubkey_hex"))?;
-
     let cc_bytes =
         std::fs::read(cc_path).with_context(|| format!("reading cc_init_data from {cc_path}"))?;
     let cc_claims = parse_cc_init_data_claims(&cc_bytes)?;
-    let signer_pk = parse_pubkey(signer_pk_hex)?;
-    let signing_pk = parse_pubkey(signing_pk_hex)?;
+    let signer_pk = cfg
+        .platform_trustee_policy_pubkey_hex
+        .as_deref()
+        .map(parse_pubkey)
+        .transpose()?;
+    let signing_pk = cfg
+        .signing_service_pubkey_hex
+        .as_deref()
+        .map(parse_pubkey)
+        .transpose()?;
 
     let token = trustee_verify::resolve_kbs_attestation_token(
         std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
@@ -375,8 +374,8 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
         artifacts: &bundle,
         cc_init_data_claims: &cc_claims,
         local_cc_init_data_toml: &cc_bytes,
-        platform_trustee_policy_pubkey: &signer_pk,
-        signing_service_pubkey: &signing_pk,
+        platform_trustee_policy_pubkey: signer_pk.as_ref(),
+        signing_service_pubkey: signing_pk.as_ref(),
     };
     trustee_verify::verify_chain_or_skip(Some(&inputs)).map_err(Into::into)
 }
