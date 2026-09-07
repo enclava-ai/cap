@@ -867,6 +867,7 @@ fn default_log_private_key_path_sanitizes_components() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn generated_log_key_registration_keeps_private_material_local() {
     use base64::Engine as _;
@@ -1084,6 +1085,7 @@ async fn generated_log_key_rejects_mismatched_registration_response() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn generated_log_key_retry_rejects_loose_private_key_permissions() {
     use enclava_common::log_encryption::generate_log_keypair;
