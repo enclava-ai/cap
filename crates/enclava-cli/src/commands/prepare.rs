@@ -26,7 +26,11 @@ impl PrepareReport {
 type ConfirmResult = Result<bool, Box<dyn std::error::Error>>;
 
 fn relative_display(cwd: &Path, path: &Path) -> String {
-    path.strip_prefix(cwd).unwrap_or(path).display().to_string()
+    path.strip_prefix(cwd)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+        .replace('\\', "/")
 }
 
 fn existing_app_name(toml_path: &Path, fallback: &str) -> String {
