@@ -49,6 +49,10 @@ pub enum KeysError {
     InvalidBackup(String),
     #[error("key file `{0}` is world-readable; refusing to load (expected mode 0600)")]
     InsecurePermissions(PathBuf),
+    #[error(
+        "could not verify permissions of key file `{0}`; if the path contains non-ASCII characters, set ENCLAVA_STATE_DIR to an ASCII-only path or enable the Windows UTF-8 system locale"
+    )]
+    AclUnverifiable(PathBuf),
     #[error("keypair storage permissions are not supported on this platform")]
     UnsupportedPlatform,
 }
@@ -234,24 +238,38 @@ fn current_user() -> std::io::Result<String> {
 /// first ACE on the same line**; additional ACEs follow on indented lines.
 /// The trailing summary line has no parenthesised rights and is ignored.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn is_owner_only_icacls(text: &str, path_echo: &str, user: &str) -> bool {
+fn is_owner_only_icacls(text: &str, path_echo: &str, user: &str) -> Option<bool> {
     let user_prefix = format!("{user}:(");
     let mut ace_lines = 0;
-    let all_owner = text
-        .lines()
-        .map(|line| {
-            line.strip_prefix(path_echo)
-                .map(str::trim_start)
-                .unwrap_or(line.trim_start())
-        })
-        .filter(|line| line.contains('('))
-        .all(|line| {
-            ace_lines += 1;
-            line.starts_with(&user_prefix)
-        });
-    // Fail closed: output we could not parse into at least one ACE line
-    // (e.g. localized or unexpected icacls output) must not pass.
-    all_owner && ace_lines > 0
+    let mut all_owner = true;
+    let mut echo_matched = false;
+    for line in text.lines() {
+        let line = match line.strip_prefix(path_echo) {
+            Some(rest) => {
+                echo_matched = true;
+                rest.trim_start()
+            }
+            None => line.trim_start(),
+        };
+        if !line.contains('(') {
+            continue;
+        }
+        ace_lines += 1;
+        if !line.starts_with(&user_prefix) {
+            all_owner = false;
+        }
+    }
+    if ace_lines == 0 {
+        // No recognizable ACE lines (e.g. localized summary text only).
+        return None;
+    }
+    // If the echoed path never matched, the first line still contains the
+    // path + first ACE and we cannot attribute its ACEs safely (e.g. a
+    // non-ASCII path emitted through a legacy console code page).
+    if !echo_matched {
+        return None;
+    }
+    Some(all_owner)
 }
 
 /// Windows counterpart of the unix mode-0600 load-time check: reject key
@@ -271,21 +289,23 @@ pub fn verify_owner_only_acl(path: &Path) -> Result<(), KeysError> {
         .into());
     }
     let user = current_user()?;
-    if !is_owner_only_icacls(
+    match is_owner_only_icacls(
         &String::from_utf8_lossy(&out.stdout),
         &path.to_string_lossy(),
         &user,
     ) {
-        return Err(KeysError::InsecurePermissions(path.to_path_buf()));
+        Some(true) => Ok(()),
+        Some(false) => Err(KeysError::InsecurePermissions(path.to_path_buf())),
+        None => Err(KeysError::AclUnverifiable(path.to_path_buf())),
     }
-    Ok(())
 }
 
 /// Windows equivalent of chmod 0600/0700: drop inherited ACEs and grant the
 /// current user full control, via the native `icacls` tool.
 // ponytail: shells out to icacls and resolves the account via `whoami`;
-// swap to windows-sys DACL APIs if the subprocess cost or unusual accounts
-// (e.g. profile-remapped SIDs) ever bite.
+// swap to windows-sys DACL APIs if the subprocess cost, unusual accounts
+// (e.g. profile-remapped SIDs), or non-ASCII paths under legacy console
+// code pages ever bite — the API path is encoding-independent.
 #[cfg(windows)]
 fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
     let user = current_user()?;
@@ -813,26 +833,44 @@ mod tests {
             "\n",
             "Successfully processed 1 files; Failed processing 0 files\n",
         );
-        assert!(is_owner_only_icacls(owned, k, "CORP\\alice"));
+        assert_eq!(is_owner_only_icacls(owned, k, "CORP\\alice"), Some(true));
         // Extra ACEs come on indented continuation lines and are rejected.
         let shared = concat!(
             "C:\\k BUILTIN\\Administrators:(F)\n",
             "     CORP\\alice:(F)\n",
             "\nSuccessfully processed 1 files\n",
         );
-        assert!(!is_owner_only_icacls(shared, "C:\\k", "CORP\\alice"));
+        assert_eq!(
+            is_owner_only_icacls(shared, "C:\\k", "CORP\\alice"),
+            Some(false)
+        );
         // Similar account name must not pass as a prefix (CORP\\alice2).
         let lookalike = "C:\\k CORP\\alice2:(F)\n";
-        assert!(!is_owner_only_icacls(lookalike, "C:\\k", "CORP\\alice"));
+        assert_eq!(
+            is_owner_only_icacls(lookalike, "C:\\k", "CORP\\alice"),
+            Some(false)
+        );
         // Inherited ACEs are ordinary ACE lines and are rejected.
         let inherited = "C:\\k CORP\\alice:(F)\n     Everyone:(R)\n";
-        assert!(!is_owner_only_icacls(inherited, "C:\\k", "CORP\\alice"));
+        assert_eq!(
+            is_owner_only_icacls(inherited, "C:\\k", "CORP\\alice"),
+            Some(false)
+        );
         // Unparsable output (no recognizable ACE lines) is rejected, not
         // vacuously accepted.
         let empty = "C:\\k\n";
-        assert!(!is_owner_only_icacls(empty, "C:\\k", "CORP\\alice"));
+        assert_eq!(is_owner_only_icacls(empty, "C:\\k", "CORP\\alice"), None);
         let localized = "C:\\k\n\u{5904}\u{7406}\u{4e86} 1 \u{4e2a}\u{6587}\u{4ef6}\n";
-        assert!(!is_owner_only_icacls(localized, "C:\\k", "CORP\\alice"));
+        assert_eq!(
+            is_owner_only_icacls(localized, "C:\\k", "CORP\\alice"),
+            None
+        );
+        // A mangled path echo (non-ASCII path through a legacy console code
+        // page, lossily decoded) is unverifiable — never accepted, and kept
+        // distinct from a genuinely foreign ACE.
+        let mangled = "C:\\Users\\\u{fffd}\\k.priv CORP\\alice:(F)\n";
+        let echo = "C:\\Users\\\u{4f0a}\u{85e4}\\k.priv";
+        assert_eq!(is_owner_only_icacls(mangled, echo, "CORP\\alice"), None);
     }
 
     // Serialise tests that mutate $HOME (test impacts a shared global).
