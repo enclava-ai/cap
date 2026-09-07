@@ -519,6 +519,9 @@ macro_rules! impl_unavailable {
             pub fn new() -> Result<Self, ErrorCode> {
                 Err(ErrorCode::UnsupportedInstruction)
             }
+            pub unsafe fn new_unchecked() -> Self {
+                $gen(())
+            }
             pub fn try_next_u16(&self) -> Result<u16, ErrorCode> {
                 Err(ErrorCode::UnsupportedInstruction)
             }
@@ -530,6 +533,30 @@ macro_rules! impl_unavailable {
             }
             pub fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), ErrorCode> {
                 Err(ErrorCode::UnsupportedInstruction)
+            }
+        }
+        // Same panic-on-failure contract as the x86 RngCore impl: these
+        // generators always fail on non-x86, so every trait method panics.
+        impl rand_core::RngCore for $gen {
+            fn next_u32(&mut self) -> u32 {
+                match self.try_next_u32() {
+                    Ok(result) => result,
+                    Err(c) => busy_loop_fail(c),
+                }
+            }
+            fn next_u64(&mut self) -> u64 {
+                match self.try_next_u64() {
+                    Ok(result) => result,
+                    Err(c) => busy_loop_fail(c),
+                }
+            }
+            fn fill_bytes(&mut self, dest: &mut [u8]) {
+                if let Err(c) = self.try_fill_bytes(dest) {
+                    busy_loop_fail(c);
+                }
+            }
+            fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+                self.try_fill_bytes(dest).map_err(Into::into)
             }
         }
     };

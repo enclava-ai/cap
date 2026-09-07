@@ -49,7 +49,7 @@ pub enum KeysError {
     InvalidBackup(String),
     #[error("key file `{0}` is world-readable; refusing to load (expected mode 0600)")]
     InsecurePermissions(PathBuf),
-    #[error("Windows is not supported in v1 — keypair storage requires POSIX mode bits")]
+    #[error("keypair storage permissions are not supported on this platform")]
     UnsupportedPlatform,
 }
 
@@ -217,19 +217,82 @@ fn assert_mode_0600(path: &Path) -> Result<(), KeysError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_file_perms_0600(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_dir_perms_0700(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
+}
+
+/// Windows equivalent of chmod 0600/0700: drop inherited ACEs and grant the
+/// current user full control, via the native `icacls` tool.
+// ponytail: shells out to icacls and resolves the account via `whoami`;
+// swap to windows-sys DACL APIs if the subprocess cost or unusual accounts
+// (e.g. profile-remapped SIDs) ever bite.
+#[cfg(windows)]
+fn restrict_acl_to_user(path: &Path, inheritable: bool) -> Result<(), KeysError> {
+    let user = String::from_utf8(std::process::Command::new("whoami").output()?.stdout).map_err(
+        |err| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("whoami: {err}")),
+    )?;
+    let user = user.trim_end();
+    let out = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(icacls_grant(user, inheritable))
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "icacls failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim_end()
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn icacls_grant(user: &str, inheritable: bool) -> String {
+    if inheritable {
+        format!("{user}:(OI)(CI)F")
+    } else {
+        format!("{user}:F")
+    }
+}
+
+#[cfg(windows)]
+fn set_file_perms_0600(path: &Path) -> Result<(), KeysError> {
+    restrict_acl_to_user(path, false)
+}
+
+#[cfg(windows)]
+fn set_dir_perms_0700(path: &Path) -> Result<(), KeysError> {
+    restrict_acl_to_user(path, true)
+}
+
+#[cfg(windows)]
+fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
+    // ACLs are restricted at write time and Windows has no umask-style
+    // permission drift, so there is nothing to re-check at load time.
+    Ok(())
+}
+
+/// Restrict an existing file to the current user (the Windows counterpart of
+/// mode 0600); used by secret-file writers outside this module.
+#[cfg(windows)]
+pub fn restrict_file_to_user(path: &Path) -> Result<(), KeysError> {
+    restrict_acl_to_user(path, false)
 }
 
 /// Generate a fresh keypair and persist it under `~/.enclava/keys/<user_id>.priv`.
@@ -648,6 +711,13 @@ pub struct RegisterPublicKeyRequest {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[cfg(windows)]
+    #[test]
+    fn icacls_grant_marks_inheritance() {
+        assert_eq!(icacls_grant(r"CORP\\alice", true), r"CORP\\alice:(OI)(CI)F");
+        assert_eq!(icacls_grant(r"CORP\\alice", false), r"CORP\\alice:F");
+    }
 
     // Serialise tests that mutate $HOME (test impacts a shared global).
     static HOME_LOCK: Mutex<()> = Mutex::new(());

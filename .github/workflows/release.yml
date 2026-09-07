@@ -58,8 +58,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # Vendored OpenSSL builds with no-asm automatically when nasm is absent.
+      # crt-static: link the MSVC runtime statically so the artifact runs on
+      # machines without the Visual C++ redistributable.
       - name: Build binary
         run: cargo build --release --bin enclava --target x86_64-pc-windows-msvc
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
 
       - name: Package binary
         run: |
@@ -155,6 +159,12 @@ jobs:
 
       - uses: sigstore/cosign-installer@v3.9.2
 
+      - name: Sign checksums
+        run: |
+          cosign sign-blob --yes \
+            --bundle artifacts/SHA256SUMS.txt.sigstore.json \
+            artifacts/SHA256SUMS.txt
+
       - name: Sign independently pinnable web verifier
         run: |
           cosign sign-blob --yes \
@@ -171,4 +181,5 @@ jobs:
             artifacts/enclava-verifier-web/example-policy.json
             artifacts/enclava-verifier-web/*.sigstore.json
             artifacts/SHA256SUMS.txt
+            artifacts/SHA256SUMS.txt.sigstore.json
           generate_release_notes: true

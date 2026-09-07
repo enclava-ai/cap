@@ -1747,6 +1747,13 @@ fn write_private_log_key(path: &Path, key: &str) -> Result<(), Box<dyn std::erro
         .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
     use std::io::Write as _;
     writeln!(file, "{key}")?;
+    #[cfg(windows)]
+    enclava_cli::keys::restrict_file_to_user(path).map_err(|err| {
+        format!(
+            "failed to restrict log private key {}: {err}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 

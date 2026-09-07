@@ -18,26 +18,36 @@ concurrency:
 
 jobs:
   check-cli:
-    name: Check enclava CLI compiles (${{ matrix.os-name }})
+    name: Build enclava CLI (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
-            os-name: windows
+            target: x86_64-pc-windows-msvc
+            crt-static: -C target-feature=+crt-static
           - os: macos-latest
-            os-name: macos
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.crt-static }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check CLI
-        run: cargo check --bin enclava
+      # Full build (not check) so linking and all target triples are exercised
+      # before a tag starts the release workflow. Mirrors the release targets,
+      # including static CRT on Windows.
+      - name: Build CLI
+        run: cargo build --bin enclava --target ${{ matrix.target }}
 
   test:
     name: Test Rust workspace
