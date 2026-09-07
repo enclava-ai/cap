@@ -155,7 +155,9 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum */*.tar.gz > SHA256SUMS.txt
+          # Release assets are flat; record basenames so `sha256sum -c` works
+          # against downloaded files.
+          sha256sum */*.tar.gz | sed -E 's#(^[a-f0-9]+ )[^/]+/#\1#' > SHA256SUMS.txt
 
       - uses: sigstore/cosign-installer@v3.9.2
 

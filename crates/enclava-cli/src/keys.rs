@@ -49,10 +49,6 @@ pub enum KeysError {
     InvalidBackup(String),
     #[error("key file `{0}` is world-readable; refusing to load (expected mode 0600)")]
     InsecurePermissions(PathBuf),
-    #[error(
-        "could not verify permissions of key file `{0}`; if the path contains non-ASCII characters, set ENCLAVA_STATE_DIR to an ASCII-only path or enable the Windows UTF-8 system locale"
-    )]
-    AclUnverifiable(PathBuf),
     #[error("keypair storage permissions are not supported on this platform")]
     UnsupportedPlatform,
 }
@@ -223,83 +219,89 @@ fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
 }
 
-/// Resolve the current domain-qualified account (e.g. `CORP\\alice`) in the
-/// form `icacls` expects.
-#[cfg(windows)]
-fn current_user() -> std::io::Result<String> {
-    let user = String::from_utf8(std::process::Command::new("whoami").output()?.stdout).map_err(
-        |err| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("whoami: {err}")),
-    )?;
-    Ok(user.trim_end().to_string())
-}
-
-/// Parse `icacls <path>` output: owner-only iff every ACE grants access
-/// to `user` and nothing else. The first line echoes the path **with the
-/// first ACE on the same line**; additional ACEs follow on indented lines.
-/// The trailing summary line has no parenthesised rights and is ignored.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn is_owner_only_icacls(text: &str, path_echo: &str, user: &str) -> Option<bool> {
-    // Windows account names are case-insensitive (case-preserving), and
-    // `whoami` and `icacls` may render the same account with different
-    // casing, so compare case-insensitively.
-    let user_prefix = format!("{user}:(").to_lowercase();
-    let mut ace_lines = 0;
-    let mut all_owner = true;
-    let mut echo_matched = false;
-    for line in text.lines() {
-        let line = match line.strip_prefix(path_echo) {
-            Some(rest) => {
-                echo_matched = true;
-                rest.trim_start()
-            }
-            None => line.trim_start(),
-        };
-        if !line.contains('(') {
-            continue;
-        }
-        ace_lines += 1;
-        if !line.to_lowercase().starts_with(&user_prefix) {
-            all_owner = false;
-        }
-    }
-    if ace_lines == 0 {
-        // No recognizable ACE lines (e.g. localized summary text only).
-        return None;
-    }
-    // If the echoed path never matched, the first line still contains the
-    // path + first ACE and we cannot attribute its ACEs safely (e.g. a
-    // non-ASCII path emitted through a legacy console code page).
-    if !echo_matched {
-        return None;
-    }
-    Some(all_owner)
-}
-
-/// Windows counterpart of the unix mode-0600 load-time check: reject key
-/// material whose DACL grants access to anyone but the current user.
+/// Windows counterpart of the unix mode-0600 load-time check: the file's
+/// owner must be the current user (an owner can always rewrite the DACL) and
+/// every DACL ACE must grant exactly the current user. Native SID comparison
+/// throughout — immune to account-name casing and console-codepage encoding.
+/// Fail-closed: absent/null DACLs, foreign ACEs, or a foreign owner all
+/// reject.
 #[cfg(windows)]
 pub fn verify_owner_only_acl(path: &Path) -> Result<(), KeysError> {
-    let out = std::process::Command::new("icacls").arg(path).output()?;
-    if !out.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "icacls failed for {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&out.stderr).trim_end()
-            ),
-        )
-        .into());
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0.cast()) };
+        }
     }
-    let user = current_user()?;
-    match is_owner_only_icacls(
-        &String::from_utf8_lossy(&out.stdout),
-        &path.to_string_lossy(),
-        &user,
-    ) {
-        Some(true) => Ok(()),
-        Some(false) => Err(KeysError::InsecurePermissions(path.to_path_buf())),
-        None => Err(KeysError::AclUnverifiable(path.to_path_buf())),
+
+    let ours = owner_sid()?;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        let mut psid_owner: PSID = std::ptr::null_mut();
+        let mut pdacl: *mut ACL = std::ptr::null_mut();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut psid_owner,
+            std::ptr::null_mut(),
+            &mut pdacl,
+            std::ptr::null_mut(),
+            &mut psd,
+        );
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32).into());
+        }
+        let _sd = SecurityDescriptor(psd);
+
+        let insecure = || KeysError::InsecurePermissions(path.to_path_buf());
+        if psid_owner.is_null() || EqualSid(psid_owner, ours.as_ptr() as *mut _) == 0 {
+            return Err(insecure());
+        }
+        // An absent DACL means default access (everyone); never accept it.
+        if pdacl.is_null() {
+            return Err(insecure());
+        }
+        let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+        if GetAclInformation(
+            pdacl,
+            &mut info as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if info.AceCount == 0 {
+            return Err(insecure());
+        }
+        for i in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(pdacl, i, &mut ace) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
+            if ace.Header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE
+                || EqualSid(
+                    std::ptr::from_ref(&ace.SidStart) as *mut _,
+                    ours.as_ptr() as *mut _,
+                ) == 0
+            {
+                return Err(insecure());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -447,8 +449,14 @@ fn create_file_with_owner_dacl(path: &Path) -> std::io::Result<std::fs::File> {
     if unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // Present (non-null) DACL containing only the owner ACE.
+    // Present (non-null) DACL containing only the owner ACE, marked
+    // SE_DACL_PROTECTED so inheritable parent ACEs (SYSTEM, Administrators,
+    // ...) are NOT merged into the new file's effective DACL.
     if unsafe { SetSecurityDescriptorDacl(sd_ptr, 1, acl.as_ptr().cast(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    use windows_sys::Win32::Security::{SE_DACL_PROTECTED, SetSecurityDescriptorControl};
+    if unsafe { SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
     let sa = SECURITY_ATTRIBUTES {
@@ -475,13 +483,18 @@ fn create_file_with_owner_dacl(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Create a new secret file: owner-only DACL at creation (see
-/// `create_file_with_owner_dacl`), then a paranoid `icacls` re-verification
-/// *before* any secret is written. If descriptor construction were ever
-/// wrong, this fails closed and removes the still-empty file.
+/// `create_file_with_owner_dacl`), then an independent re-read of the
+/// descriptor (`GetNamedSecurityInfo`, a different API family than the
+/// construction path) *before* any secret is written. If descriptor
+/// construction were ever wrong, this fails closed and removes the
+/// still-empty file.
 #[cfg(windows)]
 pub fn create_secret_file(path: &Path) -> std::io::Result<std::fs::File> {
     let file = create_file_with_owner_dacl(path)?;
     if let Err(err) = verify_owner_only_acl(path) {
+        // Drop the unshared handle first, or the deletion hits a sharing
+        // violation and an empty file is left behind.
+        drop(file);
         let _ = fs::remove_file(path);
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -960,61 +973,17 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    #[cfg(windows)]
     #[test]
-    fn owner_only_icacls_parsing() {
-        let k = r"C:\Users\alice\k.priv";
-        // Single owner ACE: printed on the same line as the echoed path.
-        let owned = concat!(
-            "C:\\Users\\alice\\k.priv CORP\\alice:(F)\n",
-            "\n",
-            "Successfully processed 1 files; Failed processing 0 files\n",
-        );
-        assert_eq!(is_owner_only_icacls(owned, k, "CORP\\alice"), Some(true));
-        // Windows renders the same account with different casing in whoami
-        // vs icacls; identities compare case-insensitively.
-        let mixed_case =
-            "C:\\Users\\alice\\k.priv Desktop-Abc12\\Alice:(F)\n\nSuccessfully processed 1 files\n";
-        assert_eq!(
-            is_owner_only_icacls(mixed_case, k, "DESKTOP-abc12\\alice"),
-            Some(true)
-        );
-        // Extra ACEs come on indented continuation lines and are rejected.
-        let shared = concat!(
-            "C:\\k BUILTIN\\Administrators:(F)\n",
-            "     CORP\\alice:(F)\n",
-            "\nSuccessfully processed 1 files\n",
-        );
-        assert_eq!(
-            is_owner_only_icacls(shared, "C:\\k", "CORP\\alice"),
-            Some(false)
-        );
-        // Similar account name must not pass as a prefix (CORP\\alice2).
-        let lookalike = "C:\\k CORP\\alice2:(F)\n";
-        assert_eq!(
-            is_owner_only_icacls(lookalike, "C:\\k", "CORP\\alice"),
-            Some(false)
-        );
-        // Inherited ACEs are ordinary ACE lines and are rejected.
-        let inherited = "C:\\k CORP\\alice:(F)\n     Everyone:(R)\n";
-        assert_eq!(
-            is_owner_only_icacls(inherited, "C:\\k", "CORP\\alice"),
-            Some(false)
-        );
-        // Unparsable output (no recognizable ACE lines) is rejected, not
-        // vacuously accepted.
-        let empty = "C:\\k\n";
-        assert_eq!(is_owner_only_icacls(empty, "C:\\k", "CORP\\alice"), None);
-        let localized = "C:\\k\n\u{5904}\u{7406}\u{4e86} 1 \u{4e2a}\u{6587}\u{4ef6}\n";
-        assert_eq!(
-            is_owner_only_icacls(localized, "C:\\k", "CORP\\alice"),
-            None
-        );
-        // A mangled path echo (non-ASCII path through a legacy console code
-        // page, lossily decoded) is unverifiable — never accepted, and kept
-        // distinct from a genuinely foreign ACE.
-        let mangled = "C:\\Users\\\u{fffd}\\k.priv CORP\\alice:(F)\n";
-        let echo = "C:\\Users\\\u{4f0a}\u{85e4}\\k.priv";
-        assert_eq!(is_owner_only_icacls(mangled, echo, "CORP\\alice"), None);
+    fn write_restricted_roundtrip_and_verify() {
+        // End-to-end runtime coverage for the native DACL path: create,
+        // verify, reload. Runs on the windows CI runner.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.key");
+        write_restricted(&path, &[7u8; 32]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), &[7u8; 32]);
+        verify_owner_only_acl(&path).unwrap();
+        assert_mode_0600(&path).unwrap();
     }
 
     // Serialise tests that mutate $HOME (test impacts a shared global).

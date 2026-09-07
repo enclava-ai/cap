@@ -49,6 +49,12 @@ jobs:
       - name: Build CLI
         run: cargo build --bin enclava --target ${{ matrix.target }}
 
+      # Runtime coverage for platform-specific code (Windows ACL
+      # create/verify roundtrip, unix permission checks) — a compiling
+      # release must not be the first time these execute.
+      - name: Run CLI unit tests
+        run: cargo test -p enclava-cli --target ${{ matrix.target }}
+
   test:
     name: Test Rust workspace
     runs-on: ubuntu-latest
