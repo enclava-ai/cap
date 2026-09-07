@@ -340,7 +340,7 @@ pub async fn rollback(
     if let Some(error) = super::runtime_reapply_status_error(current_status) {
         return Err(json_error(StatusCode::CONFLICT, error));
     }
-    if crate::mutation_leases::app_mutation_in_progress(&mut tx, app.id)
+    if crate::mutation_leases::desired_state_mutation_in_progress(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
     {

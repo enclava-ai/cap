@@ -2108,7 +2108,9 @@ fn desired_state_gated_patch_kube_client(
                         .to_bytes(),
                 )
                 .map_err(io::Error::other)?;
-                patch_started.notify_waiters();
+                // notify_one stores a permit, so the wakeup survives even if
+                // the test task has not registered its Notified future yet.
+                patch_started.notify_one();
                 release.notified().await;
                 let mut resource = state.lock().expect("fake state poisoned");
                 merge_json(&mut resource, &patch);
@@ -2222,23 +2224,37 @@ async fn paas_internal_desired_state_convergence_releases_the_deployment_lane() 
         "idempotency_request_in_progress"
     );
 
-    release.notify_waiters();
+    // A failure published while the lane is released (for example a worker
+    // terminalizing an in-flight deployment) must not be overwritten by the
+    // desired state's terminal publish.
+    sqlx::query("UPDATE apps SET status = 'failed'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app failed during convergence");
+    release.notify_one();
     let stopped = stop.await.expect("join stop request");
-    stopped.assert_status_ok();
+    stopped.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        stopped.json::<Value>()["error"],
+        "application authority changed"
+    );
     assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
     let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
         .bind(app_id)
         .fetch_one(&pool)
         .await
         .expect("load recorded state");
-    assert_eq!(recorded_state, "stopped");
+    assert_eq!(recorded_state, "failed");
+    // The publish was rejected before finish_in_tx, so the lease stays
+    // owned through its reclaim quarantine instead of being released.
     let lease_released: bool =
         sqlx::query_scalar("SELECT owner_token IS NULL FROM app_mutation_leases WHERE app_id = $1")
             .bind(app_id)
             .fetch_one(&pool)
             .await
             .expect("inspect desired-state mutation lease");
-    assert!(lease_released);
+    assert!(!lease_released);
 }
 
 #[tokio::test]

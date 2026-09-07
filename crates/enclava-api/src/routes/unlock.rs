@@ -421,7 +421,7 @@ async fn commit_unlock_mode_transition(
     {
         return Err(unlock_transition_conflict(error));
     }
-    if crate::mutation_leases::app_mutation_in_progress(
+    if crate::mutation_leases::desired_state_mutation_in_progress(
         &mut tx,
         request.observed_authority.app_id(),
     )

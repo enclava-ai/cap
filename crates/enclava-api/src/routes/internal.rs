@@ -3581,6 +3581,10 @@ pub async fn put_paas_app_desired_state(
                 outcome = error.public_code(),
                 "application desired-state convergence failed"
             );
+            // The failure path deliberately does NOT re-take the lane: the
+            // lease is dropped and stays owned through its reclaim
+            // quarantine, which is the documented safe outcome after an
+            // uncertain provider response.
             return Err(json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "desired_state_retryable",
@@ -3588,8 +3592,12 @@ pub async fn put_paas_app_desired_state(
         }
 
         // Re-take the lane and publish the terminal status in a fresh short
-        // transaction. finish_in_tx re-asserts lease ownership (token and
-        // generation) before this status write can commit.
+        // transaction. finish_in_tx requires the caller to hold the app
+        // advisory lane (see its doc comment) and re-asserts lease ownership
+        // (token and generation) before this status write can commit. A
+        // `failed` status published while the lane was released (for example
+        // a deployment worker terminalizing an in-flight job) must not be
+        // overwritten by the desired state, so the UPDATE guards it too.
         let mut tx = state.db.begin().await.map_err(|_| db_error())?;
         crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
             .await
@@ -3601,7 +3609,7 @@ pub async fn put_paas_app_desired_state(
               WHERE id = $1
                 AND org_id = $3
                 AND namespace = $4
-                AND status <> 'deleting'::app_status_enum",
+                AND status NOT IN ('deleting'::app_status_enum, 'failed'::app_status_enum)",
         )
         .bind(app_id)
         .bind(desired_state)
