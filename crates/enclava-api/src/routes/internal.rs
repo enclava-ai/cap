@@ -3547,6 +3547,12 @@ pub async fn put_paas_app_desired_state(
                 "current deployment generation is still in progress",
             ));
         }
+        // Release the deployment lane and the pooled connection before the
+        // bounded Kubernetes convergence wait (#95). Concurrent app mutations
+        // stay fenced out by the heartbeated mutation lease (they fail busy
+        // on claim), and the StatefulSet patch itself is generation-checked,
+        // so a deploy that slips in cannot be overwritten by a stale patch.
+        tx.commit().await.map_err(|_| db_error())?;
         let generation = mutation.resource_generation(&resource).ok_or_else(|| {
             json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
         })?;
@@ -3581,6 +3587,13 @@ pub async fn put_paas_app_desired_state(
             ));
         }
 
+        // Re-take the lane and publish the terminal status in a fresh short
+        // transaction. finish_in_tx re-asserts lease ownership (token and
+        // generation) before this status write can commit.
+        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+            .await
+            .map_err(|_| db_error())?;
         let updated = sqlx::query(
             "UPDATE apps
                 SET status = $2::app_status_enum,
