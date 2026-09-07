@@ -49,7 +49,7 @@ pub enum KeysError {
     InvalidBackup(String),
     #[error("key file `{0}` is world-readable; refusing to load (expected mode 0600)")]
     InsecurePermissions(PathBuf),
-    #[error("Windows is not supported in v1 — keypair storage requires POSIX mode bits")]
+    #[error("keypair storage permissions are not supported on this platform")]
     UnsupportedPlatform,
 }
 
@@ -192,14 +192,6 @@ fn key_path_for(user_id: &Uuid) -> Result<PathBuf, KeysError> {
 }
 
 #[cfg(unix)]
-fn set_file_perms_0600(path: &Path) -> Result<(), KeysError> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(unix)]
 fn set_dir_perms_0700(path: &Path) -> Result<(), KeysError> {
     use std::os::unix::fs::PermissionsExt;
     let perms = fs::Permissions::from_mode(0o700);
@@ -217,19 +209,393 @@ fn assert_mode_0600(path: &Path) -> Result<(), KeysError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn set_file_perms_0600(_: &Path) -> Result<(), KeysError> {
-    Err(KeysError::UnsupportedPlatform)
-}
-
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_dir_perms_0700(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
+}
+
+/// Windows counterpart of the unix mode-0600 load-time check: the file's
+/// owner must be the current user (an owner can always rewrite the DACL) and
+/// every DACL ACE must grant exactly the current user. Native SID comparison
+/// throughout — immune to account-name casing and console-codepage encoding.
+/// Fail-closed: absent/null DACLs, foreign ACEs, or a foreign owner all
+/// reject.
+#[cfg(windows)]
+pub fn verify_owner_only_acl(path: &Path) -> Result<(), KeysError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+
+    let ours = owner_sid()?;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        let mut psid_owner: PSID = std::ptr::null_mut();
+        let mut pdacl: *mut ACL = std::ptr::null_mut();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut psid_owner,
+            std::ptr::null_mut(),
+            &mut pdacl,
+            std::ptr::null_mut(),
+            &mut psd,
+        );
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32).into());
+        }
+        let _sd = SecurityDescriptor(psd);
+
+        let insecure = || KeysError::InsecurePermissions(path.to_path_buf());
+        if psid_owner.is_null() || EqualSid(psid_owner, ours.as_ptr() as *mut _) == 0 {
+            return Err(insecure());
+        }
+        // An absent DACL means default access (everyone); never accept it.
+        if pdacl.is_null() {
+            return Err(insecure());
+        }
+        let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+        if GetAclInformation(
+            pdacl,
+            &mut info as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if info.AceCount == 0 {
+            return Err(insecure());
+        }
+        for i in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(pdacl, i, &mut ace) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
+            if ace.Header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE
+                || EqualSid(
+                    std::ptr::from_ref(&ace.SidStart) as *mut _,
+                    ours.as_ptr() as *mut _,
+                ) == 0
+            {
+                return Err(insecure());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Windows equivalent of chmod 0600/0700, done in-process: replace the
+/// object's DACL with a protected, owner-only one. `SetNamedSecurityInfo`
+/// with `PROTECTED_DACL` swaps the whole DACL — inherited ACEs are cut and
+/// foreign *explicit* ACEs are dropped, unlike `icacls /grant:r`, which only
+/// edits grants for the named account and leaves other explicit ACEs intact.
+#[cfg(windows)]
+fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let sid = owner_sid()?;
+    let acl = owner_only_dacl(&sid, inheritable)?;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // Owner + whole-DACL replacement in one call: a foreign owner could
+    // otherwise rewrite the DACL right back. Setting the owner requires
+    // WRITE_OWNER, which a user-owned directory may legitimately lack — but
+    // then the owner is already us and a DACL-only update is equivalent.
+    // A genuinely foreign owner fails both paths and we refuse the directory.
+    let mut rc = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            sid.as_ptr() as *mut _,
+            std::ptr::null_mut(),
+            acl.as_ptr().cast(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    if path_owner_is_user(path)? {
+        rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl.as_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+    }
+    // The most recent failure, not the superseded owner-update one.
+    Err(std::io::Error::from_raw_os_error(rc as i32))
+}
+
+/// Whether `path`'s owner SID is the current user's.
+#[cfg(windows)]
+fn path_owner_is_user(path: &Path) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+
+    let ours = owner_sid()?;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        let mut psid_owner: PSID = std::ptr::null_mut();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut psid_owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut psd,
+        );
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+        let _sd = SecurityDescriptor(psd);
+        Ok(!psid_owner.is_null() && EqualSid(psid_owner, ours.as_ptr() as *mut _) != 0)
+    }
+}
+
+/// The current user's SID (raw bytes) from the process token.
+#[cfg(windows)]
+fn owner_sid() -> std::io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    unsafe {
+        let mut handle: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _token = Token(handle);
+
+        let mut needed: u32 = 0;
+        GetTokenInformation(handle, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; needed as usize];
+        if GetTokenInformation(
+            handle,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let user = &*buf.as_ptr().cast::<TOKEN_USER>();
+        let len = GetLengthSid(user.User.Sid) as usize;
+        if len == 0 || len > buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed SID from process token",
+            ));
+        }
+        Ok(std::slice::from_raw_parts(user.User.Sid.cast(), len).to_vec())
+    }
+}
+
+/// An absolute ACL granting exactly `sid` full control, optionally inherited
+/// by children (directories).
+#[cfg(windows)]
+fn owner_only_dacl(sid: &[u8], inheritable: bool) -> std::io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::GENERIC_ALL;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
+        InitializeAcl, OBJECT_INHERIT_ACE,
+    };
+
+    // ACL header + fixed ACE part + SID, minus the u32 the ACE's SidStart
+    // member overlaps with.
+    let len = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid.len()
+        - std::mem::size_of::<u32>();
+    let mut acl = vec![0u8; len];
+    let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+    if unsafe { InitializeAcl(acl_ptr, len as u32, ACL_REVISION) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = if inheritable {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
+    if unsafe {
+        AddAccessAllowedAceEx(
+            acl_ptr,
+            ACL_REVISION,
+            flags,
+            GENERIC_ALL,
+            sid.as_ptr() as *mut _,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(acl)
+}
+
+/// Create a new file whose owner-only DACL is applied in the `CreateFile`
+/// call itself: there is no instant at which the file exists with a different
+/// (e.g. inherited) descriptor, so no racing open of any kind is possible.
+#[cfg(windows)]
+fn create_file_with_owner_dacl(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::{
+        InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SetSecurityDescriptorDacl,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
+    use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+
+    let sid = owner_sid()?;
+    let acl = owner_only_dacl(&sid, false)?;
+    let mut sd = [0u8; 64]; // >= SECURITY_DESCRIPTOR_MIN_LENGTH
+    let sd_ptr = sd.as_mut_ptr().cast::<std::ffi::c_void>();
+    if unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Present (non-null) DACL containing only the owner ACE, marked
+    // SE_DACL_PROTECTED so inheritable parent ACEs (SYSTEM, Administrators,
+    // ...) are NOT merged into the new file's effective DACL.
+    if unsafe { SetSecurityDescriptorDacl(sd_ptr, 1, acl.as_ptr().cast(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    use windows_sys::Win32::Security::{
+        SE_DACL_PROTECTED, SetSecurityDescriptorControl, SetSecurityDescriptorOwner,
+    };
+    if unsafe { SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Pin the owner to the current user: with UAC, objects created by an
+    // admin-token process default to being owned by BUILTIN\Administrators,
+    // which the load-time owner check would (rightly) reject.
+    if unsafe { SetSecurityDescriptorOwner(sd_ptr, sid.as_ptr() as *mut _, 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd_ptr.cast(),
+        bInheritHandle: 0,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            0, // no sharing while we hold the handle
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
+}
+
+/// Create a new secret file: owner-only DACL at creation (see
+/// `create_file_with_owner_dacl`), then an independent re-read of the
+/// descriptor (`GetNamedSecurityInfo`, a different API family than the
+/// construction path) *before* any secret is written. If descriptor
+/// construction were ever wrong, this fails closed and removes the
+/// still-empty file.
+#[cfg(windows)]
+pub fn create_secret_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = create_file_with_owner_dacl(path)?;
+    if let Err(err) = verify_owner_only_acl(path) {
+        // Drop the unshared handle first, or the deletion hits a sharing
+        // violation and an empty file is left behind.
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to write secret to {}: ACL verification failed: {err}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn set_dir_perms_0700(path: &Path) -> Result<(), KeysError> {
+    restrict_acl_to_user(path, true)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn assert_mode_0600(path: &Path) -> Result<(), KeysError> {
+    verify_owner_only_acl(path)
+}
+
+/// Restrict an existing directory (and, via inheritance, its future
+/// children) to the current user — the Windows counterpart of mode 0700.
+/// Replaces the entire DACL, so foreign explicit ACEs are removed too.
+#[cfg(windows)]
+pub fn restrict_dir_to_user(path: &Path) -> std::io::Result<()> {
+    restrict_acl_to_user(path, true)
 }
 
 /// Generate a fresh keypair and persist it under `~/.enclava/keys/<user_id>.priv`.
@@ -240,8 +606,7 @@ pub fn create_and_store(user_id: Uuid) -> Result<UserSigningKey, KeysError> {
         return load(user_id);
     }
     let key = UserSigningKey::generate(user_id);
-    fs::write(&path, key.seed)?;
-    set_file_perms_0600(&path)?;
+    write_restricted(&path, &key.seed)?;
     Ok(key)
 }
 
@@ -255,16 +620,55 @@ pub fn store_seed_at(path: &Path, seed: &[u8; 32], force: bool) -> Result<(), Ke
     write_secret_atomic(path, seed)
 }
 
+/// Write secret bytes to `path` in a file that is owner-only from birth:
+/// the empty file is restricted *before* the secret is written, so no other
+/// local account can observe the material at any instant. On ACL failure the
+/// still-empty file is removed again.
+fn write_restricted(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let mut file = create_secret_file(path)?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(KeysError::UnsupportedPlatform);
+    #[cfg(any(unix, windows))]
+    {
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+}
+
 /// Atomically write secret bytes to `path` (file mode 0600, parent dir 0700) via a
 /// `.tmp` rename so a crash never leaves a partial secret on disk.
+/// The rename also replaces an existing destination on Windows: std passes
+/// MOVEFILE_REPLACE_EXISTING, so `store_seed_at(force = true)` works everywhere.
 fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         set_dir_perms_0700(parent)?;
     }
+    write_secret_file(path, bytes)
+}
+
+/// Write secret bytes to `path` (owner-only from birth, replacing any
+/// existing destination) via a `.tmp` rename. Unlike `write_secret_atomic`
+/// this does NOT restrict the parent directory, for user-chosen output
+/// locations such as recovery-backup files.
+pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    set_file_perms_0600(&tmp)?;
+    // Never follow a pre-planted file: remove and recreate below.
+    if tmp.exists() {
+        fs::remove_file(&tmp)?;
+    }
+    write_restricted(&tmp, bytes)?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -648,6 +1052,19 @@ pub struct RegisterPublicKeyRequest {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[cfg(windows)]
+    #[test]
+    fn write_restricted_roundtrip_and_verify() {
+        // End-to-end runtime coverage for the native DACL path: create,
+        // verify, reload. Runs on the windows CI runner.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.key");
+        write_restricted(&path, &[7u8; 32]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), &[7u8; 32]);
+        verify_owner_only_acl(&path).unwrap();
+        assert_mode_0600(&path).unwrap();
+    }
 
     // Serialise tests that mutate $HOME (test impacts a shared global).
     static HOME_LOCK: Mutex<()> = Mutex::new(());

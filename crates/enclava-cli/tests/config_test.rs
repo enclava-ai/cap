@@ -126,7 +126,12 @@ fn bootstrap_key_path_is_org_scoped() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = enclava_cli::config::CliPaths::from_root(tmp.path().join(".enclava")).unwrap();
     let key_path = paths.bootstrap_key_path("acme", "my-app");
-    assert!(key_path.to_string_lossy().contains("keys/acme/my-app.key"));
+    assert!(
+        key_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .contains("keys/acme/my-app.key")
+    );
 }
 
 #[cfg(unix)]

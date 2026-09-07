@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
     io::IsTerminal,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -1639,14 +1638,25 @@ fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::er
         )
         .into());
     }
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "existing log private key {} has insecure permissions {mode:04o}; restrict it to owner-only access (for example, chmod 600)",
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "existing log private key {} has insecure permissions {mode:04o}; restrict it to owner-only access (for example, chmod 600)",
+                path.display()
+            )
+            .into());
+        }
+    }
+    #[cfg(windows)]
+    enclava_cli::keys::verify_owner_only_acl(path).map_err(|err| {
+        format!(
+            "existing log private key {} is readable by other users ({err}); restrict it to owner-only access (icacls <path> /inheritance:r /grant:r <user>:F)",
             path.display()
         )
-        .into());
-    }
+    })?;
     Ok(())
 }
 
@@ -1732,11 +1742,24 @@ fn write_private_log_key(path: &Path, key: &str) -> Result<(), Box<dyn std::erro
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.open(path)
+    }
+    .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
+    // Owner-only from the very first instant (DACL applied in the CreateFile
+    // call), verified before the key material is written.
+    #[cfg(windows)]
+    let mut file = enclava_cli::keys::create_secret_file(path)
         .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
     use std::io::Write as _;
     writeln!(file, "{key}")?;

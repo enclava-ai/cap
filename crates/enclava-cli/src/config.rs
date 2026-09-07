@@ -124,6 +124,11 @@ impl CliPaths {
                     )?;
                 }
             }
+            #[cfg(windows)]
+            crate::keys::restrict_dir_to_user(dir).map_err(|e| ConfigError::Io {
+                path: dir.clone(),
+                source: e,
+            })?;
         }
         Ok(())
     }
@@ -184,6 +189,11 @@ pub fn save_bootstrap_key(
                 },
             )?;
         }
+        #[cfg(windows)]
+        crate::keys::restrict_dir_to_user(parent).map_err(|e| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
 
     write_secret_atomic(&path, private_key_hex.as_bytes())?;
@@ -205,11 +215,19 @@ fn write_secret_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    {
+    let mut file = {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.open(&temp_path)
     }
-    let mut file = options.open(&temp_path).map_err(|e| ConfigError::Io {
+    .map_err(|e| ConfigError::Io {
+        path: temp_path.clone(),
+        source: e,
+    })?;
+    // Owner-only from the very first instant (DACL applied in the CreateFile
+    // call), verified before any secret is written.
+    #[cfg(windows)]
+    let mut file = crate::keys::create_secret_file(&temp_path).map_err(|e| ConfigError::Io {
         path: temp_path.clone(),
         source: e,
     })?;

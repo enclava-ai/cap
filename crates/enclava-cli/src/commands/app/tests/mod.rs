@@ -419,7 +419,8 @@ fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() 
 
 #[test]
 fn deploy_preflights_password_input_before_remote_side_effects() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let deploy_start = source.find("pub async fn deploy").expect("deploy exists");
     let deploy_end = source[deploy_start..]
         .find("// Phase 1: Deploy")
@@ -472,7 +473,8 @@ fn deploy_accepts_storage_password_file_flag() {
 
 #[test]
 fn deploy_progress_does_not_redraw_during_interactive_secret_prompts() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let deploy_start = source
         .find("pub async fn deploy")
         .expect("deploy function exists");
@@ -490,7 +492,8 @@ fn deploy_progress_does_not_redraw_during_interactive_secret_prompts() {
 
 #[test]
 fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("async fn wait_for_bootstrap_endpoint")
         .expect("wait_for_bootstrap_endpoint exists");
@@ -514,7 +517,8 @@ fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
 
 #[test]
 fn deploy_bootstrap_probe_uses_short_probe_timeout_client() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("async fn wait_for_bootstrap_endpoint")
         .expect("wait_for_bootstrap_endpoint exists");
@@ -532,7 +536,8 @@ fn deploy_bootstrap_probe_uses_short_probe_timeout_client() {
 
 #[test]
 fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("async fn wait_for_deploy_runtime")
         .expect("wait_for_deploy_runtime exists");
@@ -721,7 +726,8 @@ fn direct_tee_status_rejects_errors_mismatches_and_malformed_fields() {
 
 #[test]
 fn status_command_falls_back_to_attested_tee_status() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("pub async fn status")
         .expect("status function exists");
@@ -754,7 +760,8 @@ fn status_command_falls_back_to_attested_tee_status() {
 
 #[test]
 fn status_command_surfaces_stable_ssh_endpoint_with_validating_follow_up() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("pub async fn status")
         .expect("status function exists");
@@ -800,7 +807,8 @@ fn log_output_sanitizer_removes_terminal_control_sequences() {
 
 #[test]
 fn logs_command_points_missing_scope_to_explicit_reapproval() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("pub async fn logs")
         .expect("logs function exists");
@@ -867,6 +875,7 @@ fn default_log_private_key_path_sanitizes_components() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn generated_log_key_registration_keeps_private_material_local() {
     use base64::Engine as _;
@@ -1084,6 +1093,7 @@ async fn generated_log_key_rejects_mismatched_registration_response() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn generated_log_key_retry_rejects_loose_private_key_permissions() {
     use enclava_common::log_encryption::generate_log_keypair;
@@ -1132,7 +1142,8 @@ fn attested_locked_state_overrides_only_running_status() {
 
 #[test]
 fn password_redeploy_wait_does_not_accept_stale_unlocked_runtime() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("async fn wait_for_deploy_runtime")
         .expect("wait_for_deploy_runtime exists");
@@ -1154,7 +1165,8 @@ fn password_redeploy_wait_does_not_accept_stale_unlocked_runtime() {
 
 #[test]
 fn deploy_waits_on_returned_deployment_record() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let deploy_start = source
         .find("pub async fn deploy")
         .expect("deploy function exists");
@@ -1186,7 +1198,8 @@ fn deploy_waits_on_returned_deployment_record() {
 
 #[test]
 fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let fn_start = source
         .find("async fn ensure_password_storage_unlocked_for_config")
         .expect("ensure_password_storage_unlocked_for_config exists");
@@ -1213,7 +1226,8 @@ fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
 
 #[test]
 fn deploy_config_push_attests_before_setting_values() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let phase_start = source
         .find("// Phase 4: Push config if --set was used")
         .expect("config push phase exists");
@@ -1237,7 +1251,8 @@ fn deploy_config_push_attests_before_setting_values() {
 
 #[test]
 fn deploy_health_timeout_is_not_reported_as_success() {
-    let source = include_str!("../../app.rs");
+    // CRLF checkouts (Windows autocrlf) must not break source matching.
+    let source = include_str!("../../app.rs").replace("\r\n", "\n");
     let phase_start = source
         .find("// Phase 4: Health check")
         .expect("health check phase exists");

@@ -535,6 +535,8 @@ mod tests {
         let envelope: PlatformReleaseEnvelope =
             serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         let workflow = include_str!("../../../.github/workflows/release.yml");
+        // Windows checkouts use CRLF (autocrlf); normalize before matching.
+        let workflow = workflow.replace("\r\n", "\n");
         let expected = format!(
             "\nenv:\n  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: {}\n",
             envelope.signing_pubkey

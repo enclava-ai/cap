@@ -17,6 +17,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-cli:
+    name: Build enclava CLI (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            crt-static: -C target-feature=+crt-static
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.crt-static }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Full build (not check) so linking and all target triples are exercised
+      # before a tag starts the release workflow. Mirrors the release targets,
+      # including static CRT on Windows.
+      - name: Build CLI
+        run: cargo build --bin enclava --target ${{ matrix.target }}
+
+      # Runtime coverage for platform-specific code (Windows ACL
+      # create/verify roundtrip, unix permission checks) — a compiling
+      # release must not be the first time these execute.
+      # x86_64-apple-darwin test binaries execute via Rosetta 2 on the arm64
+      # runner; split onto macos-latest-intel if that ever stops holding.
+      - name: Run CLI unit tests
+        run: cargo test -p enclava-cli --target ${{ matrix.target }}
+
   test:
     name: Test Rust workspace
     runs-on: ubuntu-latest
