@@ -315,18 +315,24 @@ fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     let sid = owner_sid()?;
     let acl = owner_only_dacl(&sid, inheritable)?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // Owner + whole-DACL replacement in one call: a foreign owner could
+    // otherwise rewrite the DACL right back. Setting the owner to ourselves
+    // fails (and we refuse the directory) unless we own it or hold
+    // WRITE_OWNER — fail-closed either way.
     let rc = unsafe {
         SetNamedSecurityInfoW(
-            wide.as_ptr() as *mut _,
+            wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            sid.as_ptr() as *mut _,
             std::ptr::null_mut(),
             acl.as_ptr().cast(),
             std::ptr::null_mut(),
