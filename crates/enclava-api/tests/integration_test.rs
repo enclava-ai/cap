@@ -2076,6 +2076,187 @@ async fn paas_internal_desired_state_rechecks_failed_status_after_claim() {
     assert!(lease_released);
 }
 
+/// Same fake as [`desired_state_kube_client`], but every PATCH parks until
+/// the test releases it, so a desired-state request can be inspected while
+/// its Kubernetes convergence is in flight.
+fn desired_state_gated_patch_kube_client(
+    state: Arc<Mutex<Value>>,
+    patch_started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> kube::Client {
+    kube::Client::new(
+        service_fn(move |request: Request<Body>| {
+            let state = Arc::clone(&state);
+            let patch_started = Arc::clone(&patch_started);
+            let release = Arc::clone(&release);
+            async move {
+                let method = request.method().clone();
+                if method == Method::GET {
+                    let resource = state.lock().expect("fake state poisoned").clone();
+                    return Ok::<_, io::Error>(desired_state_kube_response(
+                        StatusCode::OK,
+                        resource,
+                    ));
+                }
+                assert_eq!(method, Method::PATCH, "unexpected fake Kubernetes request");
+                let patch: Value = serde_json::from_slice(
+                    &request
+                        .into_body()
+                        .collect()
+                        .await
+                        .map_err(io::Error::other)?
+                        .to_bytes(),
+                )
+                .map_err(io::Error::other)?;
+                // notify_one stores a permit, so the wakeup survives even if
+                // the test task has not registered its Notified future yet.
+                patch_started.notify_one();
+                release.notified().await;
+                let mut resource = state.lock().expect("fake state poisoned");
+                merge_json(&mut resource, &patch);
+                let replicas = resource["spec"]["replicas"].as_i64().unwrap_or_default();
+                resource["metadata"]["resourceVersion"] = Value::String(
+                    (resource["metadata"]["resourceVersion"]
+                        .as_str()
+                        .unwrap_or("1")
+                        .parse::<u64>()
+                        .unwrap_or(1)
+                        + 1)
+                    .to_string(),
+                );
+                resource["status"] = serde_json::json!({
+                    "currentReplicas": replicas,
+                    "readyReplicas": replicas,
+                    "updatedReplicas": replicas,
+                });
+                Ok(desired_state_kube_response(
+                    StatusCode::OK,
+                    resource.clone(),
+                ))
+            }
+        }),
+        "default",
+    )
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_convergence_releases_the_deployment_lane() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(1)));
+    let patch_started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_gated_patch_kube_client(
+            Arc::clone(&runtime),
+            Arc::clone(&patch_started),
+            Arc::clone(&release),
+        ),
+        Default::default(),
+    ));
+    let server = Arc::new(
+        axum_test::TestServer::builder()
+            .http_transport()
+            .build(test_router(state).layer(Extension(engine))),
+    );
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("lane-release-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-lane-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app running");
+    let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load app id");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let request_server = Arc::clone(&server);
+    let request_path = path.clone();
+    let stop_operation = format!("lane-release-{suffix}");
+    let stop = tokio::spawn(async move {
+        add_internal_headers(
+            request_server.put(&request_path),
+            "ignored-lane-release-key",
+        )
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": stop_operation,
+        }))
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), patch_started.notified())
+        .await
+        .expect("stop request never reached StatefulSet convergence");
+
+    // While convergence is in flight the mutation lease must fence a second
+    // stop with a fast busy conflict. claim() acquires the app deployment
+    // lane before it can observe Busy, so a prompt 409 also proves the lane
+    // advisory lock and the phase-one connection were released (#95).
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        add_internal_headers(Arc::clone(&server).put(&path), "ignored-second-stop-key")
+            .json(&serde_json::json!({
+                "desired_state": "stopped",
+                "operation_id": format!("lane-release-second-{suffix}"),
+            }))
+            .await
+    })
+    .await
+    .expect("second stop parked on the deployment lane during convergence");
+    second.assert_status(StatusCode::CONFLICT);
+    // The busy conflict is classified known-not-applied, so the idempotency
+    // layer surfaces it as idempotency_request_in_progress to the caller.
+    assert_eq!(
+        second.json::<Value>()["error"],
+        "idempotency_request_in_progress"
+    );
+
+    // A failure published while the lane is released (for example a worker
+    // terminalizing an in-flight deployment) must not be overwritten by the
+    // desired state's terminal publish.
+    sqlx::query("UPDATE apps SET status = 'failed'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app failed during convergence");
+    release.notify_one();
+    let stopped = stop.await.expect("join stop request");
+    stopped.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        stopped.json::<Value>()["error"],
+        "application authority changed"
+    );
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+    let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recorded state");
+    assert_eq!(recorded_state, "failed");
+    // The publish was rejected before finish_in_tx, so the lease stays
+    // owned through its reclaim quarantine instead of being released.
+    let lease_released: bool =
+        sqlx::query_scalar("SELECT owner_token IS NULL FROM app_mutation_leases WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect desired-state mutation lease");
+    assert!(!lease_released);
+}
+
 #[tokio::test]
 async fn desired_state_replica_convergence_stops_resumes_and_retains_configuration() {
     use enclava_engine::apply::{

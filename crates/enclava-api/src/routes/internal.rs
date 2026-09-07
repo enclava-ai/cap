@@ -3547,6 +3547,12 @@ pub async fn put_paas_app_desired_state(
                 "current deployment generation is still in progress",
             ));
         }
+        // Release the deployment lane and the pooled connection before the
+        // bounded Kubernetes convergence wait (#95). Concurrent app mutations
+        // stay fenced out by the heartbeated mutation lease (they fail busy
+        // on claim), and the StatefulSet patch itself is generation-checked,
+        // so a deploy that slips in cannot be overwritten by a stale patch.
+        tx.commit().await.map_err(|_| db_error())?;
         let generation = mutation.resource_generation(&resource).ok_or_else(|| {
             json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
         })?;
@@ -3575,12 +3581,27 @@ pub async fn put_paas_app_desired_state(
                 outcome = error.public_code(),
                 "application desired-state convergence failed"
             );
+            // The failure path deliberately does NOT re-take the lane: the
+            // lease is dropped and stays owned through its reclaim
+            // quarantine, which is the documented safe outcome after an
+            // uncertain provider response.
             return Err(json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "desired_state_retryable",
             ));
         }
 
+        // Re-take the lane and publish the terminal status in a fresh short
+        // transaction. finish_in_tx requires the caller to hold the app
+        // advisory lane (see its doc comment) and re-asserts lease ownership
+        // (token and generation) before this status write can commit. A
+        // `failed` status published while the lane was released (for example
+        // a deployment worker terminalizing an in-flight job) must not be
+        // overwritten by the desired state, so the UPDATE guards it too.
+        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+            .await
+            .map_err(|_| db_error())?;
         let updated = sqlx::query(
             "UPDATE apps
                 SET status = $2::app_status_enum,
@@ -3588,7 +3609,7 @@ pub async fn put_paas_app_desired_state(
               WHERE id = $1
                 AND org_id = $3
                 AND namespace = $4
-                AND status <> 'deleting'::app_status_enum",
+                AND status NOT IN ('deleting'::app_status_enum, 'failed'::app_status_enum)",
         )
         .bind(app_id)
         .bind(desired_state)

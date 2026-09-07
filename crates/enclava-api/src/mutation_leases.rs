@@ -529,6 +529,36 @@ pub async fn claim_resources(
     })
 }
 
+/// Whether a desired-state stop/start is converging under a live app
+/// mutation lease — the one mutation class that runs its Kubernetes
+/// convergence with the app deployment lane released and then publishes a
+/// terminal `apps` status (#95). Deployment acceptance paths consult this
+/// under the lane so authority-snapshotted work is not accepted while that
+/// publish is still pending. Worker-owned leases (deployment setup/apply,
+/// including observation-only rollout watchers) are deliberately excluded:
+/// supersession and the deployment busy checks own that contention, and any
+/// future lane-released mutation kind must be added to this predicate.
+/// Busy mirrors `claim`'s reclaimability complement, so anything claimable
+/// is not busy.
+pub(crate) async fn desired_state_mutation_in_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM app_mutation_leases
+              WHERE app_id = $1
+                AND operation_kind = 'app_desired_state'
+                AND owner_token IS NOT NULL
+                AND reclaim_after > clock_timestamp()
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 pub async fn claim(
     state: &AppState,
     app_id: Uuid,
@@ -2089,5 +2119,58 @@ mod tests {
         .expect("attempt stale resource publication");
         assert_eq!(stale.rows_affected(), 0);
         next.finish().await.expect("finish reused hostname owner");
+    }
+
+    #[tokio::test]
+    async fn desired_state_fence_scopes_to_desired_state_leases() {
+        let pool = database_test_pool(2).await;
+        let (_, app_id) = insert_app(&pool, "desired-state-fence.example.test").await;
+        async fn hold_lease(pool: &PgPool, app_id: Uuid, operation_kind: &str) {
+            sqlx::query(
+                "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+                 ON CONFLICT (app_id) DO NOTHING",
+            )
+            .bind(app_id)
+            .execute(pool)
+            .await
+            .expect("seed app mutation lease row");
+            sqlx::query(
+                "UPDATE app_mutation_leases
+                    SET owner_token = $2,
+                        operation_kind = $3,
+                        operation_id = $4,
+                        locked_until = clock_timestamp() + interval '30 seconds',
+                        reclaim_after = clock_timestamp() + interval '60 seconds'
+                  WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .bind(Uuid::new_v4())
+            .bind(operation_kind)
+            .bind(Uuid::new_v4())
+            .execute(pool)
+            .await
+            .expect("hold app mutation lease");
+        }
+
+        // Worker-owned leases (deployment apply, including observation-only
+        // rollout watchers) must not fence deployment acceptance — that
+        // contention is owned by supersession and the deploy busy checks.
+        hold_lease(&pool, app_id, "deployment_apply").await;
+        let mut tx = pool.begin().await.expect("begin worker lease check");
+        assert!(
+            !desired_state_mutation_in_progress(&mut tx, app_id)
+                .await
+                .expect("check worker-owned lease")
+        );
+        tx.commit().await.expect("commit worker lease check");
+
+        hold_lease(&pool, app_id, "app_desired_state").await;
+        let mut tx = pool.begin().await.expect("begin desired-state lease check");
+        assert!(
+            desired_state_mutation_in_progress(&mut tx, app_id)
+                .await
+                .expect("check desired-state lease")
+        );
+        tx.commit().await.expect("commit desired-state lease check");
     }
 }

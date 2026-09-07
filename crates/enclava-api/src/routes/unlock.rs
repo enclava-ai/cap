@@ -421,6 +421,17 @@ async fn commit_unlock_mode_transition(
     {
         return Err(unlock_transition_conflict(error));
     }
+    if crate::mutation_leases::desired_state_mutation_in_progress(
+        &mut tx,
+        request.observed_authority.app_id(),
+    )
+    .await
+    .map_err(|_| unlock_database_error())?
+    {
+        return Err(unlock_transition_conflict(
+            "app mutation already in progress",
+        ));
+    }
 
     let locked_current = current_mode(&locked_app);
     if !validate_transition(locked_current, request.requested) {
@@ -2484,6 +2495,151 @@ mod tests {
         .await
         .expect("load receipt replay index metadata");
         assert!(receipt_index_is_unique);
+
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn unlock_mode_transition_rejects_while_app_mutation_lease_is_live() {
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[24; 32]);
+        let quote_hash = "ef".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T11:20:00Z",
+            "password",
+            "auto",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("verify busy-fence test receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let org_id = app.org_id;
+        let app_name = app.name.clone();
+
+        // Simulate a desired-state stop converging with the deployment lane
+        // released: the mutation lease row is live and heartbeated (#95).
+        // Accepting authority-snapshotted work now would let the stop's
+        // terminal publish invalidate it, so acceptance must fail busy.
+        sqlx::query(
+            "INSERT INTO app_mutation_leases (app_id) VALUES ($1)
+             ON CONFLICT (app_id) DO NOTHING",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("seed app mutation lease row");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = $2,
+                    operation_kind = 'app_desired_state',
+                    operation_id = $3,
+                    locked_until = clock_timestamp() + interval '30 seconds',
+                    reclaim_after = clock_timestamp() + interval '60 seconds'
+              WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("hold app mutation lease");
+
+        let (status, body) = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id,
+                user_id,
+                app_name: &app_name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id: Uuid::new_v4(),
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        )
+        .await
+        .expect_err("live mutation lease fences acceptance");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["error"], "app mutation already in progress");
+
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL
+              WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("release app mutation lease");
+        commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id,
+                user_id,
+                app_name: &app_name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id: Uuid::new_v4(),
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        )
+        .await
+        .expect("released mutation lease admits the transition");
 
         delete_unlock_test_org(&pool, app.org_id).await;
     }
