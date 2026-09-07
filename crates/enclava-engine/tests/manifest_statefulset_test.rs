@@ -237,6 +237,7 @@ fn statefulset_phase5_uses_only_steady_state_containers() {
     assert!(names.contains(&"tenant-ingress"));
     assert!(names.contains(&"enclava-init"));
     assert_eq!(names.len(), 4);
+    assert_eq!(names.last(), Some(&"enclava-init"));
 
     let proxy = pod
         .containers
