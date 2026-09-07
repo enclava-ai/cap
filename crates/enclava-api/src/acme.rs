@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::dns::{self, DnsConfig};
-use crate::workload_tls_timing::{Phase, RequestTiming};
+use crate::workload_tls_timing::{DnsErrorCategory, Phase, RequestTiming};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError};
+use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::RData;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
@@ -195,7 +197,53 @@ async fn lookup_txt(
     .await
 }
 
-async fn lookup_txt_with_resolvers<F: std::future::Future<Output = Result<Vec<String>, String>>>(
+#[derive(Clone, Debug)]
+struct DnsLookupError {
+    message: String,
+    category: DnsErrorCategory,
+}
+
+impl From<NetError> for DnsLookupError {
+    fn from(error: NetError) -> Self {
+        let category = match &error {
+            NetError::Dns(DnsError::NoRecordsFound(records)) => match records.response_code {
+                ResponseCode::NXDomain => DnsErrorCategory::NxDomain,
+                ResponseCode::NoError => DnsErrorCategory::NoData,
+                _ => DnsErrorCategory::Other,
+            },
+            NetError::Timeout => DnsErrorCategory::Timeout,
+            NetError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                DnsErrorCategory::Timeout
+            }
+            NetError::Io(_) | NetError::NoConnections => DnsErrorCategory::Transport,
+            _ => DnsErrorCategory::Other,
+        };
+        Self {
+            message: error.to_string(),
+            category,
+        }
+    }
+}
+
+impl From<String> for DnsLookupError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            category: DnsErrorCategory::Other,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for DnsLookupError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+async fn lookup_txt_with_resolvers<
+    F: std::future::Future<Output = Result<Vec<String>, DnsLookupError>>,
+>(
     config: &AcmeConfig,
     timing: RequestTiming,
     mut lookup: impl FnMut(bool) -> F,
@@ -210,22 +258,34 @@ async fn lookup_txt_with_resolvers<F: std::future::Future<Output = Result<Vec<St
         } else {
             Phase::DnsExternalLookup
         };
-        let result = timing
-            .measure(phase, async {
+        let result = {
+            let mut stage = timing.start(phase);
+            let result = async {
                 let work = lookup(system);
                 match config.dns_lookup_timeout {
-                    Some(timeout) => tokio::time::timeout(timeout, work)
-                        .await
-                        .map_err(|_| "DNS TXT lookup timed out".to_string())?,
+                    Some(timeout) => {
+                        tokio::time::timeout(timeout, work)
+                            .await
+                            .map_err(|_| DnsLookupError {
+                                message: "DNS TXT lookup timed out".to_string(),
+                                category: DnsErrorCategory::Timeout,
+                            })?
+                    }
                     None => work.await,
                 }
-            })
+            }
             .await;
+            match &result {
+                Ok(_) => stage.finish(true),
+                Err(error) => stage.finish_dns_error(error.category),
+            }
+            result
+        };
         match result {
             // Empty or nonmatching answers still belong to this resolver. The
             // propagation loop, not the fallback, checks the exact challenge.
             Ok(values) => return Ok(values),
-            Err(err) => last_error = err,
+            Err(err) => last_error = err.message,
         }
         if system == config.dns_lookup_prefer_system {
             let message = if system {
@@ -239,22 +299,34 @@ async fn lookup_txt_with_resolvers<F: std::future::Future<Output = Result<Vec<St
     Err(last_error)
 }
 
-async fn lookup_txt_external(name: &str) -> Result<Vec<String>, String> {
+async fn lookup_txt_external(name: &str) -> Result<Vec<String>, DnsLookupError> {
     let resolver = TokioResolver::builder_with_config(
         ResolverConfig::udp_and_tcp(&CLOUDFLARE),
         TokioRuntimeProvider::default(),
     )
     .with_options(ResolverOpts::default())
     .build()
-    .map_err(|e| e.to_string())?;
-    collect_txt_values(resolver.txt_lookup(name).await.map_err(|e| e.to_string())?)
+    .map_err(DnsLookupError::from)?;
+    collect_txt_values(
+        resolver
+            .txt_lookup(name)
+            .await
+            .map_err(DnsLookupError::from)?,
+    )
+    .map_err(DnsLookupError::from)
 }
 
-async fn lookup_txt_system(name: &str) -> Result<Vec<String>, String> {
+async fn lookup_txt_system(name: &str) -> Result<Vec<String>, DnsLookupError> {
     let resolver = TokioResolver::builder_tokio()
         .and_then(|builder| builder.build())
-        .map_err(|e| e.to_string())?;
-    collect_txt_values(resolver.txt_lookup(name).await.map_err(|e| e.to_string())?)
+        .map_err(DnsLookupError::from)?;
+    collect_txt_values(
+        resolver
+            .txt_lookup(name)
+            .await
+            .map_err(DnsLookupError::from)?,
+    )
+    .map_err(DnsLookupError::from)
 }
 
 fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<String>, String> {
@@ -331,6 +403,65 @@ async fn load_or_create_account(config: &AcmeConfig) -> Result<Account, AcmeErro
 mod tests {
     use super::*;
 
+    #[test]
+    fn typed_dns_error_categories_do_not_change_error_messages() {
+        use hickory_resolver::net::NoRecords;
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        let query = Query::query(
+            Name::from_ascii("private-name.invalid.").unwrap(),
+            RecordType::TXT,
+        );
+        let cases = [
+            (
+                NetError::from(NoRecords::new(query.clone(), ResponseCode::NXDomain)),
+                DnsErrorCategory::NxDomain,
+            ),
+            (
+                NetError::from(NoRecords::new(query.clone(), ResponseCode::NoError)),
+                DnsErrorCategory::NoData,
+            ),
+            (
+                NetError::from(NoRecords::new(query, ResponseCode::ServFail)),
+                DnsErrorCategory::Other,
+            ),
+            (
+                NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail)),
+                DnsErrorCategory::Other,
+            ),
+            (
+                NetError::Dns(DnsError::ResponseCode(ResponseCode::Refused)),
+                DnsErrorCategory::Other,
+            ),
+            (NetError::Timeout, DnsErrorCategory::Timeout),
+            (
+                NetError::Io(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "private-error").into(),
+                ),
+                DnsErrorCategory::Timeout,
+            ),
+            (
+                NetError::Io(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "private-error")
+                        .into(),
+                ),
+                DnsErrorCategory::Transport,
+            ),
+            (NetError::NoConnections, DnsErrorCategory::Transport),
+            (NetError::QueryCaseMismatch, DnsErrorCategory::Other),
+            (
+                NetError::Msg("private-error".into()),
+                DnsErrorCategory::Other,
+            ),
+        ];
+        for (error, expected) in cases {
+            let message = error.to_string();
+            let classified = DnsLookupError::from(error);
+            assert_eq!(classified.category, expected);
+            assert_eq!(classified.message, message);
+        }
+    }
+
     fn config(system: bool, timeout: Option<Duration>) -> AcmeConfig {
         AcmeConfig {
             directory_url: "https://acme.invalid/directory".into(),
@@ -356,48 +487,85 @@ mod tests {
             }
         }
         for system in [false, true] {
-            let logs = Arc::new(Mutex::new(Vec::new()));
-            let output = logs.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .without_time()
-                .with_ansi(false)
-                .with_env_filter("enclava_api=debug,cap::workload_tls_timing=debug")
-                .with_writer(move || Writer(output.clone()))
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
-            lookup_txt_with_resolvers(&config(system, None), RequestTiming::new(), |resolver| {
-                std::future::ready(if resolver == system {
-                    Err("private-error".into())
+            use hickory_resolver::net::NoRecords;
+            use hickory_resolver::proto::op::Query;
+            use hickory_resolver::proto::rr::{Name, RecordType};
+            let query = Query::query(
+                Name::from_ascii("private-name.invalid.").unwrap(),
+                RecordType::TXT,
+            );
+            for (error, label) in [
+                (
+                    Some(NetError::from(NoRecords::new(
+                        query.clone(),
+                        ResponseCode::NXDomain,
+                    ))),
+                    "nxdomain",
+                ),
+                (
+                    Some(NetError::from(NoRecords::new(query, ResponseCode::NoError))),
+                    "nodata",
+                ),
+                (Some(NetError::Timeout), "timeout"),
+                (Some(NetError::NoConnections), "transport"),
+                (Some(NetError::Msg("private-error".into())), "other"),
+                (None, "timeout"),
+            ] {
+                let logs = Arc::new(Mutex::new(Vec::new()));
+                let output = logs.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_env_filter("enclava_api=debug,cap::workload_tls_timing=debug")
+                    .with_writer(move || Writer(output.clone()))
+                    .finish();
+                let _guard = tracing::subscriber::set_default(subscriber);
+                lookup_txt_with_resolvers(
+                    &config(system, Some(Duration::from_millis(10))),
+                    RequestTiming::new(),
+                    |resolver| {
+                        let error = error.clone();
+                        async move {
+                            if resolver == system {
+                                match error {
+                                    Some(error) => Err(DnsLookupError::from(error)),
+                                    None => std::future::pending().await,
+                                }
+                            } else {
+                                Ok(vec!["private-answer".into()])
+                            }
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+                let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+                assert!(!text.contains("private-"));
+                let lines: Vec<_> = text
+                    .lines()
+                    .filter(|line| line.contains("event=\"workload_tls_timing\""))
+                    .collect();
+                assert_eq!(lines.len(), 2);
+                let phases = if system {
+                    ["dns_system_lookup", "dns_external_lookup"]
                 } else {
-                    Ok(vec!["private-answer".into()])
-                })
-            })
-            .await
-            .unwrap();
-            let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-            assert!(!text.contains("private-"));
-            let lines: Vec<_> = text
-                .lines()
-                .filter(|line| line.contains("event=\"workload_tls_timing\""))
-                .collect();
-            assert_eq!(lines.len(), 2);
-            let phases = if system {
-                ["dns_system_lookup", "dns_external_lookup"]
-            } else {
-                ["dns_external_lookup", "dns_system_lookup"]
-            };
-            for (line, phase) in lines.iter().zip(phases) {
-                assert!(line.contains(&format!("phase=\"{phase}\"")));
+                    ["dns_external_lookup", "dns_system_lookup"]
+                };
+                for (line, phase) in lines.iter().zip(phases) {
+                    assert!(line.contains(&format!("phase=\"{phase}\"")));
+                }
+                assert!(lines[0].contains("outcome=\"error\""));
+                assert!(lines[0].contains(&format!("error_category=\"{label}\"")));
+                assert!(lines[1].contains("outcome=\"success\""));
+                assert!(!lines[1].contains("error_category="));
+                let seq = |line: &str| {
+                    line.split_whitespace()
+                        .find(|field| field.starts_with("request_seq="))
+                        .unwrap()
+                        .to_owned()
+                };
+                assert_eq!(seq(lines[0]), seq(lines[1]));
             }
-            assert!(lines[0].contains("outcome=\"error\""));
-            assert!(lines[1].contains("outcome=\"success\""));
-            let seq = |line: &str| {
-                line.split_whitespace()
-                    .find(|field| field.starts_with("request_seq="))
-                    .unwrap()
-                    .to_owned()
-            };
-            assert_eq!(seq(lines[0]), seq(lines[1]));
         }
         let source = include_str!("acme.rs");
         let wait = source
@@ -452,7 +620,10 @@ mod tests {
                     },
                 )
                 .await;
-                assert_eq!(result, fallback);
+                assert_eq!(
+                    result,
+                    fallback.map_err(|error: DnsLookupError| error.message)
+                );
                 assert_eq!(calls, vec![system, !system]);
             }
         }
@@ -513,7 +684,7 @@ mod tests {
             lookup_txt_with_resolvers(&config(false, None), RequestTiming::new(), |_| async {
                 calls.set(calls.get() + 1);
                 let _guard = DropFlag(&dropped);
-                std::future::pending::<Result<Vec<String>, String>>().await
+                std::future::pending::<Result<Vec<String>, DnsLookupError>>().await
             }),
         )
         .await;
