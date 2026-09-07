@@ -1749,29 +1749,18 @@ fn write_private_log_key(path: &Path, key: &str) -> Result<(), Box<dyn std::erro
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Deny read sharing from birth so no racing local process can hold
-        // a read handle acquired before the ACL restriction below.
-        const FILE_SHARE_WRITE_OR_DELETE: u32 = 0x2 | 0x4;
-        options.share_mode(FILE_SHARE_WRITE_OR_DELETE);
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.open(path)
     }
-    let mut file = options
-        .open(path)
+    .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
+    // Owner-only from the very first instant (DACL applied in the CreateFile
+    // call), verified before the key material is written.
+    #[cfg(windows)]
+    let mut file = enclava_cli::keys::create_secret_file(path)
         .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
-    #[cfg(windows)]
-    {
-        // Restrict the still-empty file before the key material is written.
-        if let Err(err) = enclava_cli::keys::restrict_file_to_user(path) {
-            let _ = std::fs::remove_file(path);
-            return Err(format!(
-                "failed to restrict log private key {}: {err}",
-                path.display()
-            )
-            .into());
-        }
-    }
     use std::io::Write as _;
     writeln!(file, "{key}")?;
     Ok(())

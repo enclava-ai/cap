@@ -215,34 +215,22 @@ fn write_secret_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    {
+    let mut file = {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.open(&temp_path)
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Deny read sharing from birth so no racing local process can hold
-        // a read handle acquired before the ACL restriction below.
-        const FILE_SHARE_WRITE_OR_DELETE: u32 = 0x2 | 0x4;
-        options.share_mode(FILE_SHARE_WRITE_OR_DELETE);
-    }
-    let mut file = options.open(&temp_path).map_err(|e| ConfigError::Io {
+    .map_err(|e| ConfigError::Io {
         path: temp_path.clone(),
         source: e,
     })?;
-    // Restrict the (still empty) file on Windows before the secret lands in
-    // it; on failure remove it so nothing is left behind with inherited ACLs.
+    // Owner-only from the very first instant (DACL applied in the CreateFile
+    // call), verified before any secret is written.
     #[cfg(windows)]
-    {
-        if let Err(e) = crate::keys::restrict_file_to_user(&temp_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(ConfigError::Io {
-                path: temp_path.clone(),
-                source: e,
-            });
-        }
-    }
+    let mut file = crate::keys::create_secret_file(&temp_path).map_err(|e| ConfigError::Io {
+        path: temp_path.clone(),
+        source: e,
+    })?;
     std::io::Write::write_all(&mut file, contents).map_err(|e| ConfigError::Io {
         path: temp_path.clone(),
         source: e,

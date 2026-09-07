@@ -54,6 +54,18 @@ tempfile = "3"
 # system OpenSSL. Feature-unifies with sev's `openssl` usage.
 openssl = { version = "0.10", features = ["vendored"] }
 
+# Owner-only security descriptors for secret files/dirs (already in the
+# workspace graph transitively; no new crate).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 [features]
 prod-strict = []
 
