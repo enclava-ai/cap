@@ -455,8 +455,16 @@ fn create_file_with_owner_dacl(path: &Path) -> std::io::Result<std::fs::File> {
     if unsafe { SetSecurityDescriptorDacl(sd_ptr, 1, acl.as_ptr().cast(), 0) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    use windows_sys::Win32::Security::{SE_DACL_PROTECTED, SetSecurityDescriptorControl};
+    use windows_sys::Win32::Security::{
+        SE_DACL_PROTECTED, SetSecurityDescriptorControl, SetSecurityDescriptorOwner,
+    };
     if unsafe { SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Pin the owner to the current user: with UAC, objects created by an
+    // admin-token process default to being owned by BUILTIN\Administrators,
+    // which the load-time owner check would (rightly) reject.
+    if unsafe { SetSecurityDescriptorOwner(sd_ptr, sid.as_ptr() as *mut _, 0) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
     let sa = SECURITY_ATTRIBUTES {
