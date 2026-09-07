@@ -52,6 +52,8 @@ jobs:
       # Runtime coverage for platform-specific code (Windows ACL
       # create/verify roundtrip, unix permission checks) — a compiling
       # release must not be the first time these execute.
+      # x86_64-apple-darwin test binaries execute via Rosetta 2 on the arm64
+      # runner; split onto macos-latest-intel if that ever stops holding.
       - name: Run CLI unit tests
         run: cargo test -p enclava-cli --target ${{ matrix.target }}
 
