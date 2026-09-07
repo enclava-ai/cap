@@ -69,9 +69,16 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             ..Default::default()
         });
     } else {
+        // These emptyDirs hold helper binaries and shared decrypted
+        // mountpoints, not persistent payload. Kata may not enforce the
+        // guest-side sizeLimit, so the declared sizes are not a security
+        // bound.
         v.push(Volume {
             name: "enclava-tools".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource::default()),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("16Mi".to_string())),
+            }),
             ..Default::default()
         });
         if app
@@ -106,12 +113,18 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
         });
         v.push(Volume {
             name: "state-mount".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource::default()),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("1Mi".to_string())),
+            }),
             ..Default::default()
         });
         v.push(Volume {
             name: "tls-state-mount".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource::default()),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("1Mi".to_string())),
+            }),
             ..Default::default()
         });
         v.push(Volume {

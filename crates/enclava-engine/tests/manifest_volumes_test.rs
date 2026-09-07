@@ -73,6 +73,39 @@ fn volumes_do_not_include_enclava_tools_emptydir() {
 }
 
 #[test]
+fn volumes_enclava_tools_uses_memory_medium_and_16mi_limit() {
+    let vols = build_volumes(&sample_app());
+    let v = vols.iter().find(|v| v.name == "enclava-tools").unwrap();
+    let ed = v.empty_dir.as_ref().unwrap();
+    assert_eq!(ed.medium.as_deref(), Some("Memory"));
+    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("16Mi"));
+}
+
+#[test]
+fn volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit() {
+    let vols = build_volumes(&sample_app());
+    for name in ["state-mount", "tls-state-mount"] {
+        let v = vols.iter().find(|v| v.name == name).unwrap();
+        let ed = v.empty_dir.as_ref().unwrap();
+        assert_eq!(ed.medium.as_deref(), Some("Memory"), "{name}");
+        assert_eq!(
+            ed.size_limit.as_ref().map(|q| q.0.as_str()),
+            Some("1Mi"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn volumes_logs_emptydir_uses_default_disk_medium() {
+    let vols = build_volumes(&sample_app());
+    let v = vols.iter().find(|v| v.name == "logs").unwrap();
+    let ed = v.empty_dir.as_ref().unwrap();
+    assert!(ed.medium.is_none());
+    assert!(ed.size_limit.is_none());
+}
+
+#[test]
 fn volumes_has_tenant_ingress_caddyfile() {
     let vols = build_volumes(&sample_app());
     let v = vols
