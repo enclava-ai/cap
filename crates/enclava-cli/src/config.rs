@@ -219,6 +219,14 @@ fn write_secret_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> 
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny read sharing from birth so no racing local process can hold
+        // a read handle acquired before the ACL restriction below.
+        const FILE_SHARE_WRITE_OR_DELETE: u32 = 0x2 | 0x4;
+        options.share_mode(FILE_SHARE_WRITE_OR_DELETE);
+    }
     let mut file = options.open(&temp_path).map_err(|e| ConfigError::Io {
         path: temp_path.clone(),
         source: e,

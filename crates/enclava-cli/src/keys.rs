@@ -239,7 +239,10 @@ fn current_user() -> std::io::Result<String> {
 /// The trailing summary line has no parenthesised rights and is ignored.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_owner_only_icacls(text: &str, path_echo: &str, user: &str) -> Option<bool> {
-    let user_prefix = format!("{user}:(");
+    // Windows account names are case-insensitive (case-preserving), and
+    // `whoami` and `icacls` may render the same account with different
+    // casing, so compare case-insensitively.
+    let user_prefix = format!("{user}:(").to_lowercase();
     let mut ace_lines = 0;
     let mut all_owner = true;
     let mut echo_matched = false;
@@ -255,7 +258,7 @@ fn is_owner_only_icacls(text: &str, path_echo: &str, user: &str) -> Option<bool>
             continue;
         }
         ace_lines += 1;
-        if !line.starts_with(&user_prefix) {
+        if !line.to_lowercase().starts_with(&user_prefix) {
             all_owner = false;
         }
     }
@@ -400,9 +403,16 @@ fn write_restricted(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     };
     #[cfg(windows)]
     let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny read sharing from birth: a racing local process must not be
+        // able to hold a read handle acquired before the ACL restriction.
+        // WRITE|DELETE sharing keep icacls (READ_CONTROL/WRITE_DAC) and the
+        // final rename working. (std defaults to fully shared.)
+        const FILE_SHARE_WRITE_OR_DELETE: u32 = 0x2 | 0x4;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .share_mode(FILE_SHARE_WRITE_OR_DELETE)
             .open(path)?;
         restrict_acl_to_user(path, false).inspect_err(|_| {
             let _ = fs::remove_file(path);
@@ -834,6 +844,14 @@ mod tests {
             "Successfully processed 1 files; Failed processing 0 files\n",
         );
         assert_eq!(is_owner_only_icacls(owned, k, "CORP\\alice"), Some(true));
+        // Windows renders the same account with different casing in whoami
+        // vs icacls; identities compare case-insensitively.
+        let mixed_case =
+            "C:\\Users\\alice\\k.priv Desktop-Abc12\\Alice:(F)\n\nSuccessfully processed 1 files\n";
+        assert_eq!(
+            is_owner_only_icacls(mixed_case, k, "DESKTOP-abc12\\alice"),
+            Some(true)
+        );
         // Extra ACEs come on indented continuation lines and are rejected.
         let shared = concat!(
             "C:\\k BUILTIN\\Administrators:(F)\n",
