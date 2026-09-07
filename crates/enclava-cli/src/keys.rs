@@ -326,7 +326,7 @@ fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
     // WRITE_OWNER, which a user-owned directory may legitimately lack — but
     // then the owner is already us and a DACL-only update is equivalent.
     // A genuinely foreign owner fails both paths and we refuse the directory.
-    let rc = unsafe {
+    let mut rc = unsafe {
         SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
@@ -343,7 +343,7 @@ fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
         return Ok(());
     }
     if path_owner_is_user(path)? {
-        let rc = unsafe {
+        rc = unsafe {
             SetNamedSecurityInfoW(
                 wide.as_ptr(),
                 SE_FILE_OBJECT,
@@ -358,6 +358,7 @@ fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
             return Ok(());
         }
     }
+    // The most recent failure, not the superseded owner-update one.
     Err(std::io::Error::from_raw_os_error(rc as i32))
 }
 
