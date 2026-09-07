@@ -1752,15 +1752,20 @@ fn write_private_log_key(path: &Path, key: &str) -> Result<(), Box<dyn std::erro
     let mut file = options
         .open(path)
         .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
+    #[cfg(windows)]
+    {
+        // Restrict the still-empty file before the key material is written.
+        if let Err(err) = enclava_cli::keys::restrict_file_to_user(path) {
+            let _ = std::fs::remove_file(path);
+            return Err(format!(
+                "failed to restrict log private key {}: {err}",
+                path.display()
+            )
+            .into());
+        }
+    }
     use std::io::Write as _;
     writeln!(file, "{key}")?;
-    #[cfg(windows)]
-    enclava_cli::keys::restrict_file_to_user(path).map_err(|err| {
-        format!(
-            "failed to restrict log private key {}: {err}",
-            path.display()
-        )
-    })?;
     Ok(())
 }
 

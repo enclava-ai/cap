@@ -124,6 +124,11 @@ impl CliPaths {
                     )?;
                 }
             }
+            #[cfg(windows)]
+            crate::keys::restrict_dir_to_user(dir).map_err(|e| ConfigError::Io {
+                path: dir.clone(),
+                source: e,
+            })?;
         }
         Ok(())
     }
@@ -184,6 +189,11 @@ pub fn save_bootstrap_key(
                 },
             )?;
         }
+        #[cfg(windows)]
+        crate::keys::restrict_dir_to_user(parent).map_err(|e| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
 
     write_secret_atomic(&path, private_key_hex.as_bytes())?;
@@ -213,6 +223,18 @@ fn write_secret_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> 
         path: temp_path.clone(),
         source: e,
     })?;
+    // Restrict the (still empty) file on Windows before the secret lands in
+    // it; on failure remove it so nothing is left behind with inherited ACLs.
+    #[cfg(windows)]
+    {
+        if let Err(e) = crate::keys::restrict_file_to_user(&temp_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(ConfigError::Io {
+                path: temp_path.clone(),
+                source: e,
+            });
+        }
+    }
     std::io::Write::write_all(&mut file, contents).map_err(|e| ConfigError::Io {
         path: temp_path.clone(),
         source: e,

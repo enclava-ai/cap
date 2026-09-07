@@ -192,14 +192,6 @@ fn key_path_for(user_id: &Uuid) -> Result<PathBuf, KeysError> {
 }
 
 #[cfg(unix)]
-fn set_file_perms_0600(path: &Path) -> Result<(), KeysError> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(unix)]
 fn set_dir_perms_0700(path: &Path) -> Result<(), KeysError> {
     use std::os::unix::fs::PermissionsExt;
     let perms = fs::Permissions::from_mode(0o700);
@@ -218,11 +210,6 @@ fn assert_mode_0600(path: &Path) -> Result<(), KeysError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn set_file_perms_0600(_: &Path) -> Result<(), KeysError> {
-    Err(KeysError::UnsupportedPlatform)
-}
-
-#[cfg(not(any(unix, windows)))]
 fn set_dir_perms_0700(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
 }
@@ -235,7 +222,7 @@ fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
 /// Resolve the current domain-qualified account (e.g. `CORP\\alice`) in the
 /// form `icacls` expects.
 #[cfg(windows)]
-fn current_user() -> Result<String, KeysError> {
+fn current_user() -> std::io::Result<String> {
     let user = String::from_utf8(std::process::Command::new("whoami").output()?.stdout).map_err(
         |err| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("whoami: {err}")),
     )?;
@@ -284,7 +271,7 @@ pub fn verify_owner_only_acl(path: &Path) -> Result<(), KeysError> {
 // swap to windows-sys DACL APIs if the subprocess cost or unusual accounts
 // (e.g. profile-remapped SIDs) ever bite.
 #[cfg(windows)]
-fn restrict_acl_to_user(path: &Path, inheritable: bool) -> Result<(), KeysError> {
+fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
     let user = current_user()?;
     let out = std::process::Command::new("icacls")
         .arg(path)
@@ -315,13 +302,9 @@ fn icacls_grant(user: &str, inheritable: bool) -> String {
 }
 
 #[cfg(windows)]
-fn set_file_perms_0600(path: &Path) -> Result<(), KeysError> {
-    restrict_acl_to_user(path, false)
-}
-
-#[cfg(windows)]
 fn set_dir_perms_0700(path: &Path) -> Result<(), KeysError> {
-    restrict_acl_to_user(path, true)
+    restrict_acl_to_user(path, true)?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -332,8 +315,15 @@ fn assert_mode_0600(path: &Path) -> Result<(), KeysError> {
 /// Restrict an existing file to the current user (the Windows counterpart of
 /// mode 0600); used by secret-file writers outside this module.
 #[cfg(windows)]
-pub fn restrict_file_to_user(path: &Path) -> Result<(), KeysError> {
+pub fn restrict_file_to_user(path: &Path) -> std::io::Result<()> {
     restrict_acl_to_user(path, false)
+}
+
+/// Restrict an existing directory (and, via inheritance, its future
+/// children) to the current user — the Windows counterpart of mode 0700.
+#[cfg(windows)]
+pub fn restrict_dir_to_user(path: &Path) -> std::io::Result<()> {
+    restrict_acl_to_user(path, true)
 }
 
 /// Generate a fresh keypair and persist it under `~/.enclava/keys/<user_id>.priv`.
@@ -344,8 +334,7 @@ pub fn create_and_store(user_id: Uuid) -> Result<UserSigningKey, KeysError> {
         return load(user_id);
     }
     let key = UserSigningKey::generate(user_id);
-    fs::write(&path, key.seed)?;
-    set_file_perms_0600(&path)?;
+    write_restricted(&path, &key.seed)?;
     Ok(key)
 }
 
@@ -359,6 +348,41 @@ pub fn store_seed_at(path: &Path, seed: &[u8; 32], force: bool) -> Result<(), Ke
     write_secret_atomic(path, seed)
 }
 
+/// Write secret bytes to `path` in a file that is owner-only from birth:
+/// the empty file is restricted *before* the secret is written, so no other
+/// local account can observe the material at any instant. On ACL failure the
+/// still-empty file is removed again.
+fn write_restricted(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let mut file = {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        restrict_acl_to_user(path, false).inspect_err(|_| {
+            let _ = fs::remove_file(path);
+        })?;
+        file
+    };
+    #[cfg(not(any(unix, windows)))]
+    return Err(KeysError::UnsupportedPlatform);
+    #[cfg(any(unix, windows))]
+    {
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+}
+
 /// Atomically write secret bytes to `path` (file mode 0600, parent dir 0700) via a
 /// `.tmp` rename so a crash never leaves a partial secret on disk.
 /// The rename also replaces an existing destination on Windows: std passes
@@ -369,8 +393,11 @@ fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
         set_dir_perms_0700(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    set_file_perms_0600(&tmp)?;
+    // Never follow a pre-planted file: remove and recreate below.
+    if tmp.exists() {
+        fs::remove_file(&tmp)?;
+    }
+    write_restricted(&tmp, bytes)?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
