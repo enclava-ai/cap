@@ -529,6 +529,30 @@ pub async fn claim_resources(
     })
 }
 
+/// Whether an app mutation lease is currently held (the exact complement of
+/// the reclaim predicate `claim` uses, so anything claimable is not busy).
+/// Deployment acceptance paths consult this under the app deployment lane so
+/// authority-snapshotted work is never accepted while an external mutation
+/// (for example a desired-state stop converging with the lane released, #95)
+/// can still publish a terminal status under it.
+pub(crate) async fn app_mutation_in_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM app_mutation_leases
+              WHERE app_id = $1
+                AND owner_token IS NOT NULL
+                AND reclaim_after > clock_timestamp()
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 pub async fn claim(
     state: &AppState,
     app_id: Uuid,

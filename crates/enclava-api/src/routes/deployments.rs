@@ -1130,6 +1130,15 @@ async fn deploy_app_candidate(
         if let Some(error) = runtime_reapply_status_error(current_status) {
             return Err(json_error(StatusCode::CONFLICT, error));
         }
+        if crate::mutation_leases::app_mutation_in_progress(&mut tx, app.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+        {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "app mutation already in progress",
+            ));
+        }
     }
     if app_has_incomplete_deployment_setup(&mut tx, app.id)
         .await
