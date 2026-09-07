@@ -18,8 +18,27 @@ use crate::manifest::containers::legacy_bootstrap_enabled;
 use crate::manifest::enclava_init_config;
 use crate::types::ConfidentialApp;
 
+const GUEST_MEMORY_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v1\n";
+
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
     let legacy = legacy_bootstrap_enabled();
+    // The signer binds this exact prefix into the policy hash/signature.
+    // Retry and rollback retain their stored policy and therefore its layout.
+    // Unmarked policies (including the local fallback) keep historical disks.
+    let guest_memory = app
+        .generated_agent_policy
+        .as_ref()
+        .is_some_and(|policy| policy.policy_text.starts_with(GUEST_MEMORY_LAYOUT_MARKER));
+    let bootstrap_empty_dir = |size: &str| {
+        if guest_memory {
+            EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity(size.to_string())),
+            }
+        } else {
+            EmptyDirVolumeSource::default()
+        }
+    };
     let mut v = vec![
         Volume {
             name: "logs".to_string(),
@@ -75,10 +94,7 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
         // bound.
         v.push(Volume {
             name: "enclava-tools".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource {
-                medium: Some("Memory".to_string()),
-                size_limit: Some(Quantity("16Mi".to_string())),
-            }),
+            empty_dir: Some(bootstrap_empty_dir("16Mi")),
             ..Default::default()
         });
         if app
@@ -113,18 +129,12 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
         });
         v.push(Volume {
             name: "state-mount".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource {
-                medium: Some("Memory".to_string()),
-                size_limit: Some(Quantity("1Mi".to_string())),
-            }),
+            empty_dir: Some(bootstrap_empty_dir("1Mi")),
             ..Default::default()
         });
         v.push(Volume {
             name: "tls-state-mount".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource {
-                medium: Some("Memory".to_string()),
-                size_limit: Some(Quantity("1Mi".to_string())),
-            }),
+            empty_dir: Some(bootstrap_empty_dir("1Mi")),
             ..Default::default()
         });
         v.push(Volume {

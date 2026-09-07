@@ -4,6 +4,24 @@
 
 use enclava_engine::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::{ConfidentialApp, GeneratedAgentPolicy};
+use sha2::{Digest, Sha256};
+
+const MEMORY_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v1\n";
+
+fn app_with_policy(policy_text: String) -> ConfidentialApp {
+    let mut app = sample_app();
+    app.generated_agent_policy = Some(GeneratedAgentPolicy {
+        policy_sha256: Sha256::digest(policy_text.as_bytes()).into(),
+        policy_text,
+        genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+    });
+    app
+}
+
+fn memory_app() -> ConfidentialApp {
+    app_with_policy(format!("{MEMORY_LAYOUT_MARKER}package agent_policy\n"))
+}
 
 #[test]
 fn volumes_has_ownership_signal() {
@@ -74,7 +92,7 @@ fn volumes_do_not_include_enclava_tools_emptydir() {
 
 #[test]
 fn volumes_enclava_tools_uses_memory_medium_and_16mi_limit() {
-    let vols = build_volumes(&sample_app());
+    let vols = build_volumes(&memory_app());
     let v = vols.iter().find(|v| v.name == "enclava-tools").unwrap();
     let ed = v.empty_dir.as_ref().unwrap();
     assert_eq!(ed.medium.as_deref(), Some("Memory"));
@@ -83,7 +101,7 @@ fn volumes_enclava_tools_uses_memory_medium_and_16mi_limit() {
 
 #[test]
 fn volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit() {
-    let vols = build_volumes(&sample_app());
+    let vols = build_volumes(&memory_app());
     for name in ["state-mount", "tls-state-mount"] {
         let v = vols.iter().find(|v| v.name == name).unwrap();
         let ed = v.empty_dir.as_ref().unwrap();
@@ -98,11 +116,113 @@ fn volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit() {
 
 #[test]
 fn volumes_logs_emptydir_uses_default_disk_medium() {
-    let vols = build_volumes(&sample_app());
+    let vols = build_volumes(&memory_app());
     let v = vols.iter().find(|v| v.name == "logs").unwrap();
     let ed = v.empty_dir.as_ref().unwrap();
     assert!(ed.medium.is_none());
     assert!(ed.size_limit.is_none());
+}
+
+#[test]
+fn historical_policy_replay_preserves_bootstrap_volume_layout() {
+    use enclava_engine::manifest::statefulset::generate_statefulset;
+
+    // Retry/rollback reconstruct the app with the original stored policy,
+    // even when the operation's deployment ID changes.
+    for (app, expected_memory) in [
+        (sample_app(), false),
+        (app_with_policy("package agent_policy\n".to_string()), false),
+        (memory_app(), true),
+    ] {
+        let original = generate_statefulset(&app);
+        let mut replay = app.clone();
+        replay.deployment_id = uuid::Uuid::new_v4();
+        let replayed = generate_statefulset(&replay);
+        let original_spec = original.spec.unwrap().template.spec.unwrap();
+        let replayed_spec = replayed.spec.unwrap().template.spec.unwrap();
+        assert_eq!(original_spec.volumes, replayed_spec.volumes);
+        assert_eq!(
+            replayed_spec.containers.last().unwrap().name,
+            "enclava-init"
+        );
+        for name in ["enclava-tools", "state-mount", "tls-state-mount"] {
+            let ed = replayed_spec
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|volume| volume.name == name)
+                .unwrap()
+                .empty_dir
+                .as_ref()
+                .unwrap();
+            assert_eq!(ed.medium.as_deref(), expected_memory.then_some("Memory"));
+            if !expected_memory {
+                assert!(ed.size_limit.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn only_exact_first_line_policy_marker_selects_memory() {
+    for prefix in [
+        "# enclava-cap-volume-layout: guest-memory-v2\n".to_string(),
+        format!("\n{MEMORY_LAYOUT_MARKER}"),
+        format!("\u{feff}{MEMORY_LAYOUT_MARKER}"),
+        MEMORY_LAYOUT_MARKER.replace('\n', "\r\n"),
+        MEMORY_LAYOUT_MARKER.trim_end().to_string(),
+        format!("# unrelated\n{MEMORY_LAYOUT_MARKER}"),
+        format!(" {MEMORY_LAYOUT_MARKER}"),
+    ] {
+        let app = app_with_policy(format!("{prefix}package agent_policy\n"));
+        let sts = enclava_engine::manifest::statefulset::generate_statefulset(&app);
+        for volume in sts.spec.unwrap().template.spec.unwrap().volumes.unwrap() {
+            if ["enclava-tools", "state-mount", "tls-state-mount"].contains(&volume.name.as_str()) {
+                assert_eq!(volume.empty_dir.unwrap(), Default::default());
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "generated_agent_policy.policy_sha256 must match policy_text")]
+fn adding_layout_marker_without_updating_policy_hash_is_rejected() {
+    let mut app = app_with_policy("package agent_policy\n".to_string());
+    app.generated_agent_policy
+        .as_mut()
+        .unwrap()
+        .policy_text
+        .insert_str(0, MEMORY_LAYOUT_MARKER);
+    enclava_engine::manifest::statefulset::generate_statefulset(&app);
+}
+
+#[test]
+fn legacy_bootstrap_keeps_disk_even_with_marked_policy() {
+    // Isolate the legacy environment switch from parallel tests.
+    if std::env::var("LEGACY_BOOTSTRAP_SCRIPT").as_deref() != Ok("true") {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "legacy_bootstrap_keeps_disk_even_with_marked_policy",
+            ])
+            .env("LEGACY_BOOTSTRAP_SCRIPT", "true")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let volumes = build_volumes(&memory_app());
+    let tools = volumes
+        .iter()
+        .find(|volume| volume.name == "enclava-tools")
+        .unwrap();
+    assert_eq!(tools.empty_dir.as_ref().unwrap(), &Default::default());
+    assert!(
+        volumes
+            .iter()
+            .all(|volume| !["state-mount", "tls-state-mount"].contains(&volume.name.as_str()))
+    );
 }
 
 #[test]
