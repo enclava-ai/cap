@@ -322,9 +322,10 @@ fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
     let acl = owner_only_dacl(&sid, inheritable)?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // Owner + whole-DACL replacement in one call: a foreign owner could
-    // otherwise rewrite the DACL right back. Setting the owner to ourselves
-    // fails (and we refuse the directory) unless we own it or hold
-    // WRITE_OWNER — fail-closed either way.
+    // otherwise rewrite the DACL right back. Setting the owner requires
+    // WRITE_OWNER, which a user-owned directory may legitimately lack — but
+    // then the owner is already us and a DACL-only update is equivalent.
+    // A genuinely foreign owner fails both paths and we refuse the directory.
     let rc = unsafe {
         SetNamedSecurityInfoW(
             wide.as_ptr(),
@@ -338,10 +339,66 @@ fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
             std::ptr::null_mut(),
         )
     };
-    if rc != 0 {
-        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    if rc == 0 {
+        return Ok(());
     }
-    Ok(())
+    if path_owner_is_user(path)? {
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl.as_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(rc as i32))
+}
+
+/// Whether `path`'s owner SID is the current user's.
+#[cfg(windows)]
+fn path_owner_is_user(path: &Path) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+
+    let ours = owner_sid()?;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        let mut psid_owner: PSID = std::ptr::null_mut();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut psid_owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut psd,
+        );
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+        let _sd = SecurityDescriptor(psd);
+        Ok(!psid_owner.is_null() && EqualSid(psid_owner, ours.as_ptr() as *mut _) != 0)
+    }
 }
 
 /// The current user's SID (raw bytes) from the process token.
@@ -597,6 +654,14 @@ fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
         fs::create_dir_all(parent)?;
         set_dir_perms_0700(parent)?;
     }
+    write_secret_file(path, bytes)
+}
+
+/// Write secret bytes to `path` (owner-only from birth, replacing any
+/// existing destination) via a `.tmp` rename. Unlike `write_secret_atomic`
+/// this does NOT restrict the parent directory, for user-chosen output
+/// locations such as recovery-backup files.
+pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     let tmp = path.with_extension("tmp");
     // Never follow a pre-planted file: remove and recreate below.
     if tmp.exists() {

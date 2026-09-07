@@ -2,7 +2,7 @@ use clap::Subcommand;
 use ed25519_dalek::{Signature, VerifyingKey};
 use enclava_common::crypto::owner_rotation_directive_bytes;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use enclava_cli::api_client::ApiClient;
@@ -427,14 +427,9 @@ async fn backup(
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = output.with_extension("tmp");
-    std::fs::write(&tmp, raw)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &output)?;
+    // Owner-only from birth on every platform; the parent directory is the
+    // user's chosen output location and is deliberately left untouched.
+    keys::write_secret_file(&output, &raw)?;
     println!("Encrypted recovery backup written to {}", output.display());
     println!("Seed fingerprint: {}", keys::seed_fingerprint(&seed));
     if mnemonics.is_empty() {
@@ -539,7 +534,7 @@ fn stored_mnemonics(
 }
 
 fn write_encrypted_backup(
-    output: &PathBuf,
+    output: &Path,
     seed: &[u8; 32],
     passphrase: &str,
     me: &CurrentUserResponse,
@@ -559,14 +554,7 @@ fn write_encrypted_backup(
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = output.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&backup)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(tmp, output)?;
+    keys::write_secret_file(output, &serde_json::to_vec_pretty(&backup)?)?;
     Ok(())
 }
 
