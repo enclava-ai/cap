@@ -229,21 +229,25 @@ fn current_user() -> std::io::Result<String> {
     Ok(user.trim_end().to_string())
 }
 
-/// Parse `icacls <path>` output: owner-only iff every ACE line grants access
-/// to `user` and nothing else. The first line echoes the path; the trailing
-/// summary line has no parenthesised rights — both are skipped. Fail-closed:
-/// any unrecognized ACE rejects the file.
-#[cfg(windows)]
-fn is_owner_only_icacls(text: &str, user: &str) -> bool {
+/// Parse `icacls <path>` output: owner-only iff every ACE grants access
+/// to `user` and nothing else. The first line echoes the path **with the
+/// first ACE on the same line**; additional ACEs follow on indented lines.
+/// The trailing summary line has no parenthesised rights and is ignored.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_owner_only_icacls(text: &str, path_echo: &str, user: &str) -> bool {
     let user_prefix = format!("{user}:(");
     let mut ace_lines = 0;
     let all_owner = text
         .lines()
-        .skip(1)
+        .map(|line| {
+            line.strip_prefix(path_echo)
+                .map(str::trim_start)
+                .unwrap_or(line.trim_start())
+        })
         .filter(|line| line.contains('('))
         .all(|line| {
             ace_lines += 1;
-            line.trim_start().starts_with(&user_prefix)
+            line.starts_with(&user_prefix)
         });
     // Fail closed: output we could not parse into at least one ACE line
     // (e.g. localized or unexpected icacls output) must not pass.
@@ -267,7 +271,11 @@ pub fn verify_owner_only_acl(path: &Path) -> Result<(), KeysError> {
         .into());
     }
     let user = current_user()?;
-    if !is_owner_only_icacls(&String::from_utf8_lossy(&out.stdout), &user) {
+    if !is_owner_only_icacls(
+        &String::from_utf8_lossy(&out.stdout),
+        &path.to_string_lossy(),
+        &user,
+    ) {
         return Err(KeysError::InsecurePermissions(path.to_path_buf()));
     }
     Ok(())
@@ -300,7 +308,7 @@ fn restrict_acl_to_user(path: &Path, inheritable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn icacls_grant(user: &str, inheritable: bool) -> String {
     if inheritable {
         format!("{user}:(OI)(CI)F")
@@ -790,33 +798,41 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    #[cfg(windows)]
     #[test]
     fn icacls_grant_marks_inheritance() {
         assert_eq!(icacls_grant(r"CORP\\alice", true), r"CORP\\alice:(OI)(CI)F");
         assert_eq!(icacls_grant(r"CORP\\alice", false), r"CORP\\alice:F");
     }
 
-    #[cfg(windows)]
     #[test]
     fn owner_only_icacls_parsing() {
-        let owned = "C:\\Users\\alice\\k.priv\nCORP\\alice:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n";
-        assert!(is_owner_only_icacls(owned, "CORP\\alice"));
-        // Extra grant for another account is rejected, even before the owner's ACE.
-        let shared = "C:\\k\nBUILTIN\\Administrators:(F)\nCORP\\alice:(F)\n\nSuccessfully processed 1 files\n";
-        assert!(!is_owner_only_icacls(shared, "CORP\\alice"));
+        let k = r"C:\Users\alice\k.priv";
+        // Single owner ACE: printed on the same line as the echoed path.
+        let owned = concat!(
+            "C:\\Users\\alice\\k.priv CORP\\alice:(F)\n",
+            "\n",
+            "Successfully processed 1 files; Failed processing 0 files\n",
+        );
+        assert!(is_owner_only_icacls(owned, k, "CORP\\alice"));
+        // Extra ACEs come on indented continuation lines and are rejected.
+        let shared = concat!(
+            "C:\\k BUILTIN\\Administrators:(F)\n",
+            "     CORP\\alice:(F)\n",
+            "\nSuccessfully processed 1 files\n",
+        );
+        assert!(!is_owner_only_icacls(shared, "C:\\k", "CORP\\alice"));
         // Similar account name must not pass as a prefix (CORP\\alice2).
-        let lookalike = "C:\\k\nCORP\\alice2:(F)\n";
-        assert!(!is_owner_only_icacls(lookalike, "CORP\\alice"));
+        let lookalike = "C:\\k CORP\\alice2:(F)\n";
+        assert!(!is_owner_only_icacls(lookalike, "C:\\k", "CORP\\alice"));
         // Inherited ACEs are ordinary ACE lines and are rejected.
-        let inherited = "C:\\k\nCORP\\alice:(F)\nEveryone:(R)\n";
-        assert!(!is_owner_only_icacls(inherited, "CORP\\alice"));
+        let inherited = "C:\\k CORP\\alice:(F)\n     Everyone:(R)\n";
+        assert!(!is_owner_only_icacls(inherited, "C:\\k", "CORP\\alice"));
         // Unparsable output (no recognizable ACE lines) is rejected, not
         // vacuously accepted.
         let empty = "C:\\k\n";
-        assert!(!is_owner_only_icacls(empty, "CORP\\alice"));
+        assert!(!is_owner_only_icacls(empty, "C:\\k", "CORP\\alice"));
         let localized = "C:\\k\n\u{5904}\u{7406}\u{4e86} 1 \u{4e2a}\u{6587}\u{4ef6}\n";
-        assert!(!is_owner_only_icacls(localized, "CORP\\alice"));
+        assert!(!is_owner_only_icacls(localized, "C:\\k", "CORP\\alice"));
     }
 
     // Serialise tests that mutate $HOME (test impacts a shared global).
