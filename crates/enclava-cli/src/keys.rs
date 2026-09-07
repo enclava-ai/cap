@@ -236,10 +236,18 @@ fn current_user() -> std::io::Result<String> {
 #[cfg(windows)]
 fn is_owner_only_icacls(text: &str, user: &str) -> bool {
     let user_prefix = format!("{user}:(");
-    text.lines()
+    let mut ace_lines = 0;
+    let all_owner = text
+        .lines()
         .skip(1)
         .filter(|line| line.contains('('))
-        .all(|line| line.trim_start().starts_with(&user_prefix))
+        .all(|line| {
+            ace_lines += 1;
+            line.trim_start().starts_with(&user_prefix)
+        });
+    // Fail closed: output we could not parse into at least one ACE line
+    // (e.g. localized or unexpected icacls output) must not pass.
+    all_owner && ace_lines > 0
 }
 
 /// Windows counterpart of the unix mode-0600 load-time check: reject key
@@ -803,6 +811,12 @@ mod tests {
         // Inherited ACEs are ordinary ACE lines and are rejected.
         let inherited = "C:\\k\nCORP\\alice:(F)\nEveryone:(R)\n";
         assert!(!is_owner_only_icacls(inherited, "CORP\\alice"));
+        // Unparsable output (no recognizable ACE lines) is rejected, not
+        // vacuously accepted.
+        let empty = "C:\\k\n";
+        assert!(!is_owner_only_icacls(empty, "CORP\\alice"));
+        let localized = "C:\\k\n\u{5904}\u{7406}\u{4e86} 1 \u{4e2a}\u{6587}\u{4ef6}\n";
+        assert!(!is_owner_only_icacls(localized, "CORP\\alice"));
     }
 
     // Serialise tests that mutate $HOME (test impacts a shared global).
