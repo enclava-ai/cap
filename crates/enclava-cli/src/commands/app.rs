@@ -1650,6 +1650,13 @@ fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::er
             .into());
         }
     }
+    #[cfg(windows)]
+    enclava_cli::keys::verify_owner_only_acl(path).map_err(|err| {
+        format!(
+            "existing log private key {} is readable by other users ({err}); restrict it to owner-only access (icacls <path> /inheritance:r /grant:r <user>:F)",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 

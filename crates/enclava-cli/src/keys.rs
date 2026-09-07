@@ -232,6 +232,52 @@ fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
     Err(KeysError::UnsupportedPlatform)
 }
 
+/// Resolve the current domain-qualified account (e.g. `CORP\\alice`) in the
+/// form `icacls` expects.
+#[cfg(windows)]
+fn current_user() -> Result<String, KeysError> {
+    let user = String::from_utf8(std::process::Command::new("whoami").output()?.stdout).map_err(
+        |err| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("whoami: {err}")),
+    )?;
+    Ok(user.trim_end().to_string())
+}
+
+/// Parse `icacls <path>` output: owner-only iff every ACE line grants access
+/// to `user` and nothing else. The first line echoes the path; the trailing
+/// summary line has no parenthesised rights — both are skipped. Fail-closed:
+/// any unrecognized ACE rejects the file.
+#[cfg(windows)]
+fn is_owner_only_icacls(text: &str, user: &str) -> bool {
+    let user_prefix = format!("{user}:(");
+    text.lines()
+        .skip(1)
+        .filter(|line| line.contains('('))
+        .all(|line| line.trim_start().starts_with(&user_prefix))
+}
+
+/// Windows counterpart of the unix mode-0600 load-time check: reject key
+/// material whose DACL grants access to anyone but the current user.
+#[cfg(windows)]
+pub fn verify_owner_only_acl(path: &Path) -> Result<(), KeysError> {
+    let out = std::process::Command::new("icacls").arg(path).output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "icacls failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim_end()
+            ),
+        )
+        .into());
+    }
+    let user = current_user()?;
+    if !is_owner_only_icacls(&String::from_utf8_lossy(&out.stdout), &user) {
+        return Err(KeysError::InsecurePermissions(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 /// Windows equivalent of chmod 0600/0700: drop inherited ACEs and grant the
 /// current user full control, via the native `icacls` tool.
 // ponytail: shells out to icacls and resolves the account via `whoami`;
@@ -239,14 +285,11 @@ fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
 // (e.g. profile-remapped SIDs) ever bite.
 #[cfg(windows)]
 fn restrict_acl_to_user(path: &Path, inheritable: bool) -> Result<(), KeysError> {
-    let user = String::from_utf8(std::process::Command::new("whoami").output()?.stdout).map_err(
-        |err| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("whoami: {err}")),
-    )?;
-    let user = user.trim_end();
+    let user = current_user()?;
     let out = std::process::Command::new("icacls")
         .arg(path)
         .args(["/inheritance:r", "/grant:r"])
-        .arg(icacls_grant(user, inheritable))
+        .arg(icacls_grant(&user, inheritable))
         .output()?;
     if !out.status.success() {
         return Err(std::io::Error::new(
@@ -282,10 +325,8 @@ fn set_dir_perms_0700(path: &Path) -> Result<(), KeysError> {
 }
 
 #[cfg(windows)]
-fn assert_mode_0600(_: &Path) -> Result<(), KeysError> {
-    // ACLs are restricted at write time and Windows has no umask-style
-    // permission drift, so there is nothing to re-check at load time.
-    Ok(())
+fn assert_mode_0600(path: &Path) -> Result<(), KeysError> {
+    verify_owner_only_acl(path)
 }
 
 /// Restrict an existing file to the current user (the Windows counterpart of
@@ -320,6 +361,8 @@ pub fn store_seed_at(path: &Path, seed: &[u8; 32], force: bool) -> Result<(), Ke
 
 /// Atomically write secret bytes to `path` (file mode 0600, parent dir 0700) via a
 /// `.tmp` rename so a crash never leaves a partial secret on disk.
+/// The rename also replaces an existing destination on Windows: std passes
+/// MOVEFILE_REPLACE_EXISTING, so `store_seed_at(force = true)` works everywhere.
 fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -717,6 +760,22 @@ mod tests {
     fn icacls_grant_marks_inheritance() {
         assert_eq!(icacls_grant(r"CORP\\alice", true), r"CORP\\alice:(OI)(CI)F");
         assert_eq!(icacls_grant(r"CORP\\alice", false), r"CORP\\alice:F");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_icacls_parsing() {
+        let owned = "C:\\Users\\alice\\k.priv\nCORP\\alice:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n";
+        assert!(is_owner_only_icacls(owned, "CORP\\alice"));
+        // Extra grant for another account is rejected, even before the owner's ACE.
+        let shared = "C:\\k\nBUILTIN\\Administrators:(F)\nCORP\\alice:(F)\n\nSuccessfully processed 1 files\n";
+        assert!(!is_owner_only_icacls(shared, "CORP\\alice"));
+        // Similar account name must not pass as a prefix (CORP\\alice2).
+        let lookalike = "C:\\k\nCORP\\alice2:(F)\n";
+        assert!(!is_owner_only_icacls(lookalike, "CORP\\alice"));
+        // Inherited ACEs are ordinary ACE lines and are rejected.
+        let inherited = "C:\\k\nCORP\\alice:(F)\nEveryone:(R)\n";
+        assert!(!is_owner_only_icacls(inherited, "CORP\\alice"));
     }
 
     // Serialise tests that mutate $HOME (test impacts a shared global).
