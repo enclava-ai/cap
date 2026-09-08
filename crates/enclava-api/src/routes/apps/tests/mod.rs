@@ -244,6 +244,67 @@ fn running_and_deleting_apps_require_workload_teardown_endpoint() {
 }
 
 #[tokio::test]
+async fn tenant_namespace_delete_succeeds_when_already_absent() {
+    // Both the initial GET and a raced DELETE can report absence. Neither
+    // permits another GET (which could fail after teardown already succeeded).
+    for absent_on_delete in [false, true] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let call = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    assert_eq!(request.uri().path(), "/api/v1/namespaces/absent-delete");
+                    let (status, body) = if absent_on_delete && call == 0 {
+                        assert_eq!(request.method(), "GET");
+                        (
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "v1", "kind": "Namespace",
+                                "metadata": {"name": "absent-delete", "uid": "old", "resourceVersion": "1"}
+                            }),
+                        )
+                    } else {
+                        assert_eq!(call, usize::from(absent_on_delete));
+                        assert_eq!(
+                            request.method().as_str(),
+                            if absent_on_delete { "DELETE" } else { "GET" }
+                        );
+                        (
+                            StatusCode::NOT_FOUND,
+                            serde_json::json!({
+                                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                "reason": "NotFound", "message": "absent", "code": 404
+                            }),
+                        )
+                    };
+                    Ok::<_, io::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(body.to_string().into_bytes()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        delete_tenant_namespace_with_timeouts(
+            kube::Api::all(client),
+            "absent-delete",
+            enclava_engine::apply::generation::MutationGeneration::new(1).unwrap(),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("confirmed absence converges immediately");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1 + usize::from(absent_on_delete)
+        );
+    }
+}
+
+#[tokio::test]
 async fn tenant_namespace_delete_is_bounded_when_provider_read_hangs() {
     let client = kube::Client::new(
         service_fn(|_request: Request<Body>| async move {

@@ -1656,6 +1656,18 @@ async fn complete_idempotent_result(
     }
 }
 
+/// Ordered app teardown is resumable even after partially applied provider work.
+/// Keep this exception local to DELETE; generic RetrySafe operations fail closed.
+async fn complete_app_delete_result(
+    lease: IdempotencyLease,
+    result: Result<IdempotencyResponse, InternalRouteError>,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    if matches!(&result, Err((status, _)) if status.is_server_error()) {
+        return Err(defer_idempotent_request(lease).await);
+    }
+    complete_idempotent_result(lease, result).await
+}
+
 /// Return an expiring capability exactly once without persisting it in CAP's
 /// idempotency ledger.  The incomplete row and its DB-authored lease are the
 /// replay marker: callers receive `idempotency_in_progress` while the
@@ -3393,6 +3405,131 @@ pub async fn list_paas_apps(
     }))
 }
 
+/// Reopen only the legacy failed-delete receipt, before ordinary terminal replay.
+/// operation_id identifies the request, not the app, so creation time is the
+/// available incarnation boundary. The execution path enforces it again.
+async fn begin_app_delete_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    auth: &AuthContext,
+    body: &serde_json::Value,
+    app_name: &str,
+) -> Result<IdempotencyBegin, InternalRouteError> {
+    let key = idempotency_key(headers)?;
+    let hash = request_hash(&serde_json::json!({
+        "cap_user_id": auth.user_id,
+        "cap_org_id": auth.org_id,
+        "body": body,
+    }))?;
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    let row: Option<IdempotencyRow> = sqlx::query_as(
+        "SELECT cap_internal_idempotency.*, clock_timestamp() AS database_now
+           FROM cap_internal_idempotency WHERE idempotency_key = $1 FOR UPDATE",
+    )
+    .bind(key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    if let Some(row) = row {
+        if row.method != "DELETE" || row.path != path || row.request_hash != hash {
+            return Err(idempotency_key_reused_error());
+        }
+        if row.recovery_kind.as_deref() == Some("retry_safe")
+            && row.response_status == Some(409)
+            && row.response_body.as_ref() == Some(&idempotency_recovery_required_body())
+            && row.completed_at.is_some()
+        {
+            let app_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM apps
+                  WHERE org_id = $1 AND name = $2
+                    AND status = 'deleting'::app_status_enum AND created_at < $3",
+            )
+            .bind(auth.org_id)
+            .bind(app_name)
+            .bind(row.created_at)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| db_error())?;
+            if let Some(app_id) = app_id {
+                crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+                    .await
+                    .map_err(|_| db_error())?;
+                let current: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM apps
+                      WHERE id = $1 AND org_id = $2 AND name = $3
+                        AND status = 'deleting'::app_status_enum AND created_at < $4
+                      FOR UPDATE",
+                )
+                .bind(app_id)
+                .bind(auth.org_id)
+                .bind(app_name)
+                .bind(row.created_at)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| db_error())?;
+                if current.is_some() {
+                    let token = Uuid::new_v4();
+                    // The owner trigger compares against OLD.reservation_token.
+                    set_idempotency_completion_owner(
+                        &mut tx,
+                        row.reservation_token.unwrap_or(token),
+                    )
+                    .await?;
+                    let updated = sqlx::query(
+                        "UPDATE cap_internal_idempotency
+                            SET response_status = NULL, response_body = NULL,
+                                completed_at = NULL, reservation_token = $2,
+                                lease_expires_at = clock_timestamp()
+                                    + ($3::bigint * interval '1 second'),
+                                known_not_applied = false,
+                                attempt_count = attempt_count + 1,
+                                updated_at = clock_timestamp()
+                          WHERE idempotency_key = $1
+                            AND reservation_token IS NOT DISTINCT FROM $4
+                            AND method = 'DELETE' AND path = $5 AND request_hash = $6
+                            AND recovery_kind = 'retry_safe' AND response_status = 409
+                            AND response_body = $7 AND completed_at IS NOT NULL",
+                    )
+                    .bind(key)
+                    .bind(token)
+                    .bind(IDEMPOTENCY_DEFAULT_LEASE_SECONDS)
+                    .bind(row.reservation_token)
+                    .bind(path)
+                    .bind(&hash)
+                    .bind(idempotency_recovery_required_body())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| db_error())?;
+                    if updated.rows_affected() != 1 {
+                        return Err(idempotency_in_progress_error());
+                    }
+                    let operation_id = row.operation_id.ok_or_else(db_error)?;
+                    tx.commit().await.map_err(|_| db_error())?;
+                    return Ok(IdempotencyBegin::Execute(IdempotencyLease::new(
+                        state.db.clone(),
+                        key.to_string(),
+                        token,
+                        IdempotencyLeaseClaim {
+                            operation_id,
+                            reclaimed: true,
+                            regenerate: false,
+                            config_token_receipt: None,
+                        },
+                        IdempotencyRecovery::RetrySafe,
+                    )));
+                }
+            }
+        }
+        if let Some(response) = completed_idempotency_response(&row) {
+            tx.commit().await.map_err(|_| db_error())?;
+            return Ok(IdempotencyBegin::Replay(response));
+        }
+    }
+    tx.rollback().await.map_err(|_| db_error())?;
+    begin_idempotent_request(state, key, "DELETE", path, &hash).await
+}
+
 pub async fn delete_paas_app(
     _auth: InternalAuth,
     State(state): State<AppState>,
@@ -3405,34 +3542,39 @@ pub async fn delete_paas_app(
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}");
-    let idempotency = match begin_actor_idempotent_request(
-        &state,
-        &headers,
-        "DELETE",
-        &path,
-        &auth,
-        &body,
-        IdempotencyRecovery::RetrySafe,
-    )
-    .await?
-    {
-        IdempotencyBegin::Execute(lease) => lease,
-        IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
-    };
+    let idempotency =
+        match begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name).await? {
+            IdempotencyBegin::Execute(lease) => lease,
+            IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
+        };
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
         let reclaimed = idempotency.reclaimed();
-        let status =
-            match crate::routes::apps::delete_app(auth, State(state.clone()), Path(app_name)).await
-            {
-                Ok(status) => status,
-                Err((StatusCode::NOT_FOUND, _)) if reclaimed => StatusCode::NO_CONTENT,
-                Err(error) => return Err(error),
-            };
+        let created_before = sqlx::query_scalar(
+            "SELECT created_at FROM cap_internal_idempotency
+              WHERE idempotency_key = $1 AND reservation_token = $2",
+        )
+        .bind(&idempotency.key)
+        .bind(idempotency.token)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| db_error())?;
+        let status = match crate::routes::apps::delete_app_before(
+            auth,
+            State(state.clone()),
+            Path(app_name),
+            Some(created_before),
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err((StatusCode::NOT_FOUND, _)) if reclaimed => StatusCode::NO_CONTENT,
+            Err(error) => return Err(error),
+        };
         let response = serde_json::json!({"status": "deleted"});
         Ok((status, response))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_app_delete_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -8389,6 +8531,607 @@ mod tests {
             assert_eq!(replay.1["error"], *message);
             assert_eq!(replay.1["idempotency_disposition"], "completed");
         }
+    }
+
+    async fn app_delete_fixture() -> (AppState, AuthContext, String, Uuid) {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("delete{}", &suffix[..8]);
+        let app_name = "delete-test".to_string();
+        insert_config_token_test_actor(&pool, org_id, &org_name, &suffix, user_id, &suffix).await;
+        insert_config_token_test_app(&pool, org_id, &org_name, app_id, &app_name, "old").await;
+        sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut state = idempotency_test_state(pool);
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name,
+            role: Role::Owner,
+            api_key: None,
+            management_origin: ManagementOrigin::PaasInternal,
+        };
+        (state, auth, app_name, app_id)
+    }
+
+    #[tokio::test]
+    async fn app_delete_partial_failure_defers_and_same_key_reexecutes() {
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("partial-delete-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let operation_id = lease.operation_id();
+        let failure = complete_app_delete_result(
+            lease,
+            Err(json_error(
+                StatusCode::BAD_GATEWAY,
+                "app_delete_namespace_unavailable",
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (failure.0, failure.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        let receipt: (bool, bool, bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, response_status IS NULL,
+                    response_body IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(receipt, (true, true, true, false));
+        let busy = begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+            .await
+            .err()
+            .expect("live lease must defer");
+        assert_eq!(
+            (busy.0, busy.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        expire_idempotency_lease(&state.db, &key).await;
+        let retry = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        assert!(retry.reclaimed());
+        assert_eq!(retry.operation_id(), operation_id);
+        let response = (
+            StatusCode::NO_CONTENT,
+            serde_json::json!({"status": "deleted"}),
+        );
+        complete_app_delete_result(retry, Ok(response.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_idempotency_replay(
+                begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                    .await
+                    .unwrap(),
+            ),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn app_delete_terminal_failure_recovery_preserves_success_and_incarnation() {
+        let (state, auth, app_name, app_id) = app_delete_fixture().await;
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        for (index, status, response, recover) in [
+            (
+                0,
+                StatusCode::CONFLICT,
+                idempotency_recovery_required_body(),
+                true,
+            ),
+            (
+                1,
+                StatusCode::NO_CONTENT,
+                serde_json::json!({"status": "deleted"}),
+                false,
+            ),
+            (
+                2,
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"error": "scope_not_allowed", "idempotency_disposition": "completed"}),
+                false,
+            ),
+            (
+                3,
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": "idempotency_recovery_required"}),
+                false,
+            ),
+        ] {
+            let key = format!("terminal-delete-{index}-{}", Uuid::new_v4());
+            let headers = idempotency_headers(&key);
+            let lease = expect_idempotency_execution(
+                begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                    .await
+                    .unwrap(),
+            );
+            let token = lease.token;
+            let operation = lease.operation_id();
+            finish_idempotent_request(lease, status, &response)
+                .await
+                .unwrap();
+            // Validate all request bindings before allowing terminal recovery.
+            for (method, changed_path, changed_auth, changed_body) in [
+                ("POST", path.clone(), auth.clone(), body.clone()),
+                (
+                    "DELETE",
+                    format!("{path}-other"),
+                    auth.clone(),
+                    body.clone(),
+                ),
+                (
+                    "DELETE",
+                    path.clone(),
+                    AuthContext {
+                        user_id: Uuid::new_v4(),
+                        ..auth.clone()
+                    },
+                    body.clone(),
+                ),
+                (
+                    "DELETE",
+                    path.clone(),
+                    AuthContext {
+                        org_id: Uuid::new_v4(),
+                        ..auth.clone()
+                    },
+                    body.clone(),
+                ),
+                (
+                    "DELETE",
+                    path.clone(),
+                    auth.clone(),
+                    serde_json::json!({"changed": true}),
+                ),
+            ] {
+                let mismatch = if method == "POST" {
+                    begin_actor_idempotent_request(
+                        &state,
+                        &headers,
+                        method,
+                        &changed_path,
+                        &changed_auth,
+                        &changed_body,
+                        IdempotencyRecovery::RetrySafe,
+                    )
+                    .await
+                } else {
+                    begin_app_delete_request(
+                        &state,
+                        &headers,
+                        &changed_path,
+                        &changed_auth,
+                        &changed_body,
+                        &app_name,
+                    )
+                    .await
+                }
+                .err()
+                .expect("request mismatch rejects before replay/recovery");
+                assert_eq!(mismatch.1.0["error"], "idempotency_key_reused");
+            }
+            let next = begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap();
+            if recover {
+                let recovered = expect_idempotency_execution(next);
+                assert!(recovered.reclaimed());
+                assert_ne!(recovered.token, token);
+                assert_eq!(recovered.operation_id(), operation);
+                finish_idempotent_request(recovered, status, &response)
+                    .await
+                    .unwrap();
+                // A live but non-deleting app cannot reopen this receipt.
+                sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+                    .bind(app_id)
+                    .execute(&state.db)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    expect_idempotency_replay(
+                        begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name,)
+                            .await
+                            .unwrap()
+                    ),
+                    (status, response.clone())
+                );
+                sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+                    .bind(app_id)
+                    .execute(&state.db)
+                    .await
+                    .unwrap();
+            } else {
+                assert_eq!(expect_idempotency_replay(next), (status, response));
+            }
+        }
+        let key = format!("incarnation-delete-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let created_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT created_at FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        finish_idempotent_request(
+            lease,
+            StatusCode::CONFLICT,
+            &idempotency_recovery_required_body(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_idempotency_replay(
+                begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name,)
+                    .await
+                    .unwrap()
+            )
+            .1,
+            idempotency_recovery_required_body()
+        );
+        let replacement = Uuid::new_v4();
+        insert_config_token_test_app(
+            &state.db,
+            auth.org_id,
+            &auth.org_name,
+            replacement,
+            &app_name,
+            "new",
+        )
+        .await;
+        sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+            .bind(replacement)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_idempotency_replay(
+                begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name,)
+                    .await
+                    .unwrap()
+            )
+            .1,
+            idempotency_recovery_required_body()
+        );
+        // Also fence recreation after receipt recovery but before route execution.
+        let rejected = crate::routes::apps::delete_app_before(
+            auth,
+            State(state.clone()),
+            Path(app_name),
+            Some(created_before),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.1.0["error"], "idempotency_resource_conflict");
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM apps WHERE id = $1)")
+                .bind(replacement)
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_delete_recovery_has_one_reservation_winner() {
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("concurrent-delete-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let operation = lease.operation_id();
+        finish_idempotent_request(
+            lease,
+            StatusCode::CONFLICT,
+            &idempotency_recovery_required_body(),
+        )
+        .await
+        .unwrap();
+        let (a, b) = tokio::join!(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name),
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name),
+        );
+        let mut winners = Vec::new();
+        for attempt in [a, b] {
+            match attempt {
+                Ok(IdempotencyBegin::Execute(lease)) => winners.push(lease),
+                Err(error) => assert_eq!(
+                    (error.0, error.1.0),
+                    (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+                ),
+                Ok(IdempotencyBegin::Replay(_)) => panic!("failed receipt must not replay"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].operation_id(), operation);
+        assert!(winners[0].reclaimed());
+        let attempts: i32 = sqlx::query_scalar(
+            "SELECT attempt_count FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+        complete_app_delete_result(winners.pop().unwrap(), Ok((StatusCode::NO_CONTENT, body)))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_delete_retry_finishes_after_namespace_removal() {
+        const CHILD: &str = "CAP_APP_DELETE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // KBS policy state and provider leases are global within a schema.
+            // Other tests (including failed runs) must not select an earlier failure.
+            let pool = database_test_pool().await;
+            let schema = format!("app_delete_{}", Uuid::new_v4().simple());
+            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mut database_url = reqwest::Url::parse(
+                &std::env::var("DATABASE_URL")
+                    .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".into()),
+            )
+            .unwrap();
+            database_url
+                .query_pairs_mut()
+                .append_pair("options", &format!("-csearch_path={schema}"));
+            // Isolate kube's process-wide configuration from other lib tests.
+            let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let namespace_deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mock_deleted = deleted.clone();
+            let mock_deletes = namespace_deletes.clone();
+            let resources = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                serde_json::Value,
+            >::new()));
+            let server = axum::Router::new().fallback(move |request: axum::extract::Request| {
+                let deleted = mock_deleted.clone();
+                let deletes = mock_deletes.clone();
+                let resources = resources.clone();
+                async move {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let path = request.uri().path().to_string();
+                    let method = request.method().clone();
+                    if path.starts_with("/zones/") {
+                        return (StatusCode::OK, Json(serde_json::json!({"success":true, "result":[], "errors":[]})));
+                    }
+                    let name = path.rsplit('/').next().unwrap();
+                    let metadata = serde_json::json!({"name": name, "uid": "fixture", "resourceVersion": "1"});
+                    if path.starts_with("/api/v1/namespaces/cap-") {
+                        if method == axum::http::Method::DELETE {
+                            deletes.fetch_add(1, SeqCst);
+                            deleted.store(true, SeqCst);
+                            return (StatusCode::OK, Json(serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Success", "code":200})));
+                        }
+                        if deleted.load(SeqCst) {
+                            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"NotFound", "message":"absent", "code":404})));
+                        }
+                        return (StatusCode::OK, Json(serde_json::json!({"apiVersion":"v1", "kind":"Namespace", "metadata":metadata})));
+                    }
+                    if method == axum::http::Method::PUT {
+                        let bytes = axum::body::to_bytes(request.into_body(), 1_048_576).await.unwrap();
+                        let resource: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        resources.lock().unwrap().insert(path, resource.clone());
+                        return (StatusCode::OK, Json(resource));
+                    }
+                    if let Some(resource) = resources.lock().unwrap().get(&path).cloned() {
+                        return (StatusCode::OK, Json(resource));
+                    }
+                    let resource = if path.contains("/configmaps/") {
+                        serde_json::json!({"apiVersion":"v1", "kind":"ConfigMap", "metadata":metadata,
+                            "data":{"haproxy.cfg":"", "policy.rego":"package policy\nresource_bindings := {}\nowner_resource_bindings := {}\n"}})
+                    } else {
+                        assert!(path.contains("/daemonsets/") || path.contains("/deployments/"), "unexpected provider request {path}");
+                        serde_json::json!({"apiVersion":"apps/v1", "kind": if path.contains("/daemonsets/") {"DaemonSet"} else {"Deployment"},
+                            "metadata":metadata, "spec":{"replicas":1, "selector":{}, "template":{"metadata":{}, "spec":{"containers":[]}}},
+                            "status":{"readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
+                    };
+                    (StatusCode::OK, Json(resource))
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+            let config =
+                std::env::temp_dir().join(format!("cap-delete-kube-{}.json", Uuid::new_v4()));
+            std::fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion":"v1", "kind":"Config", "current-context":"test",
+                    "clusters":[{"name":"test", "cluster":{"server":format!("http://{address}")}}],
+                    "contexts":[{"name":"test", "context":{"cluster":"test", "user":"test"}}],
+                    "users":[{"name":"test", "user":{}}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::internal::tests::app_delete_retry_finishes_after_namespace_removal",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("DATABASE_URL", database_url.as_str())
+                .env("KUBECONFIG", &config)
+                .env(
+                    "CAP_APP_DELETE_TEST_PROVIDER_URL",
+                    format!("http://{address}"),
+                )
+                .env("TENANT_HAPROXY_NAMESPACE", "tenant-envoy")
+                .env("TENANT_HAPROXY_CONFIGMAP", "haproxy-tenant")
+                .env("TENANT_HAPROXY_DAEMONSET", "haproxy-tenant")
+                .kill_on_drop(true)
+                .output();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(60), output).await;
+            task.abort();
+            std::fs::remove_file(config).unwrap();
+            sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let output = output.expect("delete retry must not deadlock").unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .matches("app_delete_kbs_policy_failed")
+                    .count(),
+                1,
+                "the first attempt must fail at KBS reconciliation"
+            );
+            assert_eq!(
+                namespace_deletes.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            return;
+        }
+
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_test_writer()
+            .init();
+        let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+        // The missing KBS config fails after both namespace teardown and soft deletes.
+        state.kbs_policy = None;
+        state.dns = Some(crate::dns::DnsConfig {
+            cloudflare_api_token: "test".into(),
+            cloudflare_api_base_url: std::env::var("CAP_APP_DELETE_TEST_PROVIDER_URL").unwrap(),
+            cloudflare_zone_id: Some("test".into()),
+            cloudflare_zone_name: "enclava.test".into(),
+            target: "192.0.2.1".into(),
+            required: true,
+        });
+        state.tee_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap();
+        for table in ["kbs_owner_bindings", "kbs_tls_bindings"] {
+            sqlx::query(&format!("INSERT INTO {table} (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+                SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1"))
+                .bind(app_id).execute(&state.db).await.unwrap();
+        }
+        let paas_id = auth.org_id.simple().to_string();
+        let key = format!("teardown-retry-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&key, &paas_id);
+        let failed = delete_paas_app(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(serde_json::json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (failed.0, failed.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        let state_after_failure: (String, bool, bool, i64) = sqlx::query_as(
+            "SELECT status::text,
+                (SELECT deleted_at IS NOT NULL FROM kbs_owner_bindings WHERE app_id = apps.id),
+                (SELECT deleted_at IS NOT NULL FROM kbs_tls_bindings WHERE app_id = apps.id),
+                (SELECT count(*) FROM audit_log WHERE org_id = apps.org_id AND action = 'app.delete')
+             FROM apps WHERE id = $1",
+        ).bind(app_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(state_after_failure, ("deleting".into(), true, true, 0));
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE operation_id = $1 AND resource_scope IN ('dns_hostname', 'kubernetes_namespace')
+                AND owner_token IS NOT NULL",
+        )
+        .bind(app_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, 0,
+            "confirmed cleanup must be durably released before KBS failure"
+        );
+        // Advance only finite quarantine. This must never hide an infinite-fence bug.
+        sqlx::query("UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE app_id = $1")
+            .bind(app_id).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE external_resource_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE operation_id = $1 AND reclaim_after <> 'infinity'::timestamptz")
+            .bind(app_id).execute(&state.db).await.unwrap();
+        expire_idempotency_lease(&state.db, &key).await;
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        for _ in 0..2 {
+            let (status, _) = delete_paas_app(
+                internal_test_auth(),
+                State(state.clone()),
+                Path((paas_id.clone(), app_name.clone())),
+                headers.clone(),
+                Json(serde_json::json!({})),
+            )
+            .await
+            .expect("retry completes and then replays");
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let final_rows: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM apps WHERE id = $1),
+                    (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.delete')",
+        )
+        .bind(app_id)
+        .bind(auth.org_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(final_rows, (0, 1));
     }
 
     #[tokio::test]
