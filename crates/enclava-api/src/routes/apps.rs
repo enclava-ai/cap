@@ -195,13 +195,16 @@ async fn delete_tenant_namespace_with_timeouts(
     operation_timeout: std::time::Duration,
 ) -> Result<(), enclava_engine::apply::engine::ApplyError> {
     let delete_and_wait = async {
-        enclava_engine::apply::generation::delete_resource(
+        let deleted = enclava_engine::apply::generation::delete_resource(
             &api,
             namespace,
             generation,
             kube::api::DeleteParams::default(),
         )
         .await?;
+        if !deleted {
+            return Ok(());
+        }
 
         let deadline = tokio::time::Instant::now() + convergence_timeout;
         loop {
@@ -1176,6 +1179,15 @@ pub async fn delete_app(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    delete_app_before(auth, State(state), Path(app_name), None).await
+}
+
+pub(crate) async fn delete_app_before(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+    created_before: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     ensure_management_write_allowed(&state, &auth).await?;
@@ -1195,6 +1207,15 @@ pub async fn delete_app(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
+
+    // Keep receipt recovery bound to the old incarnation. All subsequent
+    // mutations use this selected UUID, including after the lane is reacquired.
+    if created_before.is_some_and(|boundary| app.created_at >= boundary) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "idempotency_resource_conflict"})),
+        ));
+    }
 
     let mut delete_resources = vec![
         crate::mutation_leases::ResourceFence::dns(&app.domain),
@@ -1221,6 +1242,13 @@ pub async fn delete_app(
         delete_resources.push(crate::mutation_leases::ResourceFence::dns(custom_domain));
         delete_resources.push(crate::mutation_leases::ResourceFence::edge(custom_domain));
     }
+    let mut dns_fences: Vec<_> = delete_resources
+        .iter()
+        .filter(|fence| fence.scope == "dns_hostname")
+        .cloned()
+        .collect();
+    dns_fences.sort();
+    dns_fences.dedup();
     let mut delete_mutation =
         crate::mutation_leases::claim(&state, app.id, "app_delete", app.id, true, delete_resources)
             .await
@@ -1412,57 +1440,6 @@ pub async fn delete_app(
             })?;
     }
 
-    if state.dns.is_some() {
-        delete_mutation
-            .arm_resource_scope_until_reconciled("dns_hostname")
-            .await
-            .map_err(|_| internal_server_error())?;
-    }
-    let tracked_dns_cleanup = delete_mutation
-        .guard_provider(crate::dns::delete_all_dns_records_for_app(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            deleting_app.id,
-        ))
-        .await
-        .map_err(|_| internal_server_error())?;
-    if let Err(error) = tracked_dns_cleanup {
-        delete_mutation
-            .retain_resource_scope_until_reconciled_in_tx(&mut delete_lane, "dns_hostname")
-            .await
-            .map_err(|_| internal_server_error())?;
-        delete_lane
-            .commit()
-            .await
-            .map_err(|_| internal_server_error())?;
-        return Err(app_delete_dns_failure(deleting_app.id, error));
-    }
-    let expected_dns_cleanup = delete_mutation
-        .guard_provider(crate::dns::delete_managed_dns_pair_by_hostname(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            deleting_app.id,
-            &deleting_app.domain,
-            deleting_app
-                .tee_domain
-                .as_deref()
-                .unwrap_or(&deleting_app.domain),
-        ))
-        .await
-        .map_err(|_| internal_server_error())?;
-    if let Err(error) = expected_dns_cleanup {
-        delete_mutation
-            .retain_resource_scope_until_reconciled_in_tx(&mut delete_lane, "dns_hostname")
-            .await
-            .map_err(|_| internal_server_error())?;
-        delete_lane
-            .commit()
-            .await
-            .map_err(|_| internal_server_error())?;
-        return Err(app_delete_dns_failure(deleting_app.id, error));
-    }
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(auth.org_id)
         .fetch_one(&state.db)
@@ -1515,6 +1492,74 @@ pub async fn delete_app(
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
 
+    if state.dns.is_some() {
+        delete_mutation
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+    }
+    let tracked_dns_cleanup = delete_mutation
+        .guard_provider(crate::dns::delete_all_dns_records_for_app(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            deleting_app.id,
+        ))
+        .await
+        .map_err(|_| internal_server_error())?;
+    if let Err(error) = tracked_dns_cleanup {
+        delete_mutation
+            .retain_resource_scope_until_reconciled_in_tx(&mut delete_lane, "dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err(app_delete_dns_failure(deleting_app.id, error));
+    }
+    let expected_dns_cleanup = delete_mutation
+        .guard_provider(crate::dns::delete_managed_dns_pair_by_hostname(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            deleting_app.id,
+            &deleting_app.domain,
+            deleting_app
+                .tee_domain
+                .as_deref()
+                .unwrap_or(&deleting_app.domain),
+        ))
+        .await
+        .map_err(|_| internal_server_error())?;
+    if let Err(error) = expected_dns_cleanup {
+        delete_mutation
+            .retain_resource_scope_until_reconciled_in_tx(&mut delete_lane, "dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err(app_delete_dns_failure(deleting_app.id, error));
+    }
+    // Keep the app lane held, but commit reconciled DNS fences independently
+    // so a later namespace/KBS failure cannot roll back their release.
+    let mut fence_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    for fence in &dns_fences {
+        delete_mutation
+            .release_resource_in_tx(&mut fence_tx, fence)
+            .await
+            .map_err(|_| internal_server_error())?;
+    }
+    fence_tx
+        .commit()
+        .await
+        .map_err(|_| internal_server_error())?;
     let kubernetes_mutation_generation =
         enclava_engine::apply::generation::MutationGeneration::new(kubernetes_mutation_generation)
             .map_err(|_| internal_server_error())?;
@@ -1536,6 +1581,27 @@ pub async fn delete_app(
         .await
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;
+    // Absence is confirmed. Release in a short committed transaction while
+    // the existing delete_lane still serializes the app's remaining teardown.
+    let mut fence_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    delete_mutation
+        .release_resource_in_tx(
+            &mut fence_tx,
+            &crate::mutation_leases::ResourceFence::new(
+                "kubernetes_namespace",
+                &deleting_app.namespace,
+            ),
+        )
+        .await
+        .map_err(|_| internal_server_error())?;
+    fence_tx
+        .commit()
+        .await
+        .map_err(|_| internal_server_error())?;
     crate::kbs::soft_delete_owner_binding(&state.db, deleting_app.id)
         .await
         .map_err(|error| {

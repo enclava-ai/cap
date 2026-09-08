@@ -227,6 +227,9 @@ impl AppMutationLease {
         tx: &mut Transaction<'_, Postgres>,
         fence: &ResourceFence,
     ) -> Result<(), MutationLeaseError> {
+        if *self.heartbeat_lost.borrow() {
+            return Err(MutationLeaseError::Lost);
+        }
         self.stop_heartbeat();
         assert_current_rows(
             tx,
