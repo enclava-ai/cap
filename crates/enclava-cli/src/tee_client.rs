@@ -40,6 +40,12 @@ pub struct TeeClient {
     http: reqwest::Client,
     timeout: std::time::Duration,
     resolve_ip: Option<IpAddr>,
+    /// SNP HOST_DATA (launch measurement) verified by this client's
+    /// attestation. Present only on the SPKI-pinned client returned by
+    /// `attest_receipt_key()` after the AMD chain, nonce, TLS leaf SPKI, and
+    /// report data all verified; it binds every later `/status` read on this
+    /// client to the TEE whose launch produced that HOST_DATA.
+    verified_host_data: Option<[u8; 32]>,
 }
 
 /// Whether TEE TLS verification is relaxed for staging-type environments.
@@ -231,6 +237,22 @@ pub fn parse_terminal_bootstrap_error(body: &serde_json::Value) -> Option<Termin
     Some(TerminalBootstrapError { code, retry_after })
 }
 
+/// Deployment binding for terminal diagnostics: the SNP HOST_DATA (launch
+/// measurement) verified over a client's attestation must equal the locally
+/// trusted expected cc-init-data hash of the deployment being waited on.
+/// CAP validates the signed descriptor's hash when rendering the deployment
+/// and revalidates it at apply, so a matching HOST_DATA proves the responding
+/// TEE executes this deployment's launch configuration; the SPKI-pinned
+/// channel then guarantees the `/status` read reaches that same TEE. Missing
+/// verified HOST_DATA (unattested client, or development JSON evidence)
+/// never binds.
+pub fn host_data_binds_deployment(
+    verified_host_data: Option<&[u8; 32]>,
+    expected_cc_init_data_hash: &[u8; 32],
+) -> bool {
+    verified_host_data == Some(expected_cc_init_data_hash)
+}
+
 /// Strictly UTC RFC3339 (`Z` or zero offset); every other shape is rejected.
 fn parse_utc_rfc3339_deadline(raw: &str) -> Option<DateTime<Utc>> {
     let deadline = DateTime::parse_from_rfc3339(raw).ok()?;
@@ -337,6 +359,7 @@ impl TeeClient {
             http,
             timeout,
             resolve_ip,
+            verified_host_data: None,
         }
     }
 
@@ -356,7 +379,31 @@ impl TeeClient {
             http,
             timeout: self.timeout,
             resolve_ip: self.resolve_ip,
+            verified_host_data: self.verified_host_data,
         }
+    }
+
+    /// The SNP HOST_DATA (launch measurement) verified by this client's
+    /// attestation, when this client came from `attest_receipt_key()`.
+    pub fn verified_host_data(&self) -> Option<[u8; 32]> {
+        self.verified_host_data
+    }
+
+    /// Testing-only: pin a synthetic verified HOST_DATA onto a client,
+    /// standing in for a completed `attest_receipt_key()` verification.
+    /// Production code must never call this; only `attest_receipt_key()`
+    /// produces trustworthy HOST_DATA.
+    pub fn with_verified_host_data_for_tests(mut self, host_data: [u8; 32]) -> Self {
+        self.verified_host_data = Some(host_data);
+        self
+    }
+
+    /// Record the HOST_DATA verified during attestation. `None` (the
+    /// development JSON evidence path) leaves the client without deployment
+    /// binding evidence, so terminal diagnostics fail closed.
+    fn with_verified_host_data_checked(mut self, host_data: Option<[u8; 32]>) -> Self {
+        self.verified_host_data = host_data;
+        self
     }
 
     fn url(&self, path: &str) -> String {
@@ -722,8 +769,9 @@ impl TeeClient {
         let evidence = B64_STANDARD
             .decode(attestation.evidence.payload_b64.as_bytes())
             .map_err(|_| TeeError::Attestation("evidence payload is not base64".to_string()))?;
-        verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)
-            .await?;
+        let verified_host_data =
+            verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)
+                .await?;
         let evidence_sha256 = hex::encode(Sha256::digest(evidence));
         let transition_attestation = TransitionReceiptAttestation {
             tee_domain: endpoint.host,
@@ -732,7 +780,10 @@ impl TeeClient {
             receipt_pubkey_sha256: attestation.runtime_data_binding.receipt_pubkey_sha256,
             attestation_evidence_sha256: evidence_sha256,
         };
-        Ok((transition_attestation, self.with_http(pinned_http)))
+        let attested_client = self
+            .with_http(pinned_http)
+            .with_verified_host_data_checked(verified_host_data);
+        Ok((transition_attestation, attested_client))
     }
 }
 
@@ -917,7 +968,7 @@ async fn verify_evidence_report_data(
     evidence: &AttestationEvidence,
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
-) -> Result<(), TeeError> {
+) -> Result<Option<[u8; 32]>, TeeError> {
     verify_evidence_report_data_with_json_fallback(
         evidence,
         evidence_bytes,
@@ -932,7 +983,7 @@ async fn verify_evidence_report_data_with_json_fallback(
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
     allow_json_report_data_only: bool,
-) -> Result<(), TeeError> {
+) -> Result<Option<[u8; 32]>, TeeError> {
     let evidence_json = evidence
         .json
         .as_ref()
@@ -972,7 +1023,10 @@ async fn verify_evidence_report_data_with_json_fallback(
                 "SNP report_data does not bind nonce, TLS leaf SPKI, and receipt key".to_string(),
             ));
         }
-        return Ok(());
+        // HOST_DATA was verified together with the same AMD chain that
+        // authenticated report_data: preserve it as the launch measurement of
+        // exactly this endpoint.
+        return Ok(Some(report.host_data));
     }
 
     if !allow_json_report_data_only {
@@ -989,7 +1043,9 @@ async fn verify_evidence_report_data_with_json_fallback(
             "SNP report_data does not bind nonce, TLS leaf SPKI, and receipt key".to_string(),
         ));
     }
-    Ok(())
+    // The development JSON path carries no raw SNP report, so no trusted
+    // HOST_DATA exists: callers fail closed on deployment binding.
+    Ok(None)
 }
 
 #[derive(Debug)]

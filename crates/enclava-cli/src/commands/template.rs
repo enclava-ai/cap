@@ -29,7 +29,7 @@ use enclava_cli::{
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
-    BootstrapEndpointStatusDecision, SignedDeployBlobParams, StoragePasswordInput,
+    BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
     bootstrap_endpoint_status_decision, build_signed_deploy_blobs, claim_initial_ownership,
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
@@ -434,6 +434,9 @@ async fn deploy_with_timings(
         prepared_log_key.as_ref(),
         signed_blobs.log_encryption.as_ref(),
     )?;
+    // Locally trusted deployment identity, captured before the signed blobs
+    // are moved into the template instance request.
+    let trusted_deployment = signed_blobs.deployment.clone();
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
@@ -466,6 +469,10 @@ async fn deploy_with_timings(
         .unwrap_or("pending")
         .to_string();
     pb.set_position(3);
+    // The PaaS forwards the signed descriptor unchanged and preserves the
+    // returned CAP deployment id, so the trusted expectation is valid only
+    // when that returned id equals the signed descriptor's deploy id.
+    let deployment = DeploymentWait::trusted(&deployment_id, Some(&trusted_deployment));
     if template.unlock_mode == "password" {
         pb.set_message("Waiting for ownership claim endpoint...");
         if timings
@@ -474,7 +481,7 @@ async fn deploy_with_timings(
                 wait_for_template_bootstrap_endpoint(
                     api,
                     &instance_name,
-                    &deployment_id,
+                    deployment,
                     Duration::from_secs(args.ssh_timeout_seconds),
                     Duration::from_secs(3),
                     &pb,
@@ -491,7 +498,7 @@ async fn deploy_with_timings(
                         &ctx.paths,
                         &ctx.cli_config,
                         &instance_name,
-                        &deployment_id,
+                        deployment,
                         &storage_password,
                         capture,
                     ),
@@ -525,7 +532,7 @@ async fn deploy_with_timings(
                     api,
                     &instance_name,
                     &template.paas_managed_config_keys,
-                    &deployment_id,
+                    deployment,
                     Duration::from_secs(args.ssh_timeout_seconds),
                     &pb,
                 ),
@@ -563,7 +570,7 @@ async fn deploy_with_timings(
                 api,
                 DeliverTemplateConfigTarget {
                     instance_name: &instance_name,
-                    deployment_id: &deployment_id,
+                    deployment,
                 },
                 &mut tee,
                 &mut config_token,
@@ -589,7 +596,7 @@ async fn deploy_with_timings(
             wait_for_paas_ssh_command(
                 api,
                 &instance_name,
-                &deployment_id,
+                deployment,
                 stable_endpoint.as_str(),
                 app_url.as_str(),
                 Duration::from_secs(args.ssh_timeout_seconds),
@@ -778,7 +785,7 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
         match wait_for_paas_ssh_command(
             &api,
             &instance_name,
-            &latest_deployment_id,
+            DeploymentWait::new(&latest_deployment_id),
             stable_endpoint,
             expected_app_url.as_str(),
             Duration::from_secs(args.ssh_timeout_seconds),
@@ -1164,12 +1171,13 @@ fn debian_ssh_config_pairs(public_keys: String) -> Vec<(&'static str, String)> {
 async fn wait_for_template_bootstrap_endpoint(
     api: &ApiClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
     timings: &DeployTimings<impl Fn(&[u8]) -> std::io::Result<()>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let mut tee = None;
 
@@ -1246,7 +1254,7 @@ async fn wait_for_template_bootstrap_endpoint(
                             deployment_bound_terminal_bootstrap_error_on_channel(
                                 api,
                                 app_name,
-                                deployment_id,
+                                deployment,
                                 &attested_tee,
                                 start + max_wait,
                             )
@@ -1279,7 +1287,7 @@ async fn wait_for_template_bootstrap_endpoint(
                                         deployment_bound_terminal_bootstrap_error_on_channel(
                                             api,
                                             app_name,
-                                            deployment_id,
+                                            deployment,
                                             &attested_tee,
                                             start + max_wait,
                                         )
@@ -1363,7 +1371,7 @@ fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
 /// Deployment identity for template config delivery.
 struct DeliverTemplateConfigTarget<'a> {
     instance_name: &'a str,
-    deployment_id: &'a str,
+    deployment: DeploymentWait<'a>,
 }
 
 async fn deliver_template_config_with_retry(
@@ -1379,7 +1387,7 @@ async fn deliver_template_config_with_retry(
         api,
         tee,
         instance_name: target.instance_name,
-        deployment_id: target.deployment_id,
+        deployment: target.deployment,
         config_token,
         tee_url,
         tee_resolve_ip,
@@ -1396,7 +1404,7 @@ struct TemplateConfigDeliveryState<'a> {
     api: &'a ApiClient,
     tee: &'a mut TeeClient,
     instance_name: &'a str,
-    deployment_id: &'a str,
+    deployment: DeploymentWait<'a>,
     config_token: &'a mut String,
     tee_url: &'a mut String,
     tee_resolve_ip: &'a mut Option<std::net::IpAddr>,
@@ -1416,7 +1424,7 @@ impl TemplateConfigDeliveryState<'_> {
         let diagnostic = terminal_diagnostic_probe_with_budget(
             self.api,
             self.instance_name,
-            self.deployment_id,
+            self.deployment,
             Some(self.tee),
             terminal_diagnostic_budget(None),
         )
@@ -1530,7 +1538,7 @@ async fn wait_for_paas_managed_config_keys(
     api: &ApiClient,
     instance_name: &str,
     expected_keys: &[String],
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     timeout: Duration,
     progress: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1543,6 +1551,7 @@ async fn wait_for_paas_managed_config_keys(
     if expected.is_empty() {
         return Ok(());
     }
+    let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let deadline = start + timeout;
     let mut terminal_probe_at: Option<Instant> = None;
@@ -1561,13 +1570,9 @@ async fn wait_for_paas_managed_config_keys(
         // only a verified attested read can authorize the stop, and no
         // automatic retry happens here.
         if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
-            && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
-                api,
-                instance_name,
-                deployment_id,
-                deadline,
-            )
-            .await
+            && let Some(diagnostic) =
+                deployment_bound_terminal_bootstrap_error(api, instance_name, deployment, deadline)
+                    .await
         {
             progress.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(instance_name, &diagnostic).into());
@@ -2220,12 +2225,13 @@ fn is_reserved_http_app_host(host: &str) -> bool {
 async fn wait_for_paas_ssh_command(
     api: &ApiClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     stable_endpoint: &str,
     expected_app_url: &str,
     timeout: Duration,
     progress: &ProgressBar,
 ) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
+    let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
     while start.elapsed() < timeout {
@@ -2245,7 +2251,7 @@ async fn wait_for_paas_ssh_command(
             && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
                 api,
                 app_name,
-                deployment_id,
+                deployment,
                 start + timeout,
             )
             .await
@@ -5363,6 +5369,19 @@ mod tests {
         }
     }
 
+    fn template_test_expectation(
+        deploy_id: &str,
+        launch_hash: [u8; 32],
+    ) -> crate::commands::app::TrustedDeploymentExpectation {
+        crate::commands::app::TrustedDeploymentExpectation {
+            deploy_id: deploy_id.to_string(),
+            expected_cc_init_data_hash: launch_hash,
+            expected_firmware_measurement: enclava_common::descriptor::FirmwareMeasurement::Full(
+                [0x11; 48],
+            ),
+        }
+    }
+
     mod terminal_delivery_support {
         use base64::Engine as _;
         use std::net::SocketAddr;
@@ -5562,7 +5581,9 @@ mod tests {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
             TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
+                .with_verified_host_data_for_tests([0x09; 32])
         };
+        let expectation = template_test_expectation("expected-1", [0x09; 32]);
         let mut config_token = "token".to_string();
         let mut tee_url = tee_url;
         let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
@@ -5570,7 +5591,7 @@ mod tests {
             api: &api,
             tee: &mut tee,
             instance_name: "shell",
-            deployment_id: "expected-1",
+            deployment: DeploymentWait::trusted("expected-1", Some(&expectation)),
             config_token: &mut config_token,
             tee_url: &mut tee_url,
             tee_resolve_ip: &mut tee_resolve_ip,
@@ -5642,8 +5663,12 @@ mod tests {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
+            // The OLD deployment's TEE: its verified launch hash differs
+            // from the wait's trusted expectation.
             TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
+                .with_verified_host_data_for_tests([0x07; 32])
         };
+        let expectation = template_test_expectation("expected-1", [0x09; 32]);
         let mut config_token = "token".to_string();
         let mut tee_url = tee_url;
         let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
@@ -5651,7 +5676,7 @@ mod tests {
             api: &api,
             tee: &mut tee,
             instance_name: "shell",
-            deployment_id: "expected-1",
+            deployment: DeploymentWait::trusted("expected-1", Some(&expectation)),
             config_token: &mut config_token,
             tee_url: &mut tee_url,
             tee_resolve_ip: &mut tee_resolve_ip,

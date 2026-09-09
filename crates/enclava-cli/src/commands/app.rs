@@ -247,6 +247,7 @@ fn deploy_needs_initial_claim(
 }
 
 mod signing;
+pub(crate) use enclava_cli::descriptor::TrustedDeploymentExpectation;
 #[cfg(test)]
 pub(crate) use signing::{ConfidentialAppForCcHash, confidential_app_for_cc_hash};
 pub(crate) use signing::{
@@ -452,6 +453,9 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         workload_security_profile: WorkloadSecurityProfile::Restricted,
     })
     .await?;
+    // Locally trusted deployment identity, captured before the signed blobs
+    // are moved into the deploy request.
+    let trusted_deployment = signed_blobs.deployment;
 
     let req = DeployRequest {
         image: Some(args.image.clone()),
@@ -501,7 +505,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         if wait_for_bootstrap_endpoint(
             &api,
             &app_name,
-            &resp.deployment_id,
+            DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
             max_wait,
             poll_interval,
             &pb,
@@ -513,7 +517,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
                 &paths,
                 &cli_config,
                 &app_name,
-                &resp.deployment_id,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                 &storage_password,
                 capture,
             )
@@ -532,7 +536,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             wait_for_deploy_runtime(
                 &api,
                 &app_name,
-                &resp.deployment_id,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                 max_wait,
                 poll_interval,
                 &pb,
@@ -544,7 +548,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
                 ensure_password_storage_unlocked_for_config(
                     &api,
                     &app_name,
-                    &resp.deployment_id,
+                    DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                     &pb,
                     &storage_password,
                 )
@@ -564,7 +568,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         wait_for_deploy_runtime(
             &api,
             &app_name,
-            &resp.deployment_id,
+            DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
             max_wait,
             poll_interval,
             &pb,
@@ -575,7 +579,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             ensure_password_storage_unlocked_for_config(
                 &api,
                 &app_name,
-                &resp.deployment_id,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                 &pb,
                 &storage_password,
             )
@@ -606,7 +610,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
                 &api,
                 &tee,
                 &app_name,
-                &resp.deployment_id,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                 key,
                 value,
                 &token_resp.token,
@@ -629,7 +633,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     wait_for_deployment_completion(
         &api,
         &app_name,
-        &resp.deployment_id,
+        DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
         health_timeout,
         Duration::from_secs(2),
         &pb,
@@ -656,7 +660,7 @@ async fn set_deploy_config(
     api: &ApiClient,
     tee: &TeeClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     key: &str,
     value: &str,
     token: &str,
@@ -671,11 +675,7 @@ async fn set_deploy_config(
                 // evidence connects the endpoint to the expected deployment,
                 // and under a probe budget capped to the remaining deadline.
                 if let Some(diagnostic) = deployment_bound_terminal_bootstrap_error_on_channel(
-                    api,
-                    app_name,
-                    deployment_id,
-                    tee,
-                    deadline,
+                    api, app_name, deployment, tee, deadline,
                 )
                 .await
                 {
@@ -722,88 +722,50 @@ pub(crate) fn tee_terminal_diagnostic_probe_due(last: &mut Option<Instant>) -> b
     true
 }
 
-/// Probe the app's attested TEE for a terminal bootstrap diagnostic.
-///
-/// Only a diagnostic read over the SPKI-pinned client returned by
-/// `attest_receipt_key()` can produce a result; every failure (endpoint
-/// lookup, attestation, status read) yields `None`, so an unverified
-/// response never authorizes a stop and the caller keeps its existing
-/// retry deadline.
-pub(crate) async fn attested_terminal_bootstrap_error(
-    api: &ApiClient,
-    app_name: &str,
-) -> Option<TerminalBootstrapError> {
-    let endpoint = api.get_unlock_endpoint(app_name).await.ok()?;
-    let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
-        &endpoint.tee_url,
-        endpoint.tee_resolve_ip,
-    );
-    let (_attestation, attested_tee) = tee.attest_receipt_key().await.ok()?;
-    attested_tee
-        .bootstrap_status()
-        .await
-        .ok()?
-        .terminal_bootstrap_error
+/// Deployment identity for a wait: the CAP record id the wait is bound to
+/// (deployment-failure checks, messages, deadlines) plus the locally trusted
+/// expectation captured at signing time. The expectation is present only for
+/// fresh signed deploys whose returned deployment id equals the signed
+/// descriptor's `deploy_id`; resumed or rollback paths carry `None` and keep
+/// existing timeout behavior -- they must never attribute exact execution
+/// terminal.
+#[derive(Clone, Copy)]
+pub(crate) struct DeploymentWait<'a> {
+    pub deployment_id: &'a str,
+    pub expectation: Option<&'a TrustedDeploymentExpectation>,
 }
 
-/// Hard cap on one complete terminal-diagnostic probe (CAP binding lookups,
-/// attested read, and the binding re-check), so stalled CAP lookups, slow
-/// attestation, or KDS retry storms can never exceed the enclosing wait.
+impl<'a> DeploymentWait<'a> {
+    pub(crate) fn new(deployment_id: &'a str) -> Self {
+        Self {
+            deployment_id,
+            expectation: None,
+        }
+    }
+
+    /// Bind a wait to a signed deployment, but only when CAP (or the PaaS
+    /// forwarding to CAP) returned exactly the deployment id the signed
+    /// descriptor carries. A mismatched returned id invalidates the trusted
+    /// expectation: the wait falls back to untrusted timeout behavior.
+    pub(crate) fn trusted(
+        deployment_id: &'a str,
+        expectation: Option<&'a TrustedDeploymentExpectation>,
+    ) -> Self {
+        Self {
+            deployment_id,
+            expectation: expectation.filter(|expectation| {
+                !deployment_id.is_empty()
+                    && deployment_id != "pending"
+                    && expectation.deploy_id == deployment_id
+            }),
+        }
+    }
+}
+
+/// Hard cap on one complete terminal-diagnostic probe (CAP endpoint lookup,
+/// attested read), so stalled CAP lookups, slow attestation, or KDS retry
+/// storms can never exceed the enclosing wait.
 const TERMINAL_DIAGNOSTIC_PROBE_BUDGET: Duration = Duration::from_secs(15);
-
-/// Evidence from CAP's live observation that the app's serving TEE endpoint
-/// belongs to the expected deployment. CAP marks an observation `fresh` only
-/// when exactly one active pod -- labeled with the deployment id CAP applied
-/// from the deployment record carrying the signed descriptor's `deploy_id` --
-/// is running and the probed TEE status coheres with that pod; anything else
-/// is `partial`/`unavailable` with a reason. A missing observation or a
-/// mismatched deployment id never authorizes a stop.
-fn observation_binds_expected_deployment(
-    observation: Option<&AppStatusObservation>,
-    expected_deployment_id: &str,
-) -> bool {
-    let Some(observation) = observation else {
-        return false;
-    };
-    observation.state == "fresh"
-        && observation.reason.is_none()
-        && !observation.drifted
-        && observation.deployment_id.as_deref() == Some(expected_deployment_id)
-}
-
-/// Evidence connecting the app's serving TEE endpoint to the expected
-/// deployment, using only existing CAP contracts:
-/// - a fresh, reason-free, non-drifted live observation whose deployment id
-///   is exactly the expected one (see
-///   [`observation_binds_expected_deployment`]); or
-/// - the expected deployment is the app's *only* deployment record, so no
-///   predecessor TEE can exist on the app-bound endpoint.
-///
-/// Deployment history ordering is deliberately NOT treated as identity: with
-/// `[new, old]` while the endpoint still serves `old`, only the observation
-/// (or its absence, which fails closed) decides.
-async fn endpoint_belongs_to_expected_deployment(
-    api: &ApiClient,
-    app_name: &str,
-    expected_deployment_id: &str,
-) -> bool {
-    if expected_deployment_id.is_empty() || expected_deployment_id == "pending" {
-        return false;
-    }
-    if let Ok(status) = api.get_status(app_name).await
-        && observation_binds_expected_deployment(
-            status.observation.as_ref(),
-            expected_deployment_id,
-        )
-    {
-        return true;
-    }
-    matches!(
-        api.list_deployments(app_name).await,
-        Ok(deployments) if deployments.len() == 1
-            && deployments[0].id == expected_deployment_id
-    )
-}
 
 /// Budget for one terminal-diagnostic probe: the hard cap, never more than
 /// the enclosing wait's remaining time.
@@ -814,17 +776,27 @@ pub(crate) fn terminal_diagnostic_budget(wait_deadline: Option<Instant>) -> Dura
     })
 }
 
-/// One complete terminal-diagnostic probe under a hard budget: CAP must
-/// corroborate the endpoint as the expected deployment BEFORE the attested
-/// read, the diagnostic is read over an attested (SPKI-pinned) channel, and
-/// CAP must corroborate again AFTER the read. Any failure -- including a
-/// stalled lookup, attestation, or status read -- yields no diagnostic, so an
-/// unverified response or an unproven binding never authorizes a stop and the
-/// caller's existing deadline governs.
+/// One complete terminal-diagnostic probe under a hard budget.
+///
+/// Authorization requires the locally trusted deployment expectation and a
+/// verified endpoint-to-deployment binding: the SNP HOST_DATA (launch
+/// measurement) verified over the SAME SPKI-pinned client used for the
+/// `/status` read must equal the expectation's cc-init-data hash. The proxy
+/// `/attestation` binds nonce + TLS leaf SPKI pre-ACME, the AMD chain
+/// authenticates the report, and CAP validates the signed descriptor's hash
+/// when rendering the deployment (revalidated at apply), so matching
+/// HOST_DATA proves the responding TEE executes this deployment's launch
+/// configuration and the SPKI pin keeps the status read on that TEE.
+///
+/// Fresh-observation and deployment-history checks are deliberately NOT used
+/// as authorization: they cannot prove which TEE serves the endpoint. Any
+/// failure -- missing expectation, unattested client, HOST_DATA mismatch
+/// (e.g. an old deployment's TEE still serving), stalled lookup or read --
+/// yields no diagnostic, and the caller's existing deadline governs.
 pub(crate) async fn terminal_diagnostic_probe_with_budget(
     api: &ApiClient,
     app_name: &str,
-    expected_deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     attested: Option<&TeeClient>,
     budget: Duration,
 ) -> Option<TerminalBootstrapError> {
@@ -832,25 +804,43 @@ pub(crate) async fn terminal_diagnostic_probe_with_budget(
         return None;
     }
     tokio::time::timeout(budget, async {
-        if !endpoint_belongs_to_expected_deployment(api, app_name, expected_deployment_id).await {
-            return None;
+        let expectation = deployment.expectation?;
+        match attested {
+            Some(attested) => terminal_diagnostic_on_attested(attested, expectation).await,
+            None => {
+                let endpoint = api.get_unlock_endpoint(app_name).await.ok()?;
+                let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
+                    &endpoint.tee_url,
+                    endpoint.tee_resolve_ip,
+                );
+                let (_attestation, attested_tee) = tee.attest_receipt_key().await.ok()?;
+                terminal_diagnostic_on_attested(&attested_tee, expectation).await
+            }
         }
-        let diagnostic = match attested {
-            Some(attested) => attested
-                .bounded_status_json()
-                .await
-                .ok()
-                .and_then(|body| parse_terminal_bootstrap_error(&body)),
-            None => attested_terminal_bootstrap_error(api, app_name).await,
-        }?;
-        if !endpoint_belongs_to_expected_deployment(api, app_name, expected_deployment_id).await {
-            return None;
-        }
-        Some(diagnostic)
     })
     .await
     .ok()
     .flatten()
+}
+
+/// Read a terminal diagnostic over an attested (SPKI-pinned) client, but only
+/// when the client's verified SNP HOST_DATA binds it to the expected
+/// deployment's launch hash.
+async fn terminal_diagnostic_on_attested(
+    attested: &TeeClient,
+    expectation: &TrustedDeploymentExpectation,
+) -> Option<TerminalBootstrapError> {
+    if !enclava_cli::tee_client::host_data_binds_deployment(
+        attested.verified_host_data().as_ref(),
+        &expectation.expected_cc_init_data_hash,
+    ) {
+        return None;
+    }
+    attested
+        .bounded_status_json()
+        .await
+        .ok()
+        .and_then(|body| parse_terminal_bootstrap_error(&body))
 }
 
 /// Deployment-bound terminal-diagnostic probe for waits that do not hold an
@@ -859,13 +849,13 @@ pub(crate) async fn terminal_diagnostic_probe_with_budget(
 pub(crate) async fn deployment_bound_terminal_bootstrap_error(
     api: &ApiClient,
     app_name: &str,
-    expected_deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     wait_deadline: Instant,
 ) -> Option<TerminalBootstrapError> {
     terminal_diagnostic_probe_with_budget(
         api,
         app_name,
-        expected_deployment_id,
+        deployment,
         None,
         terminal_diagnostic_budget(Some(wait_deadline)),
     )
@@ -878,14 +868,14 @@ pub(crate) async fn deployment_bound_terminal_bootstrap_error(
 pub(crate) async fn deployment_bound_terminal_bootstrap_error_on_channel(
     api: &ApiClient,
     app_name: &str,
-    expected_deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     attested: &TeeClient,
     wait_deadline: Instant,
 ) -> Option<TerminalBootstrapError> {
     terminal_diagnostic_probe_with_budget(
         api,
         app_name,
-        expected_deployment_id,
+        deployment,
         Some(attested),
         terminal_diagnostic_budget(Some(wait_deadline)),
     )
@@ -953,7 +943,7 @@ pub(crate) fn bootstrap_endpoint_status_decision(
 pub(crate) async fn wait_for_bootstrap_endpoint(
     api: &ApiClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
@@ -993,7 +983,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                             deployment_bound_terminal_bootstrap_error_on_channel(
                                 api,
                                 app_name,
-                                deployment_id,
+                                deployment,
                                 &attested_tee,
                                 start + max_wait,
                             )
@@ -1024,7 +1014,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                                         deployment_bound_terminal_bootstrap_error_on_channel(
                                             api,
                                             app_name,
-                                            deployment_id,
+                                            deployment,
                                             &attested_tee,
                                             start + max_wait,
                                         )
@@ -1084,12 +1074,13 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
 async fn wait_for_deploy_runtime(
     api: &ApiClient,
     app_name: &str,
-    expected_deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
     target: DeployRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_deployment_id = deployment.deployment_id;
     let start = std::time::Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
 
@@ -1167,7 +1158,7 @@ async fn wait_for_deploy_runtime(
             && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
                 api,
                 app_name,
-                expected_deployment_id,
+                deployment,
                 start + max_wait,
             )
             .await
@@ -1197,7 +1188,7 @@ async fn wait_for_deploy_runtime(
                 && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error_on_channel(
                     api,
                     app_name,
-                    expected_deployment_id,
+                    deployment,
                     &attested_tee,
                     start + max_wait,
                 )
@@ -1337,11 +1328,12 @@ async fn wait_for_deployment_apply_start(
 async fn wait_for_deployment_completion(
     api: &ApiClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
     loop {
@@ -1361,7 +1353,7 @@ async fn wait_for_deployment_completion(
             && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
                 api,
                 app_name,
-                deployment_id,
+                deployment,
                 start + max_wait,
             )
             .await
@@ -1414,7 +1406,7 @@ async fn wait_for_deployment_completion(
 async fn ensure_password_storage_unlocked_for_config(
     api: &ApiClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     pb: &ProgressBar,
     storage_password: &StoragePasswordInput,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1431,7 +1423,7 @@ async fn ensure_password_storage_unlocked_for_config(
             pb.set_message("Unlocking storage before config delivery...");
             let password = storage_password.unlock_password()?;
             tee.unlock(&password).await?;
-            wait_for_deploy_unlock_completion(api, &tee, app_name, deployment_id).await?;
+            wait_for_deploy_unlock_completion(api, &tee, app_name, deployment).await?;
             Ok(())
         }
         "unclaimed" => {
@@ -1475,7 +1467,7 @@ async fn wait_for_deploy_unlock_completion(
     api: &ApiClient,
     tee: &TeeClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
@@ -1502,11 +1494,7 @@ async fn wait_for_deploy_unlock_completion(
         // deployment.
         if tee_unlock_state(&status) != "unlocked"
             && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error_on_channel(
-                api,
-                app_name,
-                deployment_id,
-                tee,
-                deadline,
+                api, app_name, deployment, tee, deadline,
             )
             .await
         {
@@ -1542,7 +1530,7 @@ pub(crate) async fn claim_initial_ownership(
     paths: &CliPaths,
     _cli_config: &config::CliConfig,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     storage_password: &StoragePasswordInput,
     capture: MnemonicCapture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1610,7 +1598,7 @@ pub(crate) async fn claim_initial_ownership(
                             deployment_bound_terminal_bootstrap_error_on_channel(
                                 api,
                                 app_name,
-                                deployment_id,
+                                deployment,
                                 &tee,
                                 Instant::now() + TERMINAL_DIAGNOSTIC_PROBE_BUDGET,
                             )
