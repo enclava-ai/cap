@@ -200,6 +200,40 @@ fn empty_or_malformed_deployment_allowlists_reject_every_deployment() {
 }
 
 #[test]
+fn explicit_null_or_non_array_deployment_ids_is_malformed_policy() {
+    let (bundle, _) = fixture();
+    for ids in [
+        serde_json::json!(null),
+        serde_json::json!("013c5158-971a-49f0-98b2-00ae125c7aa5"),
+        serde_json::json!(7),
+        serde_json::json!({}),
+        serde_json::json!([null]),
+        serde_json::json!([42]),
+    ] {
+        let policy = deployment_pinned_policy(ids.clone());
+        assert!(
+            TrustPolicy::parse(&policy).is_none(),
+            "deployment_ids {ids} must not parse"
+        );
+        let result = verify(&bundle, &policy, context());
+        assert_eq!(
+            result.verdict,
+            Verdict::Fail,
+            "deployment_ids {ids} accepted"
+        );
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|check| check.id == "policy.structure"
+                    && check.outcome == CheckOutcome::Fail
+                    && check.reason_code == "MALFORMED_POLICY"),
+            "deployment_ids {ids} must fail policy.structure with MALFORMED_POLICY"
+        );
+    }
+}
+
+#[test]
 fn absent_deployment_allowlist_preserves_the_broad_identity_contract() {
     let (bundle, policy) = fixture();
     let parsed = TrustPolicy::parse(&policy).expect("v1 policy without deployment_ids parses");

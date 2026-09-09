@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,9 +83,26 @@ pub struct TargetPolicy {
     /// deployment descriptor's `deploy_id` to equal one entry. An explicitly
     /// empty list rejects every deployment and is never a wildcard; malformed
     /// or unmatched entries fail closed. An absent field preserves the broader
-    /// organization/application identity contract.
-    #[serde(default)]
+    /// organization/application identity contract. The present-field contract
+    /// is array-only: an explicit `null` (like any other non-array value) is
+    /// malformed policy and must never silently widen admission back to the
+    /// broad org/application scope.
+    #[serde(default, deserialize_with = "reject_null_deployment_ids")]
     pub deployment_ids: Option<Vec<String>>,
+}
+
+fn reject_null_deployment_ids<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    match Option::<Vec<String>>::deserialize(deserializer) {
+        Ok(deployment_ids @ Some(_)) => Ok(deployment_ids),
+        Ok(None) => Err(D::Error::custom(
+            "deployment_ids must be an array when present, not null",
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

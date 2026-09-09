@@ -62,8 +62,11 @@ response-carried key is informational and must exactly match an independent pin.
 `deployment.identity` check additionally requires the signed deployment descriptor's `deploy_id`
 to equal one entry, compared as the canonical hyphenated lowercase UUID string. An explicitly
 empty list rejects every deployment and is never a wildcard; malformed or unmatched entries fail
-closed. When the field is absent, `deployment.identity` keeps the broader
-organization/application identity contract, so existing policies are unaffected.
+closed. The present-field contract is array-only: an explicit `null`, like any other non-array
+value or non-string entry, is malformed policy (`policy.structure` fails with
+`MALFORMED_POLICY`) and never silently widens admission. When the field is absent,
+`deployment.identity` keeps the broader organization/application identity contract, so existing
+policies are unaffected.
 
 Release-admission policies set exactly one CAP deployment UUID in `target.deployment_ids` and
 `transport.require_tls_channel_spki: true`, pinning the appraised bundle to the retained
