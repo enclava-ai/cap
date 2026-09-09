@@ -410,7 +410,7 @@ mod tests {
                 .parse::<axum::http::HeaderValue>()
                 .expect("header value"),
         );
-        failures.observe(StatusCode::TOO_MANY_REQUESTS, &headers, Utc::now());
+        failures.observe_response(StatusCode::TOO_MANY_REQUESTS, &headers, Utc::now());
 
         let failure = IssuanceFailure::diagnose(&error, &failures);
         let (status, Json(body)) = issuance_failure_response(&failure);

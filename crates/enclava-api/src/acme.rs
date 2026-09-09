@@ -95,9 +95,10 @@ pub struct IssuanceFailure {
     /// Bounded diagnostic code for the failure.
     pub code: IssuanceFailureCode,
     /// Validated UTC instant after which a new issuance attempt may be
-    /// retried, captured from the failing ACME API response's `Retry-After`
-    /// header. `None` when the header was absent, malformed, or out of
-    /// bounds.
+    /// retried, captured from the issuance's most recent transport exchange
+    /// when that exchange was an ACME API failure response. `None` when the
+    /// header was absent, malformed, out of bounds, or the exchange was a
+    /// success or transport failure.
     pub retry_after: Option<DateTime<Utc>>,
 }
 
@@ -120,13 +121,17 @@ impl IssuanceFailure {
     }
 }
 
-/// Issuance-local capture of `Retry-After` values from ACME API failure
+/// Issuance-local capture of the `Retry-After` value from ACME API failure
 /// responses.
 ///
-/// One capture belongs to exactly one issuance attempt: it is shared between
-/// that attempt's HTTP transport and its error handling only, never between
-/// concurrent issuances or accounts. Successful responses never update the
-/// stored value, so unrelated polling headers cannot become a retry deadline.
+/// The capture tracks exactly one transport exchange — the most recent one —
+/// so a stored deadline can only ever describe the response that produced
+/// the terminal failure. Successful responses and transport failures clear
+/// it, which keeps a recovered badNonce retry's header (instant-acme retries
+/// badNonce internally) from leaking into a later DNS failure, transport
+/// failure, or API problem embedded in a successful order body. One capture
+/// belongs to exactly one issuance attempt; concurrent issuances never share
+/// it, so unrelated polling headers cannot become a retry deadline either.
 #[derive(Clone, Default)]
 pub(crate) struct FailureHeaders {
     inner: Arc<FailureHeadersInner>,
@@ -138,17 +143,32 @@ struct FailureHeadersInner {
 }
 
 impl FailureHeaders {
-    /// Record the `Retry-After` header of an ACME API response when that
-    /// response is a failure. The last failure response is authoritative;
-    /// a failure without a usable header clears any earlier value.
-    pub(crate) fn observe(&self, status: StatusCode, headers: &HeaderMap, now: DateTime<Utc>) {
-        if status.is_client_error() || status.is_server_error() {
-            let retry_after = headers
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| parse_retry_after(value, now));
-            *self.lock() = retry_after;
-        }
+    /// Record the outcome of one transport exchange. A failure response
+    /// stores its own validated `Retry-After` (clearing when the header is
+    /// absent or unusable, so the last failure stays authoritative); any
+    /// other response clears, because its headers cannot describe a later
+    /// terminal failure.
+    pub(crate) fn observe_response(
+        &self,
+        status: StatusCode,
+        headers: &HeaderMap,
+        now: DateTime<Utc>,
+    ) {
+        let retry_after = (status.is_client_error() || status.is_server_error())
+            .then(|| {
+                headers
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| parse_retry_after(value, now))
+            })
+            .flatten();
+        *self.lock() = retry_after;
+    }
+
+    /// A transport-level failure carries no response headers; clear so no
+    /// earlier exchange's deadline can describe it.
+    pub(crate) fn observe_transport_failure(&self) {
+        *self.lock() = None;
     }
 
     pub(crate) fn retry_after(&self) -> Option<DateTime<Utc>> {
@@ -191,11 +211,13 @@ fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 
 /// The instant-acme HTTP transport for one issuance attempt.
 ///
-/// Forwards every request to the broker's shared reqwest client and observes
-/// ACME API failure responses so their `Retry-After` metadata stays attached
-/// to this issuance only. The default instant-acme client discards response
-/// headers on API failures, so the capture happens here, on the transport,
-/// before the error is surfaced.
+/// Forwards every request to the caller-provided reqwest client — in
+/// production the SSRF-guarded shared client (HTTPS-only, redirects
+/// disabled, guarded resolver; `crate::clients::build_guarded_client`) —
+/// adding no client policy of its own, and records the `Retry-After` header
+/// of failure responses into the issuance-local capture. The default
+/// instant-acme client discards response headers on API failures, so the
+/// capture happens here, on the transport, before the error is surfaced.
 struct IssuanceHttpClient {
     client: reqwest::Client,
     failures: FailureHeaders,
@@ -216,19 +238,28 @@ impl instant_acme::HttpClient for IssuanceHttpClient {
                 Ok(collected) => collected.to_bytes(),
                 Err(infallible) => match infallible {},
             };
-            let request = client
+            let request = match client
                 .request(parts.method, parts.uri.to_string())
                 .headers(parts.headers)
                 .body(body)
                 .build()
-                .map_err(|err| instant_acme::Error::Other(Box::new(err)))?;
-            let response = client
-                .execute(request)
-                .await
-                .map_err(|err| instant_acme::Error::Other(Box::new(err)))?;
+            {
+                Ok(request) => request,
+                Err(err) => {
+                    failures.observe_transport_failure();
+                    return Err(instant_acme::Error::Other(Box::new(err)));
+                }
+            };
+            let response = match client.execute(request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    failures.observe_transport_failure();
+                    return Err(instant_acme::Error::Other(Box::new(err)));
+                }
+            };
             let status = response.status();
             let headers = response.headers().clone();
-            failures.observe(status, &headers, Utc::now());
+            failures.observe_response(status, &headers, Utc::now());
             let forwarded = <http::Response<reqwest::Body>>::from(response);
             Ok(instant_acme::BytesResponse::from(forwarded))
         })
@@ -1049,7 +1080,7 @@ mod tests {
         assert!(error.to_string().contains(SYNTHETIC_PROVIDER_SECRET));
 
         let failures = FailureHeaders::default();
-        failures.observe(
+        failures.observe_response(
             StatusCode::TOO_MANY_REQUESTS,
             &header_map(&[("Retry-After", "60")]),
             Utc::now(),
@@ -1146,39 +1177,55 @@ mod tests {
     }
 
     #[test]
-    fn failure_capture_ignores_success_and_redirects_and_keeps_last_failure() {
+    fn failure_capture_tracks_only_the_latest_exchange() {
         let capture = FailureHeaders::default();
         let now = fixed_now();
 
-        // Successful polls (and redirects) never capture, even with headers.
-        capture.observe(StatusCode::OK, &header_map(&[("Retry-After", "999")]), now);
-        capture.observe(
+        // Successful responses — including ones carrying Retry-After, and
+        // redirects — clear: their headers cannot describe a later failure.
+        capture.observe_response(StatusCode::OK, &header_map(&[("Retry-After", "999")]), now);
+        assert_eq!(capture.retry_after(), None);
+        capture.observe_response(
             StatusCode::FOUND,
             &header_map(&[("Retry-After", "999")]),
             now,
         );
         assert_eq!(capture.retry_after(), None);
 
-        capture.observe(
+        capture.observe_response(
             StatusCode::TOO_MANY_REQUESTS,
             &header_map(&[("Retry-After", "120")]),
             now,
         );
         assert_eq!(capture.retry_after(), Some(now + TimeDelta::minutes(2)));
 
-        // A later success on the same issuance must not move the deadline.
-        capture.observe(StatusCode::OK, &header_map(&[("Retry-After", "999")]), now);
-        assert_eq!(capture.retry_after(), Some(now + TimeDelta::minutes(2)));
+        // A later success clears the stored failure deadline.
+        capture.observe_response(StatusCode::OK, &header_map(&[]), now);
+        assert_eq!(capture.retry_after(), None);
 
         // A failure without a usable header is authoritative for that
         // failure: it clears any earlier value.
-        capture.observe(StatusCode::BAD_GATEWAY, &header_map(&[]), now);
+        capture.observe_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "120")]),
+            now,
+        );
+        capture.observe_response(StatusCode::BAD_GATEWAY, &header_map(&[]), now);
         assert_eq!(capture.retry_after(), None);
-        capture.observe(
+        capture.observe_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &header_map(&[("Retry-After", "not-a-date")]),
             now,
         );
+        assert_eq!(capture.retry_after(), None);
+
+        // Transport-level failures carry no headers and clear too.
+        capture.observe_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "120")]),
+            now,
+        );
+        capture.observe_transport_failure();
         assert_eq!(capture.retry_after(), None);
     }
 
@@ -1188,18 +1235,18 @@ mod tests {
         let second = FailureHeaders::default();
         let now = fixed_now();
 
-        first.observe(
+        first.observe_response(
             StatusCode::TOO_MANY_REQUESTS,
             &header_map(&[("Retry-After", "100")]),
             now,
         );
-        second.observe(
+        second.observe_response(
             StatusCode::TOO_MANY_REQUESTS,
             &header_map(&[("Retry-After", "86400")]),
             now,
         );
         // A later failure of the first issuance does not touch the second.
-        first.observe(
+        first.observe_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &header_map(&[("Retry-After", "garbage")]),
             now,
@@ -1285,6 +1332,18 @@ mod tests {
             .expect("static test request")
     }
 
+    /// Loopback test client mirroring the production guarded client's
+    /// no-redirect policy (`crate::clients::build_guarded_client`:
+    /// HTTPS-only, redirects disabled, guarded resolver). HTTPS-only and the
+    /// guarded resolver cannot apply to loopback http; production gets them
+    /// from the shared client the transport forwards to unchanged.
+    fn test_loopback_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test loopback client")
+    }
+
     #[tokio::test]
     async fn issuance_transport_forwards_traffic_and_captures_failure_retry_after() {
         let addr = spawn_test_acme_server(|path| match path {
@@ -1298,7 +1357,7 @@ mod tests {
         .await;
         let failures = FailureHeaders::default();
         let transport = IssuanceHttpClient {
-            client: reqwest::Client::new(),
+            client: test_loopback_client(),
             failures: failures.clone(),
         };
 
@@ -1345,7 +1404,7 @@ mod tests {
             _ => (200, Some("999"), "{}".to_string()),
         })
         .await;
-        let shared = reqwest::Client::new();
+        let shared = test_loopback_client();
         let first = FailureHeaders::default();
         let second = FailureHeaders::default();
         let first_transport = IssuanceHttpClient {
@@ -1393,7 +1452,9 @@ mod tests {
         assert!(second_deadline > before + TimeDelta::hours(24) - TimeDelta::seconds(2));
         assert!(second_deadline < after + TimeDelta::hours(24) + TimeDelta::seconds(2));
 
-        // A later unrelated success on the shared transport changes neither.
+        // A later unrelated success on the shared transport clears the
+        // first issuance's own capture (its last exchange was a success)
+        // and leaves the untouched second issuance's deadline in place.
         let response = tokio::time::timeout(
             Duration::from_secs(10),
             instant_acme::HttpClient::request(
@@ -1405,7 +1466,131 @@ mod tests {
         .expect("bounded loopback request")
         .expect("forwarded request");
         assert_eq!(response.parts.status, StatusCode::OK);
-        assert_eq!(first.retry_after(), Some(first_deadline));
+        assert_eq!(first.retry_after(), None);
         assert_eq!(second.retry_after(), Some(second_deadline));
+    }
+
+    #[tokio::test]
+    async fn recovered_bad_nonce_header_never_describes_later_failures() {
+        // instant-acme retries badNonce internally: a 400 with Retry-After
+        // is followed by a retried request that succeeds. The recovered
+        // header must not survive into any later, unrelated failure.
+        let challenge_visits = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let addr = spawn_test_acme_server(move |path| match path {
+            "/challenge" => {
+                if challenge_visits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (
+                        400,
+                        Some("999"),
+                        "{\"type\":\"urn:ietf:params:acme:error:badNonce\"}".to_string(),
+                    )
+                } else {
+                    (200, None, "{}".to_string())
+                }
+            }
+            "/redirect" => (302, Some("999"), String::new()),
+            "/rate-limited" => (
+                429,
+                Some("120"),
+                "{\"type\":\"urn:ietf:params:acme:error:rateLimited\"}".to_string(),
+            ),
+            _ => (200, None, "{}".to_string()),
+        })
+        .await;
+        let failures = FailureHeaders::default();
+        let transport = IssuanceHttpClient {
+            client: test_loopback_client(),
+            failures: failures.clone(),
+        };
+
+        // The recovered badNonce exchange: failure first, retry succeeds.
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(&transport, test_acme_request(&addr, "/challenge")),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect("forwarded request");
+        assert_eq!(response.parts.status, StatusCode::BAD_REQUEST);
+        assert!(failures.retry_after().is_some());
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(&transport, test_acme_request(&addr, "/challenge")),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect("forwarded request");
+        assert_eq!(response.parts.status, StatusCode::OK);
+        assert_eq!(
+            failures.retry_after(),
+            None,
+            "recovered failure header cleared"
+        );
+
+        // A later DNS failure must not inherit the recovered deadline.
+        let dns_error = AcmeError::DnsPropagation {
+            record_name: "_acme-challenge.app.example.test".to_string(),
+        };
+        let diagnostic = IssuanceFailure::diagnose(&dns_error, &failures);
+        assert_eq!(diagnostic.code, IssuanceFailureCode::Failed);
+        assert_eq!(diagnostic.retry_after, None);
+
+        // An API problem embedded in a successful order body classifies by
+        // type but carries no deadline (its exchange was a success).
+        let embedded = AcmeError::Acme(instant_acme::Error::Api(api_problem(
+            Some("urn:ietf:params:acme:error:rateLimited"),
+            Some(SYNTHETIC_PROVIDER_SECRET),
+        )));
+        let diagnostic = IssuanceFailure::diagnose(&embedded, &failures);
+        assert_eq!(diagnostic.code, IssuanceFailureCode::RateLimited);
+        assert_eq!(diagnostic.retry_after, None);
+
+        // Redirects stay terminal at the transport (production policy:
+        // redirects disabled) and never capture.
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(&transport, test_acme_request(&addr, "/redirect")),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect("forwarded request");
+        assert_eq!(response.parts.status, StatusCode::FOUND);
+        assert_eq!(failures.retry_after(), None);
+
+        // A transport-level failure clears: first re-arm the capture with a
+        // failing response, then hit an unreachable address.
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(
+                &transport,
+                test_acme_request(&addr, "/rate-limited"),
+            ),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect("forwarded request");
+        assert_eq!(response.parts.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(failures.retry_after().is_some());
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let dead_addr = dead.local_addr().expect("loopback address");
+        drop(dead);
+        let transport_error = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(&transport, test_acme_request(&dead_addr, "/")),
+        )
+        .await
+        .expect("bounded loopback request");
+        assert!(transport_error.is_err(), "unreachable address must fail");
+        assert_eq!(failures.retry_after(), None, "transport failure cleared");
+        let diagnostic = IssuanceFailure::diagnose(
+            &AcmeError::Acme(instant_acme::Error::Other(Box::new(std::io::Error::other(
+                "transport",
+            )))),
+            &failures,
+        );
+        assert_eq!(diagnostic.code, IssuanceFailureCode::Failed);
+        assert_eq!(diagnostic.retry_after, None);
     }
 }
