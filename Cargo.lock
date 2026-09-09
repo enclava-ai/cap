@@ -1637,9 +1637,12 @@ dependencies = [
  "hkdf",
  "libcryptsetup-rs",
  "nix",
+ "pem",
  "rand 0.8.6",
  "rcgen",
  "reqwest 0.12.28",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1650,6 +1653,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
  "zeroize",
 ]
 
