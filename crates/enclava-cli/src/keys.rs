@@ -902,14 +902,16 @@ fn prepare_app_mnemonic_sink_with_dir_sync(
     // directory and every ancestor up to the filesystem root. A filesystem that
     // rejects directory fsync must fail HERE, before the claim is sent, instead
     // of passing preparation and dooming the post-claim store (review P1).
-    let mut ancestor = Some(parent);
+    //
+    // The walk starts from the canonicalized (absolute, symlink-resolved)
+    // location: the state root may itself be relative (`ENCLAVA_STATE_DIR=
+    // fresh-state` is supported by `CliPaths::resolve`), and a purely textual
+    // parent walk stops at the empty parent without ever flushing the current
+    // directory that holds the newly created state root's entry.
+    let mut ancestor = Some(fs::canonicalize(parent)?);
     while let Some(dir) = ancestor {
-        dir_sync(dir)?;
-        ancestor = match dir.parent() {
-            Some(parent) if parent.as_os_str().is_empty() => None,
-            Some(parent) => Some(parent),
-            None => None,
-        };
+        dir_sync(&dir)?;
+        ancestor = dir.parent().map(|parent| parent.to_path_buf());
     }
 
     // Exercise the full durability pipeline through the REAL temp path: create
@@ -1516,9 +1518,50 @@ mod tests {
             .expect("recording syncs must succeed");
 
         let flushed = flushed.into_inner();
-        assert!(flushed.contains(&paths.keys_dir.join("org-a")));
-        assert!(flushed.contains(&paths.keys_dir));
-        assert!(flushed.contains(&tmp.path().to_path_buf()));
+        let canon = |p: &Path| fs::canonicalize(p).unwrap();
+        assert!(flushed.contains(&canon(&paths.keys_dir.join("org-a"))));
+        assert!(flushed.contains(&canon(&paths.keys_dir)));
+        assert!(flushed.contains(&canon(&tmp.path())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_app_mnemonic_sink_flushes_directory_holding_relative_state_root() {
+        // Review reproduction: `ENCLAVA_STATE_DIR=fresh-state` is supported
+        // (config.rs resolves the raw value), so the whole keystore chain is
+        // relative. A textual parent walk flushed fresh-state/keys/org-a,
+        // fresh-state/keys and fresh-state but stopped at the empty parent
+        // without ever flushing the current directory holding the new state
+        // root's entry — leaving the state root creation non-durable. The walk
+        // must reach the directory containing the relative state root.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let paths = CliPaths::from_root(std::path::PathBuf::from("fresh-state")).unwrap();
+        let flushed = std::cell::RefCell::new(Vec::new());
+        let recorder = |dir: &Path| {
+            flushed.borrow_mut().push(dir.to_path_buf());
+            Ok(())
+        };
+        let prepared =
+            prepare_app_mnemonic_sink_with_dir_sync(&paths, "org-a", "shell1", &recorder);
+        let _ = std::env::set_current_dir(prev);
+        prepared.expect("relative state root preparation must succeed");
+
+        let flushed = flushed.into_inner();
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        let state_root = cwd.join("fresh-state");
+        assert!(flushed.contains(&state_root.join("keys").join("org-a")));
+        assert!(flushed.contains(&state_root.join("keys")));
+        assert!(flushed.contains(&state_root));
+        // The previously-missed flush: the current directory that holds the
+        // newly created state root's entry.
+        assert!(
+            flushed.contains(&cwd),
+            "must flush the directory holding a relative state root: {flushed:?}"
+        );
     }
 
     #[test]
