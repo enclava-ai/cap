@@ -1653,7 +1653,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "x509-parser",
+ "webpki-roots 1.0.6",
  "zeroize",
 ]
 

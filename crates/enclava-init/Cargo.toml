@@ -39,7 +39,7 @@ rcgen = "0.14"
 pem = "3"
 rustls-pki-types = "1"
 rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "std", "ring"] }
-x509-parser = { version = "0.18", features = ["verify"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 tempfile = "3"
