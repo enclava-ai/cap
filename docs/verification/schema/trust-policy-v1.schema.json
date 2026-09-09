@@ -39,7 +39,8 @@
         "caddy_digests": { "$ref": "#/$defs/nonemptyStrings" },
         "platform_release_versions": { "$ref": "#/$defs/nonemptyStrings" },
         "organization_ids": { "$ref": "#/$defs/nonemptyStrings" },
-        "application_ids": { "$ref": "#/$defs/nonemptyStrings" }
+        "application_ids": { "$ref": "#/$defs/nonemptyStrings" },
+        "deployment_ids": { "type": "array", "items": { "$ref": "#/$defs/nonemptyString" } }
       }
     },
     "trusted_org_keyring_sha256": { "$ref": "#/$defs/hex32List" },

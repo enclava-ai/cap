@@ -78,6 +78,14 @@ pub struct TargetPolicy {
     pub platform_release_versions: Vec<String>,
     pub organization_ids: Vec<String>,
     pub application_ids: Vec<String>,
+    /// Optional exact-deployment admission allowlist. When present, the
+    /// `deployment.identity` check additionally requires the signed CAP
+    /// deployment descriptor's `deploy_id` to equal one entry. An explicitly
+    /// empty list rejects every deployment and is never a wildcard; malformed
+    /// or unmatched entries fail closed. An absent field preserves the broader
+    /// organization/application identity contract.
+    #[serde(default)]
+    pub deployment_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]

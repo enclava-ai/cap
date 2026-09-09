@@ -402,7 +402,23 @@ fn verify_evidence(
                         .target
                         .application_ids
                         .iter()
-                        .any(|value| value == &descriptor.app_id.to_string()),
+                        .any(|value| value == &descriptor.app_id.to_string())
+                    // Optional exact-deployment admission: when the policy
+                    // supplies a `deployment_ids` allowlist, the signed
+                    // descriptor `deploy_id` must match one entry. An empty
+                    // allowlist admits nothing; it is never a wildcard, and
+                    // malformed entries can never equal the canonical UUID
+                    // string, so they fail closed. An absent allowlist keeps
+                    // the broader org/application identity contract.
+                    && policy
+                        .target
+                        .deployment_ids
+                        .as_ref()
+                        .is_none_or(|deployment_ids| {
+                            deployment_ids
+                                .iter()
+                                .any(|value| value == &descriptor.deploy_id.to_string())
+                        }),
                 "DEPLOYMENT_IDENTITY_REJECTED",
             ));
             checks.push(simple_check(

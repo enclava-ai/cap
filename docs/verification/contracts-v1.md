@@ -56,6 +56,22 @@ the full-width policy check required for an independent `PASS`.
 interval, and revocation status. Receipt lifetime and clock-skew bounds are policy inputs. A
 response-carried key is informational and must exactly match an independent pin.
 
+### Optional exact-deployment admission (`target.deployment_ids`)
+
+`target.deployment_ids` is an optional allowlist of CAP deployment UUIDs. When present, the
+`deployment.identity` check additionally requires the signed deployment descriptor's `deploy_id`
+to equal one entry, compared as the canonical hyphenated lowercase UUID string. An explicitly
+empty list rejects every deployment and is never a wildcard; malformed or unmatched entries fail
+closed. When the field is absent, `deployment.identity` keeps the broader
+organization/application identity contract, so existing policies are unaffected.
+
+Release-admission policies set exactly one CAP deployment UUID in `target.deployment_ids` and
+`transport.require_tls_channel_spki: true`, pinning the appraised bundle to the retained
+deployment and the observed TLS channel. Policies carrying `target.deployment_ids` are rejected
+by older verifiers (their strict `deny_unknown_fields` parsing refuses the unknown field), which
+is the intended fail-closed behavior: every consumer that appraises such policies must be
+updated to this verifier version or newer before the field is distributed.
+
 ## Appraisal result
 
 The JSON result fields are `verdict`, `bundle_sha256`, `policy_sha256`, `target_origin`,
