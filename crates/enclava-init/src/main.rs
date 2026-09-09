@@ -246,9 +246,30 @@ fn record_failure_file(safe_json: &str) {
     let termination_path = std::env::var("ENCLAVA_INIT_TERMINATION_LOG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/dev/termination-log"));
-    if let Err(err) = writes::atomic_write(&termination_path, body.as_bytes(), 0o644) {
+    if let Err(err) = write_termination_log_in_place(&termination_path, body.as_bytes()) {
         eprintln!("enclava-init: failed to write termination log: {err}");
     }
+}
+
+/// Write the Kubernetes termination log in place.
+///
+/// The kubelet bind-mounts `/dev/termination-log` into the container, and
+/// renaming over a mounted file fails with `EBUSY` — the tmp+rename of
+/// [`writes::atomic_write`] can never replace it, so the safe JSON would
+/// never reach that surface. Write the existing file in place instead
+/// (open + truncate + write + fsync). This advisory surface does not need
+/// rename atomicity: a crash mid-write leaves at most a truncated log,
+/// never cross-file corruption. The private init-error file keeps the
+/// atomic tmp+rename write.
+fn write_termination_log_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn record_stage(stage: &str) -> Result<()> {
@@ -553,19 +574,18 @@ fn fetch_wrap_key_with_retries(
         match client.fetch_wrap_key() {
             Ok(wrap_key) => return Ok(wrap_key),
             Err(err) => {
-                let err_text = err.to_string();
                 if attempt == attempts {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "KBS fetch failed after {attempts} attempt(s); last error: {err_text}"
-                        )
-                    });
+                    return Err(err)
+                        .with_context(|| format!("KBS fetch failed after {attempts} attempt(s)"));
                 }
+                // Safe bounded retry metadata only: the raw KBS error text
+                // carries the complete request URL — its path/query may hold
+                // secret markers — so it must never reach ordinary logs.
                 tracing::warn!(
                     attempt,
                     attempts,
                     retry_sleep_seconds = sleep.as_secs(),
-                    error = %err_text,
+                    error = "kbs_fetch_failed",
                     "KBS autounlock fetch failed; retrying"
                 );
                 std::thread::sleep(sleep);
@@ -591,7 +611,6 @@ fn wait_for_kbs_proxy_health_if_needed(kbs_url: &str) -> Result<()> {
         .context("building KBS proxy health client")?;
 
     tracing::info!(
-        url = %health_url,
         wait_seconds = wait_timeout.as_secs(),
         poll_seconds = poll.as_secs(),
         "waiting for local KBS proxy before autounlock"
@@ -614,9 +633,12 @@ fn wait_for_kbs_proxy_health_if_needed(kbs_url: &str) -> Result<()> {
                     "local KBS proxy health not ready"
                 );
             }
-            Err(err) => {
+            Err(_) => {
+                // Bounded code only: reqwest error text embeds the full
+                // (supplied) health URL, whose query may carry secret
+                // markers.
                 tracing::debug!(
-                    error = %err,
+                    error = "health_request_failed",
                     "local KBS proxy health request failed"
                 );
             }

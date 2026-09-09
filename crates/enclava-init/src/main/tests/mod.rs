@@ -4,11 +4,41 @@ use enclava_init::config::AppBindMountConfig;
 use enclava_init::safe_diagnostics::SafeDiagnosticCode;
 use enclava_init::tls_certificate::TlsBrokerFailure;
 use serde_json::json;
+use std::os::unix::fs::MetadataExt;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 /// Serializes tests that mutate the failure-reporting environment
 /// variables, so parallel test threads cannot observe each other's paths.
 static FAILURE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes tests that mutate the KBS retry environment variables.
+static KBS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// tracing writer that captures formatted events into a shared buffer, so
+/// tests can assert on the actual retry-path log output.
+#[derive(Clone)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CapturedMaker(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedMaker {
+    type Writer = CapturedWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedWriter(self.0.clone())
+    }
+}
 
 struct FailureEnvGuard {
     _dir: tempfile::TempDir,
@@ -97,6 +127,17 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
 
     record_stage("provisioning static tls certificate").unwrap();
 
+    // Model the kubelet's bind-mounted termination log: an existing file
+    // whose inode must survive the failure-path write (a rename over a
+    // mounted file fails with EBUSY, so the safe JSON must be written in
+    // place).
+    std::fs::write(
+        &env.termination,
+        "much longer previous termination content that must be fully replaced\n",
+    )
+    .unwrap();
+    let termination_inode_before = std::fs::metadata(&env.termination).unwrap().ino();
+
     // A bootstrap failure whose anyhow chain carries broker provider text
     // and supplied values, wrapped in the same contextual layers run()
     // adds around TLS provisioning.
@@ -135,6 +176,13 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
     assert_eq!(
         std::fs::read_to_string(&env.stage).unwrap(),
         "provisioning static tls certificate\n"
+    );
+    // The existing (mounted-style) termination file was rewritten in
+    // place: same inode, fully replaced content.
+    assert_eq!(
+        std::fs::metadata(&env.termination).unwrap().ino(),
+        termination_inode_before,
+        "termination log must be written in place, never renamed over"
     );
 }
 
@@ -182,6 +230,110 @@ fn recovery_clears_stale_failure_file() {
     // Clearing again (no stale error) stays a no-op.
     clear_error_file(&error_file_path());
     assert!(!env.error.exists());
+}
+
+#[test]
+fn kbs_fetch_retry_logging_carries_only_safe_bounded_metadata() {
+    let _env_lock = KBS_ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("ENCLAVA_INIT_KBS_FETCH_RETRIES", "2");
+        std::env::set_var("ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS", "1");
+    }
+
+    // The KBS URL is supplied signed-config input whose path/query may
+    // carry secret markers; kbs_fetch embeds the complete URL in its error
+    // text, so the actual retry path must log only bounded metadata.
+    const SYNTHETIC_KBS_URL_SENTINEL: &str = "SYNTHETIC-KBS-URL-SECRET";
+    let mut client = kbs_fetch::KbsClient::new(
+        format!("http://127.0.0.1:9/cdh/resource?marker={SYNTHETIC_KBS_URL_SENTINEL}"),
+        "default/app-owner/seed-encrypted".to_string(),
+    );
+    client.timeout = std::time::Duration::from_millis(200);
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(CapturedMaker(captured.clone()))
+        .finish();
+
+    let result =
+        tracing::subscriber::with_default(subscriber, || fetch_wrap_key_with_retries(&client));
+
+    assert!(result.is_err(), "unroutable KBS URL must fail the fetch");
+    let events = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        events.contains("KBS autounlock fetch failed; retrying"),
+        "retry warning must still be emitted: {events}"
+    );
+    assert!(
+        events.contains("\"attempt\":1"),
+        "attempt metadata: {events}"
+    );
+    assert!(
+        events.contains("\"attempts\":2"),
+        "attempts metadata: {events}"
+    );
+    assert!(
+        events.contains("\"error\":\"kbs_fetch_failed\""),
+        "bounded error code: {events}"
+    );
+    assert!(
+        events.contains("\"retry_sleep_seconds\":1"),
+        "retry sleep metadata: {events}"
+    );
+    assert!(
+        !events.contains(SYNTHETIC_KBS_URL_SENTINEL),
+        "retry logging leaked the supplied URL secret marker: {events}"
+    );
+    assert!(
+        !events.contains("127.0.0.1:9"),
+        "retry logging leaked the request URL: {events}"
+    );
+
+    unsafe {
+        std::env::remove_var("ENCLAVA_INIT_KBS_FETCH_RETRIES");
+        std::env::remove_var("ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS");
+    }
+}
+
+#[test]
+fn termination_log_write_is_in_place_like_a_mounted_file() {
+    let dir = tempdir().unwrap();
+    let termination = dir.path().join("termination-log");
+    // Model the kubelet's bind-mounted /dev/termination-log: an existing
+    // file whose inode must survive the write. Renaming over a mounted
+    // file fails with EBUSY, so only an in-place write reaches it; the
+    // inode staying identical proves no tmp+rename was attempted.
+    std::fs::write(
+        &termination,
+        "much longer previous termination content that must be fully replaced\n",
+    )
+    .unwrap();
+    let inode_before = std::fs::metadata(&termination).unwrap().ino();
+
+    write_termination_log_in_place(
+        &termination,
+        b"{\"error\":\"enclava_init_failed\",\"retry_after\":null,\"terminal\":true}\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&termination).unwrap(),
+        "{\"error\":\"enclava_init_failed\",\"retry_after\":null,\"terminal\":true}\n",
+        "existing content must be fully replaced (truncated), not appended"
+    );
+    assert_eq!(
+        std::fs::metadata(&termination).unwrap().ino(),
+        inode_before,
+        "in-place write must keep the mounted file's inode (no rename)"
+    );
+    let siblings = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name() != "termination-log")
+        .count();
+    assert_eq!(siblings, 0, "no rename-style temp siblings may be created");
 }
 
 #[test]
