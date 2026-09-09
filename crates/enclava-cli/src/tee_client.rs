@@ -457,6 +457,18 @@ impl TeeClient {
         Ok(bootstrap_status_from_json(&body))
     }
 
+    /// [`TeeClient::bootstrap_status`] under a hard budget, so a
+    /// terminal-classifying status read can never outlive the enclosing
+    /// wait. A budget expiry surfaces as `Err`, which callers treat as "no
+    /// status".
+    pub async fn bootstrap_status_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<TeeBootstrapStatus, TeeError> {
+        let body = self.bounded_status_json_within(budget).await?;
+        Ok(bootstrap_status_from_json(&body))
+    }
+
     /// The one safe `/status` read shared by every bootstrap-diagnostics
     /// caller. Successful bodies are capped at
     /// `MAX_BOOTSTRAP_STATUS_BODY_BYTES` (checked against `content-length`
@@ -472,6 +484,19 @@ impl TeeClient {
             read_bounded_response_body(resp, MAX_BOOTSTRAP_STATUS_BODY_BYTES, "TEE status body")
                 .await?;
         parse_status_body(&body)
+    }
+
+    /// [`TeeClient::bounded_status_json`] under a hard budget: the complete
+    /// read (connection, status code, bounded body) is cut when the budget
+    /// elapses, so a stalled endpoint cannot hold a wait past its deadline
+    /// via a status read.
+    pub async fn bounded_status_json_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<serde_json::Value, TeeError> {
+        tokio::time::timeout(budget, self.bounded_status_json())
+            .await
+            .map_err(|_| TeeError::Attestation("TEE status read exceeded its budget".to_string()))?
     }
 
     // --- Ownership operations (direct to TEE, no API token) ---

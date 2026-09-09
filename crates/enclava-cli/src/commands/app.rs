@@ -1010,8 +1010,14 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                     Err(_) => {
                         // One safe status read decides the challenge-failure
                         // fallback: a terminal diagnostic is never masked by a
-                        // claimed ownership state.
-                        match attested_tee.bootstrap_status().await {
+                        // claimed ownership state. The read runs under a
+                        // budget capped to the wait's remaining time.
+                        match attested_tee
+                            .bootstrap_status_within(terminal_diagnostic_budget(Some(
+                                start + max_wait,
+                            )))
+                            .await
+                        {
                             Ok(status) => match bootstrap_endpoint_status_decision(&status) {
                                 BootstrapEndpointStatusDecision::Terminal => {
                                     if let Some(diagnostic) =
@@ -1177,7 +1183,9 @@ async fn wait_for_deploy_runtime(
                 endpoint.tee_resolve_ip,
             )
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
-            && let Ok(status) = attested_tee.bounded_status_json().await
+            && let Ok(status) = attested_tee
+                .bounded_status_json_within(terminal_diagnostic_budget(Some(start + max_wait)))
+                .await
         {
             // A terminal diagnostic in this attested status body outranks both
             // direct-fallback success states -- but it may only stop the wait
@@ -1471,7 +1479,21 @@ async fn wait_for_deploy_unlock_completion(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        let status = tee.bounded_status_json().await?;
+        // The read runs under a budget capped to the remaining deadline: the
+        // ownership client's own request timeout (900 s) must not be able to
+        // hold this 300 s wait open.
+        let status = match tee
+            .bounded_status_json_within(terminal_diagnostic_budget(Some(deadline)))
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err("timed out waiting for unlock completion".into());
+                }
+                return Err(error.into());
+            }
+        };
         // An already-satisfied unlock wins over a stale terminal diagnostic;
         // otherwise a recognized terminal diagnostic parsed from this same
         // bounded status read over the attested channel stops the wait with
@@ -1569,7 +1591,10 @@ pub(crate) async fn claim_initial_ownership(
             // outranks everything, including a terminal diagnostic), while a
             // recognized terminal diagnostic replaces the raw transport
             // error. Never retry the claim and never regenerate identity.
-            match tee.bootstrap_status().await {
+            match tee
+                .bootstrap_status_within(terminal_diagnostic_budget(None))
+                .await
+            {
                 Ok(status) if status.claimed => {
                     return Err(
                         crate::commands::ownership::ownership_committed_recovery_backup_incomplete(

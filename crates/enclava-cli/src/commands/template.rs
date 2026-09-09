@@ -1267,7 +1267,9 @@ async fn wait_for_template_bootstrap_endpoint(
                         match timings
                             .run(
                                 DeployPhase::BootstrapStateFallback,
-                                attested_tee.bootstrap_status(),
+                                attested_tee.bootstrap_status_within(terminal_diagnostic_budget(
+                                    Some(start + max_wait),
+                                )),
                             )
                             .await
                         {
@@ -5332,7 +5334,9 @@ mod tests {
             .unwrap()
             + bootstrap_start;
         let bootstrap = &source[bootstrap_start..bootstrap_end];
-        let status_read = bootstrap.find("attested_tee.bootstrap_status()").unwrap();
+        let status_read = bootstrap
+            .find("attested_tee.bootstrap_status_within")
+            .unwrap();
         let terminal = bootstrap
             .find("BootstrapEndpointStatusDecision::Terminal")
             .unwrap();

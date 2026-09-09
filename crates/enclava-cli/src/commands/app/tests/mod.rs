@@ -2436,6 +2436,37 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
+    async fn budgeted_status_read_cuts_stalled_responses() {
+        // The standalone budgeted read (used by the unlock wait, runtime
+        // direct fallback, and bootstrap fallback arms) must cut a stalled
+        // response at its budget instead of holding the enclosing wait open
+        // up to the client's own request timeout.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_raw_server(requests, |_path| None).await;
+        let tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            local_tee_client(address)
+        };
+        let started = std::time::Instant::now();
+        let error = tee
+            .bounded_status_json_within(std::time::Duration::from_millis(250))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            error.to_string().contains("exceeded its budget"),
+            "unexpected error: {error}"
+        );
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_probe_budget_caps_stalled_attested_read() {
         // Binding passes (sole deployment record), but the attested /status
         // read stalls: the budget cuts the whole probe.
@@ -2608,5 +2639,23 @@ mod terminal_diagnostics {
             health.contains("deployment_bound_terminal_bootstrap_error"),
             "the health wait must use the deployment-bound terminal probe"
         );
+
+        // No terminal-classifying status read may escape a complete budget:
+        // the unlock wait, the runtime direct fallback, and the bootstrap
+        // fallback arms all use the deadline-capped reads.
+        let unlock_start = source
+            .find("async fn wait_for_deploy_unlock_completion")
+            .unwrap();
+        let unlock_end = source[unlock_start..]
+            .find("pub(crate) async fn claim_initial_ownership")
+            .unwrap()
+            + unlock_start;
+        assert!(
+            source[unlock_start..unlock_end]
+                .contains("bounded_status_json_within(terminal_diagnostic_budget"),
+            "the unlock wait's status read must be budget-capped to its deadline"
+        );
+        assert!(runtime.contains("bounded_status_json_within"));
+        assert!(source.contains("bootstrap_status_within(terminal_diagnostic_budget"));
     }
 }
