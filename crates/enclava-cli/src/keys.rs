@@ -663,7 +663,10 @@ fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
 /// Write secret bytes to `path` (owner-only from birth, replacing any
 /// existing destination) via a `.tmp` rename. Unlike `write_secret_atomic`
 /// this does NOT restrict the parent directory, for user-chosen output
-/// locations such as recovery-backup files.
+/// locations such as recovery-backup files. On unix the rename is made durable
+/// by flushing the parent directory; on other platforms the file contents are
+/// synced but rename durability is NOT provided — callers that require it must
+/// gate on [`secret_rename_durability_supported`] (claim sink preparation does).
 pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     let tmp = path.with_extension("tmp");
     // Never follow a pre-planted file: remove and recreate below.
@@ -677,20 +680,20 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
 }
 
 /// Flush the directory entry for a just-renamed secret so the rename itself
-/// survives a crash, not only the file contents. `write_restricted` already
-/// `sync_all`s the data before the rename. Failures propagate: a secret whose
-/// durable completion cannot be confirmed must not be reported as stored.
+/// survives a crash, not only the file contents (unix). `write_restricted`
+/// already `sync_all`s the data before the rename. Failures propagate on unix.
+///
+/// Other platforms have no verified directory-flush primitive in this codebase,
+/// so this is a no-op there: rename durability is NOT provided, only file-level
+/// durability. That is acceptable for legacy key/backup writes, but anything
+/// that must prove durable completion (the one-time recovery-mnemonic sink)
+/// rejects those platforms up front via [`secret_rename_durability_supported`].
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) -> Result<(), KeysError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    let dir = std::fs::OpenOptions::new()
-        .read(true)
-        .mode(0o700)
-        .open(parent)?;
+    let dir = std::fs::OpenOptions::new().read(true).open(parent)?;
     dir.sync_all()?;
     Ok(())
 }
@@ -698,6 +701,15 @@ fn sync_parent_dir(path: &Path) -> Result<(), KeysError> {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> Result<(), KeysError> {
     Ok(())
+}
+
+/// Whether durable completion of a secret's atomic rename can be proven on this
+/// platform: unix flushes the parent directory after the rename. No verified
+/// native equivalent exists here for Windows, so claim sink preparation (and
+/// thus ownership claims) fail closed there instead of pretending the one-time
+/// recovery mnemonic was durably persisted.
+pub fn secret_rename_durability_supported() -> bool {
+    cfg!(unix)
 }
 
 pub fn load_recovery_seed(paths: &CliPaths) -> Result<Option<[u8; 32]>, KeysError> {
@@ -790,37 +802,82 @@ pub fn store_app_mnemonic(
 /// mnemonic exactly once and rejects a second claim, so a destination that only
 /// fails afterwards loses the mnemonic permanently.
 ///
-/// Performs exactly the directory setup `store_app_mnemonic` would perform
-/// (org directory created with owner-only permissions), then proves the sink is
-/// writable by round-tripping a probe file through the same owner-only
-/// atomic-write primitives. The probe contains no secret material and is
-/// removed again on both outcomes.
+/// Validates the two REAL paths the store uses — the destination
+/// `{app}.mnemonic` and the atomic-write temp `{app}.tmp` — and proves
+/// writability by writing a probe through the real temp path with the same
+/// owner-only primitive the store uses. An existing regular file at the
+/// destination is a prior mnemonic backup and is left untouched (the post-claim
+/// store replaces it atomically); directories or symlinks at either real path
+/// are rejected fail-closed, because the post-claim rename/remove would be
+/// guaranteed to fail or write through a planted link. The probe contains no
+/// secret material and is removed again on both outcomes.
 pub fn prepare_app_mnemonic_sink(paths: &CliPaths, org: &str, app: &str) -> Result<(), KeysError> {
     const PROBE_BYTES: &[u8] = b"claim sink writability probe (not a secret)";
 
+    if !secret_rename_durability_supported() {
+        // Claims cannot risk an unpersistable one-time mnemonic: reject before
+        // the claim is sent rather than after ownership committed.
+        return Err(KeysError::InvalidBackup(
+            "claim sink preparation is unsupported on this platform: durable completion of \
+             the recovery-mnemonic write cannot be proven here (no verified directory-flush \
+             primitive). Run the ownership claim on a platform with proven secret-rename \
+             durability (unix)"
+                .to_string(),
+        ));
+    }
+
     validate_app_mnemonic_name(app)?;
-    let path = app_mnemonic_path(paths, org, app);
-    let Some(parent) = path.parent() else {
+    let dest = app_mnemonic_path(paths, org, app);
+    // `write_secret_file` stages the atomic write at `{app}.tmp` and renames it
+    // onto `{app}.mnemonic`; both real paths must be safe before the claim.
+    let tmp = dest.with_extension("tmp");
+    let Some(parent) = dest.parent() else {
         return Err(KeysError::InvalidBackup(format!(
             "recovery mnemonic path {} has no parent directory",
-            path.display()
+            dest.display()
         )));
     };
     fs::create_dir_all(parent)?;
     set_dir_perms_0700(parent)?;
 
-    // The `.bin` suffix keeps the probe's atomic-write temp name
-    // (`{app}.sink-probe.tmp`) distinct from the real mnemonic's (`{app}.tmp`).
-    let probe = parent.join(format!("{app}.sink-probe.bin"));
-    if let Err(err) = write_secret_file(&probe, PROBE_BYTES) {
-        // Best-effort cleanup of a partial probe; the write error is authoritative.
-        let _ = fs::remove_file(&probe);
-        return Err(err);
+    // Destination: an existing regular file is a prior mnemonic backup — keep it
+    // (the store's rename replaces it atomically; a pre-claim probe rename would
+    // clobber it). A directory or symlink makes that rename fail or unsafe, and
+    // a probe that ignored the real destination would pass here only to strand
+    // the one-time mnemonic after ownership commits.
+    if let Ok(meta) = fs::symlink_metadata(&dest)
+        && !meta.file_type().is_file()
+    {
+        return Err(KeysError::InvalidBackup(format!(
+            "recovery mnemonic destination {} is occupied by a directory or symlink; \
+             refusing to claim into it",
+            dest.display()
+        )));
     }
-    fs::remove_file(&probe).map_err(|err| {
+
+    // Atomic-write temp path: a leftover regular file is a crashed write temp;
+    // remove it exactly like the store would. A directory or symlink there
+    // cannot be removed by the store and would fail every post-claim attempt.
+    if let Ok(meta) = fs::symlink_metadata(&tmp) {
+        if !meta.file_type().is_file() {
+            return Err(KeysError::InvalidBackup(format!(
+                "recovery mnemonic temp path {} is occupied by a directory or symlink; \
+                 refusing to claim into it",
+                tmp.display()
+            )));
+        }
+        fs::remove_file(&tmp)?;
+    }
+
+    // Prove writability through the REAL temp path with the same owner-only
+    // primitive the store uses (create-new 0600 + fsync). The destination has
+    // been type-checked above and the temp lives in the same directory, so no
+    // realistic rename failure remains that these checks did not exclude.
+    write_restricted(&tmp, PROBE_BYTES)?;
+    fs::remove_file(&tmp).map_err(|err| {
         KeysError::InvalidBackup(format!(
             "claim sink probe {} could not be removed: {err}",
-            probe.display()
+            tmp.display()
         ))
     })?;
     Ok(())
@@ -1198,7 +1255,7 @@ mod tests {
             .collect();
         assert!(
             leftovers.is_empty(),
-            "probe must be removed, found {leftovers:?}"
+            "probe must be removed from the real temp path, found {leftovers:?}"
         );
         #[cfg(unix)]
         {
@@ -1216,18 +1273,99 @@ mod tests {
     }
 
     #[test]
-    fn prepare_app_mnemonic_sink_rejects_blocked_destination() {
+    fn prepare_app_mnemonic_sink_rejects_directory_at_real_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        // A directory at the REAL destination passes no probe at a distinct name
+        // but guarantees the post-claim rename fails; it must be rejected now.
+        fs::create_dir_all(paths.keys_dir.join("org-a").join("shell1.mnemonic")).unwrap();
+
+        let err = prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
+            .expect_err("destination directory must be rejected before the claim");
+        assert!(err.to_string().contains("shell1.mnemonic"));
+        // Nothing was touched: the blocking directory is still there.
+        assert!(
+            paths
+                .keys_dir
+                .join("org-a")
+                .join("shell1.mnemonic")
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn prepare_app_mnemonic_sink_rejects_directory_at_real_temp_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        fs::create_dir_all(paths.keys_dir.join("org-a").join("shell1.tmp")).unwrap();
+
+        let err = prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
+            .expect_err("temp-path directory must be rejected before the claim");
+        assert!(err.to_string().contains("shell1.tmp"));
+        assert!(paths.keys_dir.join("org-a").join("shell1.tmp").is_dir());
+    }
+
+    #[test]
+    fn prepare_app_mnemonic_sink_preserves_existing_backup_and_removes_stale_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        store_app_mnemonic(&paths, "org-a", "shell1", "prior backup mnemonic").unwrap();
+        // A stale regular temp from a crashed write must be cleaned, not kept.
+        fs::write(paths.keys_dir.join("org-a").join("shell1.tmp"), "stale").unwrap();
+
+        prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
+            .expect("existing regular backup must not block preparation");
+
+        // The prior backup is preserved byte-for-byte; only the stale temp is gone.
+        assert_eq!(
+            load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some("prior backup mnemonic".to_string())
+        );
+        assert!(!paths.keys_dir.join("org-a").join("shell1.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_app_mnemonic_sink_rejects_symlinks_at_either_real_path() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
         let org_dir = paths.keys_dir.join("org-a");
         fs::create_dir_all(&org_dir).unwrap();
-        // A directory squatting on the atomic-write temp name makes every store
-        // attempt fail, on any uid (root would bypass permission-based setups).
-        fs::create_dir_all(org_dir.join("shell1.sink-probe.tmp")).unwrap();
+        let outside = tmp.path().join("planted-target");
+        fs::write(&outside, "planted").unwrap();
 
+        std::os::unix::fs::symlink(&outside, org_dir.join("shell1.mnemonic")).unwrap();
         let err = prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
-            .expect_err("blocked sink must be rejected before the claim");
-        assert!(!err.to_string().is_empty());
+            .expect_err("symlinked destination must be rejected");
+        assert!(err.to_string().contains("directory or symlink"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "planted");
+
+        std::os::unix::fs::symlink(&outside, org_dir.join("shell1.tmp")).unwrap();
+        let err = prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
+            .expect_err("symlinked temp path must be rejected");
+        assert!(err.to_string().contains("directory or symlink"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "planted");
+    }
+
+    #[test]
+    fn prepare_app_mnemonic_sink_requires_proven_rename_durability() {
+        if secret_rename_durability_supported() {
+            // Unix: preparation proceeds past the durability gate.
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+            prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
+                .expect("unix provides proven rename durability");
+        } else {
+            // Platforms without a verified directory-flush primitive must fail
+            // closed with an actionable error, not pretend durability.
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+            let err = prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
+                .expect_err("unsupported platforms must reject claim sink preparation");
+            let msg = err.to_string();
+            assert!(msg.contains("durable completion"));
+            assert!(msg.contains("unix"));
+        }
     }
 
     #[test]

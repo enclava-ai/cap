@@ -795,10 +795,11 @@ mod tests {
     fn preclaim_gate_rejects_unwritable_sink() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
-        // A directory squatting on the atomic-write temp name makes every write
-        // attempt fail on any uid (root would bypass permission-based setups).
+        // A directory squatting on the REAL atomic-write temp name makes the
+        // post-claim store fail on any uid (root would bypass permission-based
+        // setups); the gate must reject it before the claim is sent.
         let org_dir = paths.keys_dir.join("org-a");
-        std::fs::create_dir_all(org_dir.join("shell1.sink-probe.tmp")).unwrap();
+        std::fs::create_dir_all(org_dir.join("shell1.tmp")).unwrap();
 
         let err = prepare_recovery_mnemonic_sink_for_session(
             &paths,
@@ -812,6 +813,64 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("sink is not ready"));
         assert!(!msg.contains(SYNTHETIC_MNEMONIC));
+    }
+
+    #[test]
+    fn preclaim_gate_rejects_directory_at_either_real_destination_path() {
+        // The store persists to `{app}.mnemonic` via an atomic rename from
+        // `{app}.tmp`; a directory at either REAL path guarantees the post-claim
+        // store fails, so the pre-claim gate must reject both — behavioral
+        // preflight failure, no mocks needed.
+        for blocked in ["shell1.mnemonic", "shell1.tmp"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+            std::fs::create_dir_all(paths.keys_dir.join("org-a").join(blocked)).unwrap();
+
+            let err = prepare_recovery_mnemonic_sink_for_session(
+                &paths,
+                "org-a",
+                "shell1",
+                MnemonicCapture::Store,
+                true,
+            )
+            .expect_err("blocked real destination must be rejected before the claim");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("sink is not ready"),
+                "gate must report the sink failure for {blocked}: {msg}"
+            );
+            assert!(
+                !msg.contains(SYNTHETIC_MNEMONIC),
+                "preflight failure must not leak the mnemonic for {blocked}"
+            );
+            // Rejected pre-claim: the blocking directory is untouched.
+            assert!(paths.keys_dir.join("org-a").join(blocked).is_dir());
+        }
+    }
+
+    #[test]
+    fn preclaim_gate_rejection_preserves_existing_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell1", "prior backup mnemonic").unwrap();
+        // Force preflight failure via the temp path while a valid backup exists.
+        std::fs::create_dir_all(paths.keys_dir.join("org-a").join("shell1.tmp")).unwrap();
+
+        prepare_recovery_mnemonic_sink_for_session(
+            &paths,
+            "org-a",
+            "shell1",
+            MnemonicCapture::Store,
+            true,
+        )
+        .expect_err("blocked temp path must fail preflight");
+
+        // The prior mnemonic backup survives the rejected preflight untouched.
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some("prior backup mnemonic".to_string())
+        );
     }
 
     #[test]
@@ -829,13 +888,7 @@ mod tests {
         .expect("interactive store-mode sink must be prepared");
 
         assert!(paths.keys_dir.join("org-a").is_dir());
-        assert!(
-            !paths
-                .keys_dir
-                .join("org-a")
-                .join("shell1.sink-probe.bin")
-                .exists()
-        );
+        assert!(!paths.keys_dir.join("org-a").join("shell1.tmp").exists());
     }
 
     #[test]
