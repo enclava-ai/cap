@@ -1,14 +1,22 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::dns::{self, DnsConfig};
 use crate::workload_tls_timing::{DnsErrorCategory, Phase, RequestTiming};
+use bytes::Bytes;
+use chrono::{DateTime, TimeDelta, Utc};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::RData;
+use http::header::RETRY_AFTER;
+use http::{HeaderMap, Request, StatusCode};
+use http_body_util::BodyExt;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
     NewOrder, OrderStatus, RetryPolicy,
@@ -45,13 +53,195 @@ pub enum AcmeError {
     Json(#[from] serde_json::Error),
 }
 
+/// The exact ACME problem type that maps to the broker's rate-limit
+/// diagnostic. Classification is byte-exact; any other value (including
+/// prefixed or suffixed lookalikes) stays a generic failure.
+const RATE_LIMITED_PROBLEM_TYPE: &str = "urn:ietf:params:acme:error:rateLimited";
+
+/// Largest `Retry-After` offset accepted from an ACME provider. Larger (or
+/// otherwise unusable) values produce no retry deadline instead of an
+/// unbounded timestamp.
+const MAX_RETRY_AFTER_SECONDS: i64 = 365 * 24 * 60 * 60;
+
+/// Bounded, provider-text-free diagnostic code for a terminal issuance
+/// failure. Never carries ACME problem details, CSRs, hostnames, request
+/// URLs, or any other provider-supplied text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuanceFailureCode {
+    /// The terminal ACME API problem type was exactly
+    /// `urn:ietf:params:acme:error:rateLimited`.
+    RateLimited,
+    /// Every other terminal issuance failure: transport errors, DNS
+    /// failures, unexpected statuses, and non-rate-limited or untyped ACME
+    /// problems.
+    Failed,
+}
+
+impl IssuanceFailureCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimited => "acme_rate_limited",
+            Self::Failed => "acme_certificate_issuance_failed",
+        }
+    }
+}
+
+/// Safe terminal diagnostics for one failed certificate issuance attempt.
+///
+/// Every field is bounded and safe for API responses and logs; the raw
+/// [`AcmeError`] is deliberately not preserved.
+#[derive(Debug, Clone)]
+pub struct IssuanceFailure {
+    /// Bounded diagnostic code for the failure.
+    pub code: IssuanceFailureCode,
+    /// Validated UTC instant after which a new issuance attempt may be
+    /// retried, captured from the failing ACME API response's `Retry-After`
+    /// header. `None` when the header was absent, malformed, or out of
+    /// bounds.
+    pub retry_after: Option<DateTime<Utc>>,
+}
+
+impl IssuanceFailure {
+    /// Build the safe diagnostic for a terminal issuance error and the
+    /// issuance-local failure-header capture.
+    pub(crate) fn diagnose(error: &AcmeError, failures: &FailureHeaders) -> Self {
+        let code = match error {
+            AcmeError::Acme(instant_acme::Error::Api(problem))
+                if problem.r#type.as_deref() == Some(RATE_LIMITED_PROBLEM_TYPE) =>
+            {
+                IssuanceFailureCode::RateLimited
+            }
+            _ => IssuanceFailureCode::Failed,
+        };
+        Self {
+            code,
+            retry_after: failures.retry_after(),
+        }
+    }
+}
+
+/// Issuance-local capture of `Retry-After` values from ACME API failure
+/// responses.
+///
+/// One capture belongs to exactly one issuance attempt: it is shared between
+/// that attempt's HTTP transport and its error handling only, never between
+/// concurrent issuances or accounts. Successful responses never update the
+/// stored value, so unrelated polling headers cannot become a retry deadline.
+#[derive(Clone, Default)]
+pub(crate) struct FailureHeaders {
+    inner: Arc<FailureHeadersInner>,
+}
+
+#[derive(Default)]
+struct FailureHeadersInner {
+    retry_after: Mutex<Option<DateTime<Utc>>>,
+}
+
+impl FailureHeaders {
+    /// Record the `Retry-After` header of an ACME API response when that
+    /// response is a failure. The last failure response is authoritative;
+    /// a failure without a usable header clears any earlier value.
+    pub(crate) fn observe(&self, status: StatusCode, headers: &HeaderMap, now: DateTime<Utc>) {
+        if status.is_client_error() || status.is_server_error() {
+            let retry_after = headers
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| parse_retry_after(value, now));
+            *self.lock() = retry_after;
+        }
+    }
+
+    pub(crate) fn retry_after(&self) -> Option<DateTime<Utc>> {
+        *self.lock()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<DateTime<Utc>>> {
+        self.inner
+            .retry_after
+            .lock()
+            .expect("retry-after capture lock poisoned")
+    }
+}
+
+/// Parse and validate a `Retry-After` header value (delta-seconds or
+/// HTTP-date) into a bounded future UTC deadline.
+///
+/// Returns `None` for malformed, non-future, or out-of-bound values;
+/// provider prose is never interpreted as a deadline.
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    // RFC 9110 delta-seconds is 1*DIGIT; signs, fractions, or other text
+    // are not accepted as a delta.
+    let delta_seconds = !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    if delta_seconds {
+        let seconds = value.parse::<u64>().ok()?;
+        if seconds > MAX_RETRY_AFTER_SECONDS as u64 {
+            return None;
+        }
+        let deadline = now.checked_add_signed(TimeDelta::seconds(seconds as i64))?;
+        return (deadline > now).then_some(deadline);
+    }
+    let deadline = DateTime::<Utc>::from(httpdate::parse_http_date(value).ok()?);
+    let horizon = now.checked_add_signed(TimeDelta::seconds(MAX_RETRY_AFTER_SECONDS))?;
+    if deadline <= now || deadline > horizon {
+        return None;
+    }
+    Some(deadline)
+}
+
+/// The instant-acme HTTP transport for one issuance attempt.
+///
+/// Forwards every request to the broker's shared reqwest client and observes
+/// ACME API failure responses so their `Retry-After` metadata stays attached
+/// to this issuance only. The default instant-acme client discards response
+/// headers on API failures, so the capture happens here, on the transport,
+/// before the error is surfaced.
+struct IssuanceHttpClient {
+    client: reqwest::Client,
+    failures: FailureHeaders,
+}
+
+impl instant_acme::HttpClient for IssuanceHttpClient {
+    fn request(
+        &self,
+        req: Request<instant_acme::BodyWrapper<Bytes>>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<instant_acme::BytesResponse, instant_acme::Error>> + Send>,
+    > {
+        let client = self.client.clone();
+        let failures = self.failures.clone();
+        Box::pin(async move {
+            let (parts, body) = req.into_parts();
+            let body = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(infallible) => match infallible {},
+            };
+            let request = client
+                .request(parts.method, parts.uri.to_string())
+                .headers(parts.headers)
+                .body(body)
+                .build()
+                .map_err(|err| instant_acme::Error::Other(Box::new(err)))?;
+            let response = client
+                .execute(request)
+                .await
+                .map_err(|err| instant_acme::Error::Other(Box::new(err)))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            failures.observe(status, &headers, Utc::now());
+            let forwarded = <http::Response<reqwest::Body>>::from(response);
+            Ok(instant_acme::BytesResponse::from(forwarded))
+        })
+    }
+}
+
 pub async fn issue_dns01_certificate(
     http_client: &reqwest::Client,
     dns_config: &DnsConfig,
     acme_config: &AcmeConfig,
     hostnames: &[String],
     csr_der: &[u8],
-) -> Result<String, AcmeError> {
+) -> Result<String, IssuanceFailure> {
     issue_dns01_certificate_timed(
         http_client,
         dns_config,
@@ -70,9 +260,42 @@ pub(crate) async fn issue_dns01_certificate_timed(
     hostnames: &[String],
     csr_der: &[u8],
     timing: RequestTiming,
+) -> Result<String, IssuanceFailure> {
+    // The failure-header capture is issuance-local: it exists only for this
+    // attempt's transport and error handling, so concurrent issuances (or
+    // accounts) can never exchange retry metadata.
+    let failures = FailureHeaders::default();
+    let acme_http: Box<dyn instant_acme::HttpClient> = Box::new(IssuanceHttpClient {
+        client: http_client.clone(),
+        failures: failures.clone(),
+    });
+    issue_dns01_certificate_attempt(
+        http_client,
+        acme_http,
+        dns_config,
+        acme_config,
+        hostnames,
+        csr_der,
+        timing,
+    )
+    .await
+    .map_err(|error| IssuanceFailure::diagnose(&error, &failures))
+}
+
+async fn issue_dns01_certificate_attempt(
+    http_client: &reqwest::Client,
+    acme_http: Box<dyn instant_acme::HttpClient>,
+    dns_config: &DnsConfig,
+    acme_config: &AcmeConfig,
+    hostnames: &[String],
+    csr_der: &[u8],
+    timing: RequestTiming,
 ) -> Result<String, AcmeError> {
     let account = timing
-        .measure(Phase::AcmeAccount, load_or_create_account(acme_config))
+        .measure(
+            Phase::AcmeAccount,
+            load_or_create_account(acme_config, acme_http),
+        )
         .await?;
     let identifiers = hostnames
         .iter()
@@ -351,35 +574,37 @@ async fn cleanup_challenges(
     timing: RequestTiming,
 ) {
     for record in records {
-        if let Err(err) = timing
+        if timing
             .measure(
                 Phase::DnsCleanup,
                 dns::delete_txt_record(http_client, dns_config, record),
             )
             .await
+            .is_err()
         {
-            tracing::warn!(
-                record = %record.hostname(),
-                error = %err,
-                "failed to clean up ACME DNS-01 TXT record"
-            );
+            // DNS provider error details and challenge record names stay out
+            // of broker diagnostics.
+            tracing::warn!("failed to clean up ACME DNS-01 TXT record");
         }
     }
 }
 
-async fn load_or_create_account(config: &AcmeConfig) -> Result<Account, AcmeError> {
+async fn load_or_create_account(
+    config: &AcmeConfig,
+    http: Box<dyn instant_acme::HttpClient>,
+) -> Result<Account, AcmeError> {
     if let Some(path) = config.account_credentials_path.as_ref()
         && path.is_file()
     {
         let bytes = std::fs::read(path)?;
         let credentials: AccountCredentials = serde_json::from_slice(&bytes)?;
-        return Account::builder()?
+        return Account::builder_with_http(http)
             .from_credentials(credentials)
             .await
             .map_err(AcmeError::Acme);
     }
 
-    let (account, credentials) = Account::builder()?
+    let (account, credentials) = Account::builder_with_http(http)
         .create(
             &NewAccount {
                 contact: &[],
@@ -732,5 +957,455 @@ mod tests {
             fallback.contains("builder_tokio()"),
             "ACME DNS-01 TXT self-check must fall back to a fresh system resolver when pod egress to external DNS is blocked"
         );
+    }
+
+    const SYNTHETIC_PROVIDER_SECRET: &str = "SYNTHETIC-PROVIDER-SECRET-7f3a91c2";
+
+    fn api_problem(r#type: Option<&str>, detail: Option<&str>) -> instant_acme::Problem {
+        instant_acme::Problem {
+            r#type: r#type.map(str::to_string),
+            detail: detail.map(str::to_string),
+            status: Some(429),
+            subproblems: Vec::new(),
+        }
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                http::HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn rate_limit_classification_requires_exact_problem_type() {
+        let cases = [
+            (
+                Some("urn:ietf:params:acme:error:rateLimited"),
+                IssuanceFailureCode::RateLimited,
+            ),
+            (
+                Some("urn:ietf:params:acme:error:rateLimited/"),
+                IssuanceFailureCode::Failed,
+            ),
+            (
+                Some("urn:ietf:params:acme:error:rateLimitedX"),
+                IssuanceFailureCode::Failed,
+            ),
+            (
+                Some("xurn:ietf:params:acme:error:rateLimited"),
+                IssuanceFailureCode::Failed,
+            ),
+            (
+                Some("URN:IETF:PARAMS:ACME:ERROR:RATELIMITED"),
+                IssuanceFailureCode::Failed,
+            ),
+            (
+                Some("urn:ietf:params:acme:error:unauthorized"),
+                IssuanceFailureCode::Failed,
+            ),
+            (Some(""), IssuanceFailureCode::Failed),
+            (None, IssuanceFailureCode::Failed),
+        ];
+        for (r#type, expected) in cases {
+            let error = AcmeError::Acme(instant_acme::Error::Api(api_problem(
+                r#type,
+                Some(SYNTHETIC_PROVIDER_SECRET),
+            )));
+            let diagnostic = IssuanceFailure::diagnose(&error, &FailureHeaders::default());
+            assert_eq!(diagnostic.code, expected, "problem type {type:?}");
+            assert_eq!(diagnostic.retry_after, None);
+        }
+
+        let non_api_errors = [
+            AcmeError::Acme(instant_acme::Error::Crypto),
+            AcmeError::OrderStatus(OrderStatus::Invalid),
+            AcmeError::AuthorizationStatus(AuthorizationStatus::Invalid),
+            AcmeError::Csr(SYNTHETIC_PROVIDER_SECRET.into()),
+            AcmeError::AccountLoad("no DNS-01 challenge".into()),
+            AcmeError::Io(std::io::Error::other(SYNTHETIC_PROVIDER_SECRET)),
+        ];
+        for error in &non_api_errors {
+            assert_eq!(
+                IssuanceFailure::diagnose(error, &FailureHeaders::default()).code,
+                IssuanceFailureCode::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn issuance_diagnostics_never_contain_provider_detail_text() {
+        let error = AcmeError::Acme(instant_acme::Error::Api(api_problem(
+            Some("urn:ietf:params:acme:error:rateLimited"),
+            Some(&format!(
+                "quota window exceeded for {SYNTHETIC_PROVIDER_SECRET}"
+            )),
+        )));
+        // The legacy detail field did leak this provider text.
+        assert!(error.to_string().contains(SYNTHETIC_PROVIDER_SECRET));
+
+        let failures = FailureHeaders::default();
+        failures.observe(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "60")]),
+            Utc::now(),
+        );
+        let diagnostic = IssuanceFailure::diagnose(&error, &failures);
+        let rendered = format!(
+            "{diagnostic:?}|{}|{:?}",
+            diagnostic.code.as_str(),
+            diagnostic.retry_after
+        );
+        assert!(!rendered.contains(SYNTHETIC_PROVIDER_SECRET));
+        assert_eq!(diagnostic.code.as_str(), "acme_rate_limited");
+        assert!(diagnostic.retry_after.is_some());
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
+            .expect("fixed test instant")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn retry_after_delta_seconds_are_parsed_and_bounded() {
+        let now = fixed_now();
+        assert_eq!(
+            parse_retry_after("3600", now),
+            Some(now + TimeDelta::hours(1))
+        );
+        assert_eq!(
+            parse_retry_after("  3600 ", now),
+            Some(now + TimeDelta::hours(1))
+        );
+        // Not a future deadline.
+        assert_eq!(parse_retry_after("0", now), None);
+        // The horizon is inclusive.
+        assert_eq!(
+            parse_retry_after(&MAX_RETRY_AFTER_SECONDS.to_string(), now),
+            Some(now + TimeDelta::seconds(MAX_RETRY_AFTER_SECONDS))
+        );
+        // Beyond the horizon, or beyond u64 entirely: no deadline.
+        assert_eq!(
+            parse_retry_after(&(MAX_RETRY_AFTER_SECONDS + 1).to_string(), now),
+            None
+        );
+        assert_eq!(parse_retry_after("99999999999999999999999999", now), None);
+        assert_eq!(parse_retry_after(&u64::MAX.to_string(), now), None);
+    }
+
+    #[test]
+    fn retry_after_http_dates_are_parsed_and_bounded() {
+        let now = fixed_now();
+        let future = now + TimeDelta::hours(6);
+        let rendered = httpdate::fmt_http_date(future.into());
+        assert_eq!(parse_retry_after(&rendered, now), Some(future));
+
+        let past = now - TimeDelta::hours(1);
+        assert_eq!(
+            parse_retry_after(&httpdate::fmt_http_date(past.into()), now),
+            None
+        );
+
+        let horizon = now + TimeDelta::seconds(MAX_RETRY_AFTER_SECONDS);
+        assert_eq!(
+            parse_retry_after(&httpdate::fmt_http_date(horizon.into()), now),
+            Some(horizon)
+        );
+        let beyond = now + TimeDelta::seconds(MAX_RETRY_AFTER_SECONDS + 1);
+        assert_eq!(
+            parse_retry_after(&httpdate::fmt_http_date(beyond.into()), now),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_after_malformed_values_are_rejected() {
+        let now = fixed_now();
+        let malformed = [
+            "",
+            "   ",
+            "abc",
+            "-1",
+            "1.5",
+            "+60",
+            "60seconds",
+            "60 60",
+            "\u{0669}\u{0669}",
+            "Sep 9 2026",
+            "Wed, 99 Zzz 2026 00:00:00 GMT",
+            "999999999999999999999",
+        ];
+        for value in malformed {
+            assert_eq!(parse_retry_after(value, now), None, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn failure_capture_ignores_success_and_redirects_and_keeps_last_failure() {
+        let capture = FailureHeaders::default();
+        let now = fixed_now();
+
+        // Successful polls (and redirects) never capture, even with headers.
+        capture.observe(StatusCode::OK, &header_map(&[("Retry-After", "999")]), now);
+        capture.observe(
+            StatusCode::FOUND,
+            &header_map(&[("Retry-After", "999")]),
+            now,
+        );
+        assert_eq!(capture.retry_after(), None);
+
+        capture.observe(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "120")]),
+            now,
+        );
+        assert_eq!(capture.retry_after(), Some(now + TimeDelta::minutes(2)));
+
+        // A later success on the same issuance must not move the deadline.
+        capture.observe(StatusCode::OK, &header_map(&[("Retry-After", "999")]), now);
+        assert_eq!(capture.retry_after(), Some(now + TimeDelta::minutes(2)));
+
+        // A failure without a usable header is authoritative for that
+        // failure: it clears any earlier value.
+        capture.observe(StatusCode::BAD_GATEWAY, &header_map(&[]), now);
+        assert_eq!(capture.retry_after(), None);
+        capture.observe(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &header_map(&[("Retry-After", "not-a-date")]),
+            now,
+        );
+        assert_eq!(capture.retry_after(), None);
+    }
+
+    #[test]
+    fn concurrent_issuance_captures_are_independent() {
+        let first = FailureHeaders::default();
+        let second = FailureHeaders::default();
+        let now = fixed_now();
+
+        first.observe(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "100")]),
+            now,
+        );
+        second.observe(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "86400")]),
+            now,
+        );
+        // A later failure of the first issuance does not touch the second.
+        first.observe(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &header_map(&[("Retry-After", "garbage")]),
+            now,
+        );
+
+        assert_eq!(first.retry_after(), None);
+        assert_eq!(second.retry_after(), Some(now + TimeDelta::hours(24)));
+    }
+
+    async fn spawn_test_acme_server(
+        respond: impl Fn(&str) -> (u16, Option<&'static str>, String) + Send + Sync + 'static,
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let addr = listener.local_addr().expect("loopback address");
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let respond = Arc::clone(&respond);
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        // Test requests carry no body, so a complete head
+                        // delimits each request.
+                        let head_end = loop {
+                            if let Some(position) =
+                                buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                break Some(position);
+                            }
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break None,
+                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                            }
+                        };
+                        let Some(head_end) = head_end else { return };
+                        let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+                        buffer.drain(..head_end + 4);
+                        let path = head
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("/")
+                            .split('?')
+                            .next()
+                            .unwrap_or("/")
+                            .to_string();
+                        let (status, retry_after, body) = respond(&path);
+                        let reason = StatusCode::from_u16(status)
+                            .ok()
+                            .and_then(|status| status.canonical_reason())
+                            .unwrap_or("Status");
+                        let mut response = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n",
+                            body.len()
+                        );
+                        if let Some(value) = retry_after {
+                            response.push_str("Retry-After: ");
+                            response.push_str(value);
+                            response.push_str("\r\n");
+                        }
+                        response.push_str("Connection: keep-alive\r\n\r\n");
+                        response.push_str(&body);
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn test_acme_request(
+        addr: &std::net::SocketAddr,
+        path: &str,
+    ) -> Request<instant_acme::BodyWrapper<Bytes>> {
+        Request::get(format!("http://{addr}{path}"))
+            .body(instant_acme::BodyWrapper::default())
+            .expect("static test request")
+    }
+
+    #[tokio::test]
+    async fn issuance_transport_forwards_traffic_and_captures_failure_retry_after() {
+        let addr = spawn_test_acme_server(|path| match path {
+            "/ok" => (200, Some("999"), "{\"ok\":true}".to_string()),
+            _ => (
+                429,
+                Some("120"),
+                "{\"type\":\"urn:ietf:params:acme:error:rateLimited\"}".to_string(),
+            ),
+        })
+        .await;
+        let failures = FailureHeaders::default();
+        let transport = IssuanceHttpClient {
+            client: reqwest::Client::new(),
+            failures: failures.clone(),
+        };
+
+        // A successful poll carrying Retry-After must be forwarded but not
+        // captured.
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(&transport, test_acme_request(&addr, "/ok")),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect("forwarded request");
+        assert_eq!(response.parts.status, StatusCode::OK);
+        let body = response.body.into_bytes().await.expect("forwarded body");
+        assert_eq!(body, Bytes::from_static(b"{\"ok\":true}"));
+        assert_eq!(failures.retry_after(), None);
+
+        // A failure response with Retry-After is forwarded and captured.
+        let before = Utc::now();
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(
+                &transport,
+                test_acme_request(&addr, "/rate-limited"),
+            ),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect("forwarded request");
+        let after = Utc::now();
+        assert_eq!(response.parts.status, StatusCode::TOO_MANY_REQUESTS);
+        let body = response.body.into_bytes().await.expect("forwarded body");
+        assert!(body.starts_with(b"{\"type\""));
+        let deadline = failures.retry_after().expect("failure deadline captured");
+        assert!(deadline > before + TimeDelta::seconds(118));
+        assert!(deadline < after + TimeDelta::seconds(122));
+    }
+
+    #[tokio::test]
+    async fn concurrent_issuances_share_transport_but_not_retry_metadata() {
+        let addr = spawn_test_acme_server(|path| match path {
+            "/first" => (429, Some("100"), "{}".to_string()),
+            "/second" => (429, Some("86400"), "{}".to_string()),
+            _ => (200, Some("999"), "{}".to_string()),
+        })
+        .await;
+        let shared = reqwest::Client::new();
+        let first = FailureHeaders::default();
+        let second = FailureHeaders::default();
+        let first_transport = IssuanceHttpClient {
+            client: shared.clone(),
+            failures: first.clone(),
+        };
+        let second_transport = IssuanceHttpClient {
+            client: shared.clone(),
+            failures: second.clone(),
+        };
+
+        let before = Utc::now();
+        let (first_response, second_response) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                instant_acme::HttpClient::request(
+                    &first_transport,
+                    test_acme_request(&addr, "/first"),
+                ),
+            ),
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                instant_acme::HttpClient::request(
+                    &second_transport,
+                    test_acme_request(&addr, "/second"),
+                ),
+            ),
+        );
+        let after = Utc::now();
+        for response in [first_response, second_response] {
+            assert_eq!(
+                response
+                    .expect("bounded loopback request")
+                    .expect("forwarded request")
+                    .parts
+                    .status,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+
+        let first_deadline = first.retry_after().expect("first issuance deadline");
+        let second_deadline = second.retry_after().expect("second issuance deadline");
+        assert!(first_deadline > before + TimeDelta::seconds(98));
+        assert!(first_deadline < after + TimeDelta::seconds(102));
+        assert!(second_deadline > before + TimeDelta::hours(24) - TimeDelta::seconds(2));
+        assert!(second_deadline < after + TimeDelta::hours(24) + TimeDelta::seconds(2));
+
+        // A later unrelated success on the shared transport changes neither.
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            instant_acme::HttpClient::request(
+                &first_transport,
+                test_acme_request(&addr, "/unrelated"),
+            ),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect("forwarded request");
+        assert_eq!(response.parts.status, StatusCode::OK);
+        assert_eq!(first.retry_after(), Some(first_deadline));
+        assert_eq!(second.retry_after(), Some(second_deadline));
     }
 }
