@@ -416,6 +416,38 @@ async fn evidence_chain_with_unpinned_ark_falls_back_to_kds_and_fails_closed() {
 }
 
 #[test]
+fn synthetic_launch_identity_is_test_support_only() {
+    // The only construction path for a verified launch identity outside
+    // attest_receipt_key() is this cfg(test)-gated setter: production builds
+    // (debug or release) compile without it, so no caller can forge trust.
+    let expected_measurement = enclava_common::descriptor::FirmwareMeasurement::Full([0x11; 48]);
+    let client = TeeClient::new("app.enclava.dev");
+    assert!(
+        client.verified_launch_identity().is_none(),
+        "ordinary clients must carry no verified launch identity"
+    );
+
+    let identity = super::VerifiedSnpLaunchIdentity {
+        host_data: [0x09; 32],
+        firmware_measurement: [0x11; 48],
+    };
+    let trusted = client.with_verified_launch_identity_for_tests([0x09; 32], [0x11; 48]);
+    assert_eq!(trusted.verified_launch_identity(), Some(identity));
+    assert!(super::launch_identity_binds_deployment(
+        trusted.verified_launch_identity().as_ref(),
+        &[0x09; 32],
+        &expected_measurement
+    ));
+    // Matching HOST_DATA with a mismatched measurement never binds.
+    let wrong_measurement = enclava_common::descriptor::FirmwareMeasurement::Full([0x22; 48]);
+    assert!(!super::launch_identity_binds_deployment(
+        trusted.verified_launch_identity().as_ref(),
+        &[0x09; 32],
+        &wrong_measurement
+    ));
+}
+
+#[test]
 fn snp_report_with_debug_policy_is_rejected() {
     let mut report = sev::firmware::guest::AttestationReport::default();
     assert!(crate::attestation::ensure_snp_report_production_policy(&report).is_ok());

@@ -409,14 +409,13 @@ impl TeeClient {
         self.verified_launch_identity
     }
 
-    /// Testing-only: pin a synthetic verified launch identity onto a client,
-    /// standing in for a completed `attest_receipt_key()` verification.
-    /// Excluded from release builds, like every other debug-gated test
-    /// affordance in this client; only `attest_receipt_key()` produces a
-    /// trustworthy identity.
-    #[cfg(any(test, debug_assertions))]
-    #[doc(hidden)]
-    pub fn with_verified_launch_identity_for_tests(
+    /// Unit-test-only (lib tests): pin a synthetic verified launch identity
+    /// onto a client, standing in for a completed `attest_receipt_key()`
+    /// verification. Compiled only under `cfg(test)`, so no production build
+    /// -- debug or release -- can construct synthetic trust; only
+    /// `attest_receipt_key()` produces a trustworthy identity outside tests.
+    #[cfg(test)]
+    pub(crate) fn with_verified_launch_identity_for_tests(
         mut self,
         host_data: [u8; 32],
         firmware_measurement: [u8; 48],

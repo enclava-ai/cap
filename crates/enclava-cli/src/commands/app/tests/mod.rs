@@ -1873,23 +1873,18 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
-    async fn unlock_wait_ends_promptly_on_terminal_diagnostic_from_attested_channel() {
-        // The loop's client parameter is the SPKI-pinned channel returned by
-        // attest_receipt_key() in production; this test drives that loop's
-        // control flow with a stand-in channel. Storage stays mid-unlock, so
-        // without the terminal diagnostic the loop would spin toward its
-        // 300-second deadline.
+    async fn unlock_wait_fails_closed_without_verified_launch_identity() {
+        // Without a verified launch identity the loop never attributes a
+        // terminal diagnostic: it keeps its own state handling (here: the
+        // locked arm ends the wait with the unlock error, not a terminal
+        // message). The client stands in for the attested channel; the
+        // ordering check below proves the predicate gates the read.
         let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
         let address = spawn_local_tls_server(requests, |path| {
             let body = if path.ends_with("/status") {
                 serde_json::json!({
-                    "unlock_state": "unlocking",
-                    "bootstrap_error": {
-                        "error": "acme_rate_limited",
-                        "terminal": true,
-                        "retry_after": null,
-                        "detail": SYNTHETIC_SECRET_MARKER,
-                    }
+                    "unlock_state": "locked",
+                    "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
                 })
                 .to_string()
             } else {
@@ -1903,47 +1898,27 @@ mod terminal_diagnostics {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
-            local_tee_client(address).with_verified_launch_identity_for_tests(
-                NEW_EXPECTED_LAUNCH_HASH,
-                EXPECTED_FIRMWARE_MEASUREMENT,
-            )
+            local_tee_client(address)
         };
-        let started = std::time::Instant::now();
-        let api_address = spawn_json_api_stub(|path| {
-            if path.ends_with("/deployments") {
-                Some(serde_json::json!([deployment_entry_json(
-                    "expected-1",
-                    "applying"
-                )]))
-            } else {
-                None
-            }
-        })
-        .await;
-        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
+        let expectation = test_expectation("expected-1", NEW_EXPECTED_LAUNCH_HASH);
         let error = wait_for_deploy_unlock_completion(
             &api,
             &tee,
             "demo",
-            crate::commands::app::DeploymentWait::trusted(
-                "expected-1",
-                Some(&test_expectation("expected-1", NEW_EXPECTED_LAUNCH_HASH)),
-            ),
+            crate::commands::app::DeploymentWait::trusted("expected-1", Some(&expectation)),
         )
         .await
         .unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
         let message = error.to_string();
         assert!(
-            message.contains("terminal bootstrap failure for app demo: acme_rate_limited"),
+            message.contains("unlock did not complete"),
             "unexpected error: {message}"
         );
-        assert!(!message.contains(SYNTHETIC_SECRET_MARKER));
-        {
-            let _guard = tls_env_lock();
-            unsafe {
-                std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
-            }
+        assert!(!message.contains("terminal bootstrap failure"));
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
         }
     }
 
@@ -2143,24 +2118,30 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
-    async fn set_deploy_config_stops_promptly_on_terminal_diagnostic() {
-        // The client stands in for the attested channel deploy() passes in.
-        // The write stays locked (423) and /status carries a terminal
-        // diagnostic: the retry loop must stop with the stable code instead
-        // of spinning to its 60-second deadline.
+    async fn set_deploy_config_ignores_terminal_diagnostics_without_verified_identity() {
+        // The write is refused once (423, terminal diagnostic present on
+        // /status) but the client carries no verified launch identity: the
+        // probe must not attribute the terminal failure, the retry must
+        // proceed, and no /status read may happen through the probe.
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let address = spawn_local_tls_server(requests.clone(), |path| {
-            if path.ends_with("/status") {
-                (
-                    200,
-                    serde_json::json!({
-                        "unlock_state": "locked",
-                        "bootstrap_error": { "error": "enclava_init_failed", "terminal": true, "retry_after": null }
-                    })
-                    .to_string(),
-                )
-            } else {
-                (423, "{}".to_string())
+        let address = spawn_local_tls_server(requests.clone(), {
+            let attempts = attempts.clone();
+            move |path| {
+                if path.ends_with("/status") {
+                    (
+                        200,
+                        serde_json::json!({
+                            "unlock_state": "locked",
+                            "bootstrap_error": { "error": "enclava_init_failed", "terminal": true, "retry_after": null }
+                        })
+                        .to_string(),
+                    )
+                } else if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (423, "{}".to_string())
+                } else {
+                    (200, "{}".to_string())
+                }
             }
         })
         .await;
@@ -2169,57 +2150,32 @@ mod terminal_diagnostics {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
-            local_tee_client(address).with_verified_launch_identity_for_tests(
-                NEW_EXPECTED_LAUNCH_HASH,
-                EXPECTED_FIRMWARE_MEASUREMENT,
-            )
+            local_tee_client(address)
         };
-        let started = std::time::Instant::now();
-        let api_address = spawn_json_api_stub(|path| {
-            if path.ends_with("/deployments") {
-                Some(serde_json::json!([deployment_entry_json(
-                    "expected-1",
-                    "applying"
-                )]))
-            } else {
-                None
-            }
-        })
-        .await;
-        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
-        let error = set_deploy_config(
+        let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
+        let expectation = test_expectation("expected-1", NEW_EXPECTED_LAUNCH_HASH);
+        set_deploy_config(
             &api,
             &tee,
             "demo",
-            crate::commands::app::DeploymentWait::trusted(
-                "expected-1",
-                Some(&test_expectation("expected-1", NEW_EXPECTED_LAUNCH_HASH)),
-            ),
+            crate::commands::app::DeploymentWait::trusted("expected-1", Some(&expectation)),
             "K",
             "V",
             "token",
         )
         .await
-        .unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        let message = error.to_string();
+        .expect("an unverified endpoint must not block config retries");
         assert!(
-            message.contains("terminal bootstrap failure for app demo: enclava_init_failed"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            requests
+            !requests
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|path| path.ends_with("/status")),
-            "the terminal diagnostic must come from a status read"
+            "no /status read may happen before the launch-identity predicate passes"
         );
-        {
-            let _guard = tls_env_lock();
-            unsafe {
-                std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
-            }
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
         }
     }
 
@@ -2275,13 +2231,11 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
-    async fn old_tee_host_data_cannot_abort_new_deployment() {
-        // The binding contract: the wait's trusted expectation is the NEW
-        // deployment's signed launch hash, while the endpoint (an old TEE
-        // still serving during a replacement) attests the OLD launch hash.
-        // The verified HOST_DATA mismatch must yield no diagnostic -- the
-        // signed-descriptor hash protects the claim path too, since the same
-        // predicate gates claim-failure terminal attribution.
+    async fn terminal_probe_reads_no_status_without_verified_launch_identity() {
+        // Fail-closed integration: an endpoint reporting a terminal failure is
+        // never read through the diagnostic probe unless the client carries a
+        // verified launch identity matching the wait's expectation (the pure
+        // launch_identity_binding_fixtures cover hash/masurement mismatch).
         let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
         let address = spawn_local_tls_server(requests.clone(), |path| {
             let body = if path.ends_with("/status") {
@@ -2302,11 +2256,6 @@ mod terminal_diagnostics {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
             local_tee_client(address)
-                // The old TEE's verified launch measurement.
-                .with_verified_launch_identity_for_tests(
-                    OLD_TEE_LAUNCH_HASH,
-                    EXPECTED_FIRMWARE_MEASUREMENT,
-                )
         };
         let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
         let expectation = test_expectation("new-1", NEW_EXPECTED_LAUNCH_HASH);
@@ -2321,124 +2270,16 @@ mod terminal_diagnostics {
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
             )
             .await
-            .is_none(),
-            "an old deployment's verified HOST_DATA must never abort the new deployment's wait"
-        );
-        assert!(
-            !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|path| path.ends_with("/status")),
-            "no terminal diagnostic may be read through an unbound endpoint"
-        );
-
-        // A missing verified HOST_DATA (unattested channel) never binds.
-        let unattested = {
-            let _guard = tls_env_lock();
-            unsafe {
-                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
-            }
-            local_tee_client(address)
-        };
-        assert!(
-            deployment_bound_terminal_bootstrap_error_on_channel(
-                &api,
-                "demo",
-                deployment,
-                &unattested,
-                std::time::Instant::now() + std::time::Duration::from_secs(5),
-            )
-            .await
-            .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn matching_host_data_authorizes_the_terminal_diagnostic() {
-        // Positive fixture: the endpoint's verified HOST_DATA equals the
-        // signed descriptor's launch hash, so the terminal diagnostic read
-        // over the same SPKI-pinned client is this deployment's own failure.
-        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let address = spawn_local_tls_server(requests.clone(), |path| {
-            let body = if path.ends_with("/status") {
-                serde_json::json!({
-                    "unlock_state": "locked",
-                    "bootstrap_error": {
-                        "error": "acme_certificate_issuance_failed",
-                        "terminal": true,
-                        "retry_after": null,
-                        "detail": SYNTHETIC_SECRET_MARKER,
-                    }
-                })
-                .to_string()
-            } else {
-                "{}".to_string()
-            };
-            (200, body)
-        })
-        .await;
-        let tee = {
-            let _guard = tls_env_lock();
-            unsafe {
-                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
-            }
-            local_tee_client(address).with_verified_launch_identity_for_tests(
-                NEW_EXPECTED_LAUNCH_HASH,
-                EXPECTED_FIRMWARE_MEASUREMENT,
-            )
-        };
-        let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
-        let expectation = test_expectation("expected-1", NEW_EXPECTED_LAUNCH_HASH);
-        let deployment =
-            crate::commands::app::DeploymentWait::trusted("expected-1", Some(&expectation));
-
-        let diagnostic = deployment_bound_terminal_bootstrap_error_on_channel(
-            &api,
-            "demo",
-            deployment,
-            &tee,
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("matching verified HOST_DATA must authorize the diagnostic");
-        assert_eq!(diagnostic.code(), "acme_certificate_issuance_failed");
-        assert!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|path| path.ends_with("/status"))
-        );
-
-        // Exact returned-id mismatch rejects the trusted expectation: the
-        // wait falls back to untrusted timeout behavior.
-        assert!(
-            deployment_bound_terminal_bootstrap_error_on_channel(
-                &api,
-                "demo",
-                crate::commands::app::DeploymentWait::trusted("other-id", Some(&expectation)),
-                &tee,
-                std::time::Instant::now() + std::time::Duration::from_secs(5),
-            )
-            .await
             .is_none()
         );
         assert!(
-            crate::commands::app::DeploymentWait::trusted("other-id", Some(&expectation))
-                .expectation
-                .is_none()
+            requests.lock().unwrap().is_empty(),
+            "no /status read may happen before the launch-identity predicate passes"
         );
-        assert!(
-            crate::commands::app::DeploymentWait::trusted("expected-1", Some(&expectation))
-                .expectation
-                .is_some()
-        );
-        assert!(
-            crate::commands::app::DeploymentWait::trusted("pending", Some(&expectation))
-                .expectation
-                .is_none()
-        );
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+        }
     }
 
     #[test]
@@ -2495,61 +2336,6 @@ mod terminal_diagnostics {
             &NEW_EXPECTED_LAUNCH_HASH,
             &expected_measurement
         ));
-    }
-
-    #[tokio::test]
-    async fn matching_host_data_with_wrong_measurement_cannot_authorize() {
-        // The endpoint reports the NEW deployment's launch hash but its
-        // authenticated firmware measurement differs: no stop, and no
-        // terminal diagnostic may be read through the unbound endpoint.
-        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let address = spawn_local_tls_server(requests.clone(), |path| {
-            let body = if path.ends_with("/status") {
-                serde_json::json!({
-                    "unlock_state": "locked",
-                    "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
-                })
-                .to_string()
-            } else {
-                "{}".to_string()
-            };
-            (200, body)
-        })
-        .await;
-        let tee = {
-            let _guard = tls_env_lock();
-            unsafe {
-                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
-            }
-            local_tee_client(address).with_verified_launch_identity_for_tests(
-                NEW_EXPECTED_LAUNCH_HASH,
-                WRONG_FIRMWARE_MEASUREMENT,
-            )
-        };
-        let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
-        let expectation = test_expectation("new-1", NEW_EXPECTED_LAUNCH_HASH);
-        let deployment = crate::commands::app::DeploymentWait::trusted("new-1", Some(&expectation));
-
-        assert!(
-            deployment_bound_terminal_bootstrap_error_on_channel(
-                &api,
-                "demo",
-                deployment,
-                &tee,
-                std::time::Instant::now() + std::time::Duration::from_secs(5),
-            )
-            .await
-            .is_none(),
-            "matching HOST_DATA with a mismatched firmware measurement must never authorize"
-        );
-        assert!(
-            !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|path| path.ends_with("/status")),
-            "no terminal diagnostic may be read through an unbound endpoint"
-        );
     }
 
     #[tokio::test]
@@ -2655,56 +2441,6 @@ mod terminal_diagnostics {
             error.to_string().contains("exceeded its budget"),
             "unexpected error: {error}"
         );
-        let _guard = tls_env_lock();
-        unsafe {
-            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_probe_budget_caps_stalled_attested_read() {
-        // Binding passes (sole deployment record), but the attested /status
-        // read stalls: the budget cuts the whole probe.
-        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let address = spawn_local_tls_raw_server(requests, |_path| None).await;
-        let api_address = spawn_json_api_stub(|path| {
-            if path.ends_with("/deployments") {
-                Some(serde_json::json!([deployment_entry_json(
-                    "expected-1",
-                    "applying"
-                )]))
-            } else {
-                None
-            }
-        })
-        .await;
-        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
-        let tee = {
-            let _guard = tls_env_lock();
-            unsafe {
-                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
-            }
-            local_tee_client(address).with_verified_launch_identity_for_tests(
-                NEW_EXPECTED_LAUNCH_HASH,
-                EXPECTED_FIRMWARE_MEASUREMENT,
-            )
-        };
-        let started = std::time::Instant::now();
-        assert!(
-            terminal_diagnostic_probe_with_budget(
-                &api,
-                "demo",
-                crate::commands::app::DeploymentWait::trusted(
-                    "expected-1",
-                    Some(&test_expectation("expected-1", NEW_EXPECTED_LAUNCH_HASH)),
-                ),
-                Some(&tee),
-                std::time::Duration::from_millis(250),
-            )
-            .await
-            .is_none()
-        );
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
         let _guard = tls_env_lock();
         unsafe {
             std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
@@ -2839,6 +2575,21 @@ mod terminal_diagnostics {
         assert!(
             health.contains("deployment_bound_terminal_bootstrap_error"),
             "the health wait must use the deployment-bound terminal probe"
+        );
+
+        // Production ordering inside the post-auth reader is
+        // verification -> predicate -> reader: the launch-identity predicate
+        // must gate the bounded status read.
+        let reader_start = source
+            .find("async fn terminal_diagnostic_on_attested")
+            .unwrap();
+        let reader_end = source[reader_start..].find("\nasync fn ").unwrap() + reader_start;
+        let reader = &source[reader_start..reader_end];
+        let predicate = reader.find("launch_identity_binds_deployment").unwrap();
+        let read = reader.find("bounded_status_json").unwrap();
+        assert!(
+            predicate < read,
+            "the launch-identity predicate must gate the status read"
         );
 
         // No terminal-classifying status read may escape a complete budget:

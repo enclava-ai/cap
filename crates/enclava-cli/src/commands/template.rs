@@ -5390,8 +5390,6 @@ mod tests {
 
         pub(crate) use std::sync::Mutex as TestMutex;
 
-        pub(crate) const SYNTHETIC_SECRET_MARKER: &str = "SECRET-MARKER-3d61b8";
-
         // Public synthetic localhost fixture (same key material as the
         // transport test in tee_client/tls.rs); used only for local TLS test
         // servers.
@@ -5532,31 +5530,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn template_config_delivery_stops_promptly_on_terminal_diagnostic() {
+    async fn template_config_delivery_ignores_terminal_diagnostics_without_verified_identity() {
         use terminal_delivery_support::*;
 
-        // Real control flow of the 121-attempt config-delivery retry loop:
-        // the write stays locked (423) and the TEE this state is attested to
-        // reports a terminal diagnostic, so delivery must stop with the
-        // stable code instead of retrying for minutes.
+        // Real control flow of the config-delivery retry loop: the write is
+        // refused once (423) with a terminal diagnostic on /status, but the
+        // attested channel carries no verified launch identity (synthetic
+        // trust construction is test-support only and lives in the lib
+        // tests). The probe must attribute nothing, the retry proceeds, and
+        // no /status read happens through the probe; the pure predicate
+        // fixtures in commands::app::tests cover hash/measurement binding.
+        let attempts = std::sync::Arc::new(TestMutex::new(0usize));
         let requests = std::sync::Arc::new(TestMutex::new(Vec::new()));
-        let tee_address = spawn_local_tls_server(requests.clone(), |path| {
-            if path.ends_with("/status") {
-                (
-                    200,
-                    serde_json::json!({
-                        "unlock_state": "locked",
-                        "bootstrap_error": {
-                            "error": "acme_certificate_issuance_failed",
-                            "terminal": true,
-                            "retry_after": null,
-                            "detail": SYNTHETIC_SECRET_MARKER,
-                        }
-                    })
-                    .to_string(),
-                )
-            } else {
-                (423, "{}".to_string())
+        let tee_address = spawn_local_tls_server(requests.clone(), {
+            let attempts = attempts.clone();
+            move |path| {
+                if path.ends_with("/status") {
+                    (
+                        200,
+                        serde_json::json!({
+                            "unlock_state": "locked",
+                            "bootstrap_error": { "error": "acme_certificate_issuance_failed", "terminal": true, "retry_after": null }
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    let mut attempts = attempts.lock().unwrap();
+                    *attempts += 1;
+                    if *attempts == 1 {
+                        (423, "{}".to_string())
+                    } else {
+                        (200, "{}".to_string())
+                    }
+                }
             }
         })
         .await;
@@ -5581,7 +5587,6 @@ mod tests {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
             TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
-                .with_verified_launch_identity_for_tests([0x09; 32], [0x11; 48])
         };
         let expectation = template_test_expectation("expected-1", [0x09; 32]);
         let mut config_token = "token".to_string();
@@ -5597,24 +5602,17 @@ mod tests {
             tee_resolve_ip: &mut tee_resolve_ip,
             terminal_probe_at: None,
         };
-        let started = Instant::now();
-        let error = state.set_key("SKEY", "value").await.unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        let message = error.to_string();
+        state
+            .set_key("SKEY", "value")
+            .await
+            .expect("an unverified endpoint must not block config retries");
         assert!(
-            message.contains(
-                "terminal bootstrap failure for app shell: acme_certificate_issuance_failed"
-            ),
-            "unexpected error: {message}"
-        );
-        assert!(!message.contains(SYNTHETIC_SECRET_MARKER));
-        assert!(
-            requests
+            !requests
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|path| path.ends_with("/status")),
-            "the terminal diagnostic must come from a bounded status read"
+            "no /status read may happen before the launch-identity predicate passes"
         );
         let _guard = tls_env_lock();
         unsafe {
@@ -5623,12 +5621,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn template_config_delivery_probe_skips_replacement() {
+    async fn template_config_delivery_probe_skips_unverified_identity() {
         use terminal_delivery_support::*;
 
-        // While a newer deployment is current, the delivery probe must not
-        // contact the previous TEE at all, even though it would report a
-        // terminal diagnostic.
+        // The delivery probe attributes nothing unless the channel carries a
+        // verified launch identity: None here (and zero TEE status reads),
+        // regardless of what the endpoint would report.
         let tee_requests = std::sync::Arc::new(TestMutex::new(Vec::new()));
         let tee_address = spawn_local_tls_server(tee_requests.clone(), |_path| {
             (
@@ -5663,10 +5661,7 @@ mod tests {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
-            // The OLD deployment's TEE: its verified launch hash differs
-            // from the wait's trusted expectation.
             TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
-                .with_verified_launch_identity_for_tests([0x07; 32], [0x11; 48])
         };
         let expectation = template_test_expectation("expected-1", [0x09; 32]);
         let mut config_token = "token".to_string();
@@ -5684,11 +5679,11 @@ mod tests {
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),
-            "a probe for a superseded deployment must never authorize a stop"
+            "an unverified channel must never authorize a stop"
         );
         assert!(
             tee_requests.lock().unwrap().is_empty(),
-            "the replaced TEE must not be contacted before the binding check"
+            "no TEE read may happen before the launch-identity predicate passes"
         );
         let _guard = tls_env_lock();
         unsafe {
