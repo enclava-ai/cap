@@ -2339,6 +2339,91 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
+    async fn malformed_nested_attestation_fields_never_leak_content() {
+        // Review regression: an otherwise well-shaped attestation response
+        // that echoes the requested nonce, domain, and leaf SPKI but carries
+        // a malformed receipt_pubkey_sha256 must fail with a fixed message --
+        // hex decode errors interpolate the offending response bytes, and
+        // this field is parsed before SNP authentication completes.
+        use x509_cert::der::{Decode as _, Encode as _};
+        let certificate = base64::engine::general_purpose::STANDARD
+            .decode(SYNTHETIC_LOCALHOST_CERT_B64)
+            .unwrap();
+        let spki_der = x509_cert::Certificate::from_der(&certificate)
+            .unwrap()
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .unwrap();
+        use sha2::Digest as _;
+        let leaf_spki_sha256 = hex::encode(sha2::Sha256::digest(&spki_der));
+
+        for malformed in [
+            // Invalid hex carrying the secret marker.
+            format!("{SYNTHETIC_SECRET_MARKER}-ZZ"),
+            // Valid hex, wrong length.
+            "aa".repeat(31),
+        ] {
+            let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let leaf_spki_sha256 = leaf_spki_sha256.clone();
+            let address = spawn_local_tls_raw_server(requests, move |path| {
+                // Echo the client's nonce so the response passes the
+                // nonce/domain/SPKI equality checks and reaches the
+                // receipt-pubkey hex parse.
+                let nonce = path
+                    .split('?')
+                    .nth(1)
+                    .and_then(|query| {
+                        query.split('&').find_map(|pair| {
+                            let (key, value) = pair.split_once('=')?;
+                            (key == "nonce").then_some(value.to_string())
+                        })
+                    })
+                    .unwrap_or_default();
+                let body = serde_json::json!({
+                    "nonce": nonce,
+                    "runtime_data_binding": {
+                        "domain": "localhost",
+                        "leaf_spki_sha256": leaf_spki_sha256,
+                        "receipt_pubkey_sha256": malformed.clone(),
+                    },
+                    "evidence": { "payload_b64": "" },
+                });
+                let mut response =
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+                        .to_vec();
+                response.extend_from_slice(body.to_string().as_bytes());
+                Some(response)
+            })
+            .await;
+            let tee = TeeClient::new_with_resolve_ip(
+                &format!("https://localhost:{}", address.port()),
+                Some(address.ip()),
+            );
+            let error = match tee.attest_receipt_key().await {
+                Ok(_) => panic!("malformed receipt_pubkey_sha256 must be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("receipt_pubkey_sha256"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error.contains("is not valid hex") || error.contains("must be 32 bytes"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                !error.contains(SYNTHETIC_SECRET_MARKER),
+                "hex/length errors must never echo response bytes"
+            );
+            assert!(
+                !error.contains("Invalid character"),
+                "raw hex decode errors must never surface"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_attestation_response_never_leaks_content() {
         // A type-mismatched (malformed) attestation body must produce a fixed
         // error message: serde type errors can interpolate the offending

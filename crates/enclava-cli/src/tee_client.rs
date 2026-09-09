@@ -1151,8 +1151,10 @@ fn extract_snp_der_chain(value: &serde_json::Value) -> Option<SnpDerChain> {
 }
 
 async fn fetch_snp_der_chain_from_kds(snp_report_bytes: &[u8]) -> Result<SnpDerChain, TeeError> {
-    let report = sev::firmware::guest::AttestationReport::from_bytes(snp_report_bytes)
-        .map_err(|err| TeeError::Attestation(format!("SNP report parse failed: {err}")))?;
+    let report =
+        sev::firmware::guest::AttestationReport::from_bytes(snp_report_bytes).map_err(|_| {
+            TeeError::Attestation("attestation evidence SNP report is malformed".to_string())
+        })?;
     let (ark_der, ask_der) = builtin_snp_ca_der_chain(&report)?;
     let vcek_url = amd_kds_vcek_url(&report, AMD_KDS_BASE_URL)?;
     let client = reqwest::Client::builder()
@@ -1479,12 +1481,14 @@ fn parse_bytes_string(raw: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-fn parse_hex32_field(field: &str, value: &str) -> Result<[u8; 32], TeeError> {
+fn parse_hex32_field(field: &'static str, value: &str) -> Result<[u8; 32], TeeError> {
+    // Fixed messages only: hex errors interpolate the offending response
+    // bytes, and this field is parsed before SNP authentication completes.
     let bytes = hex::decode(value.trim())
-        .map_err(|err| TeeError::Attestation(format!("{field} is not hex: {err}")))?;
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
-        TeeError::Attestation(format!("{field} must be 32 bytes, got {}", bytes.len()))
-    })
+        .map_err(|_| TeeError::Attestation(format!("{field} is not valid hex")))?;
+    bytes
+        .try_into()
+        .map_err(|_| TeeError::Attestation(format!("{field} must be 32 bytes")))
 }
 
 mod tls;
