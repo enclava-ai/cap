@@ -29,7 +29,9 @@ use enclava_cli::keyring::{
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
-use enclava_cli::tee_client::{TeeClient, TeeError};
+use enclava_cli::tee_client::{
+    TeeBootstrapStatus, TeeClient, TeeError, TerminalBootstrapError, parse_terminal_bootstrap_error,
+};
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
     log_keypair_from_private_key,
@@ -645,6 +647,84 @@ fn should_retry_deploy_config(error: &TeeError) -> bool {
     matches!(error, TeeError::Tee { status: 423, .. })
 }
 
+/// Stable, provider-detail-free message for an authenticated terminal
+/// bootstrap failure: the recognized error code plus the optional validated
+/// retry deadline, in a form a PaaS verifier can safely match later.
+pub(crate) fn terminal_bootstrap_failure_message(
+    app_name: &str,
+    diagnostic: &TerminalBootstrapError,
+) -> String {
+    format!(
+        "terminal bootstrap failure for app {app_name}: {}; run `enclava status --app {app_name}` for the latest state",
+        diagnostic.stable_summary()
+    )
+}
+
+/// Minimum spacing between terminal-diagnostic TEE probes inside long
+/// API-only wait loops: bounds attestation cost while keeping the stop
+/// prompt after a terminal failure.
+const TEE_TERMINAL_DIAGNOSTIC_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a terminal-diagnostic TEE probe is due in a long wait loop.
+pub(crate) fn tee_terminal_diagnostic_probe_due(last: &mut Option<Instant>) -> bool {
+    if last
+        .as_ref()
+        .is_some_and(|probed_at| probed_at.elapsed() < TEE_TERMINAL_DIAGNOSTIC_PROBE_INTERVAL)
+    {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+
+/// Probe the app's attested TEE for a terminal bootstrap diagnostic.
+///
+/// Only a diagnostic read over the SPKI-pinned client returned by
+/// `attest_receipt_key()` can produce a result; every failure (endpoint
+/// lookup, attestation, status read) yields `None`, so an unverified
+/// response never authorizes a stop and the caller keeps its existing
+/// retry deadline.
+pub(crate) async fn attested_terminal_bootstrap_error(
+    api: &ApiClient,
+    app_name: &str,
+) -> Option<TerminalBootstrapError> {
+    let endpoint = api.get_unlock_endpoint(app_name).await.ok()?;
+    let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
+        &endpoint.tee_url,
+        endpoint.tee_resolve_ip,
+    );
+    let (_attestation, attested_tee) = tee.attest_receipt_key().await.ok()?;
+    attested_tee
+        .bootstrap_status()
+        .await
+        .ok()?
+        .terminal_bootstrap_error
+}
+
+/// Decision from one safe [`TeeBootstrapStatus`] read in the bootstrap
+/// endpoint waits. A terminal diagnostic outranks an already-claimed state so
+/// a claimed-but-not-ready failure is never reported as success.
+pub(crate) enum BootstrapEndpointStatusDecision {
+    /// A recognized terminal failure: stop the wait with the stable code.
+    Terminal(TerminalBootstrapError),
+    /// Ownership already claimed; the initial-claim flow may be skipped.
+    AlreadyClaimed,
+    /// No terminal failure and not claimed: keep waiting.
+    Waiting,
+}
+
+pub(crate) fn bootstrap_endpoint_status_decision(
+    status: &TeeBootstrapStatus,
+) -> BootstrapEndpointStatusDecision {
+    if let Some(diagnostic) = &status.terminal_bootstrap_error {
+        BootstrapEndpointStatusDecision::Terminal(diagnostic.clone())
+    } else if status.claimed {
+        BootstrapEndpointStatusDecision::AlreadyClaimed
+    } else {
+        BootstrapEndpointStatusDecision::Waiting
+    }
+}
+
 pub(crate) async fn wait_for_bootstrap_endpoint(
     api: &ApiClient,
     app_name: &str,
@@ -675,29 +755,60 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
             max_wait,
         ));
         match tee.attest_receipt_key().await {
-            Ok((_attestation, attested_tee)) => match attested_tee.bootstrap_challenge().await {
-                Ok(_) => {
-                    pb.set_message("Ownership claim endpoint ready");
-                    return Ok(true);
+            Ok((_attestation, attested_tee)) => {
+                match attested_tee.bootstrap_challenge().await {
+                    Ok(_) => {
+                        // A terminal diagnostic read over this attested,
+                        // SPKI-pinned channel outranks a reachable challenge
+                        // endpoint: stop before attempting any claim.
+                        if let Ok(status) = attested_tee.bootstrap_status().await
+                            && let Some(diagnostic) = status.terminal_bootstrap_error
+                        {
+                            pb.abandon_with_message("TEE bootstrap failed");
+                            return Err(
+                                terminal_bootstrap_failure_message(app_name, &diagnostic).into()
+                            );
+                        }
+                        pb.set_message("Ownership claim endpoint ready");
+                        return Ok(true);
+                    }
+                    Err(_) => {
+                        // One safe status read decides the challenge-failure
+                        // fallback: a terminal diagnostic is never masked by a
+                        // claimed ownership state.
+                        match attested_tee.bootstrap_status().await {
+                            Ok(status) => match bootstrap_endpoint_status_decision(&status) {
+                                BootstrapEndpointStatusDecision::Terminal(diagnostic) => {
+                                    pb.abandon_with_message("TEE bootstrap failed");
+                                    return Err(terminal_bootstrap_failure_message(
+                                        app_name,
+                                        &diagnostic,
+                                    )
+                                    .into());
+                                }
+                                BootstrapEndpointStatusDecision::AlreadyClaimed => {
+                                    pb.set_message("Ownership already claimed");
+                                    return Ok(false);
+                                }
+                                BootstrapEndpointStatusDecision::Waiting => {
+                                    pb.set_message(timed_progress(
+                                        "TEE ownership: waiting for claim endpoint",
+                                        start.elapsed(),
+                                        max_wait,
+                                    ));
+                                }
+                            },
+                            Err(_) => {
+                                pb.set_message(timed_progress(
+                                    "TEE ownership: waiting for claim endpoint",
+                                    start.elapsed(),
+                                    max_wait,
+                                ));
+                            }
+                        }
+                    }
                 }
-                Err(err)
-                    if attested_tee
-                        .claim_state_is_successful()
-                        .await
-                        .unwrap_or(false) =>
-                {
-                    pb.set_message("Ownership already claimed");
-                    let _ = err;
-                    return Ok(false);
-                }
-                Err(_) => {
-                    pb.set_message(timed_progress(
-                        "TEE ownership: waiting for claim endpoint",
-                        start.elapsed(),
-                        max_wait,
-                    ));
-                }
-            },
+            }
             Err(_) => {
                 pb.set_message(timed_progress(
                     "TEE ownership: waiting for attested endpoint",
@@ -721,6 +832,7 @@ async fn wait_for_deploy_runtime(
     target: DeployRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
+    let mut terminal_probe_at: Option<Instant> = None;
 
     loop {
         if start.elapsed() > max_wait {
@@ -737,9 +849,10 @@ async fn wait_for_deploy_runtime(
             start.elapsed(),
             max_wait,
         ));
+        let mut observation_is_fresh = false;
         let direct_tee_allowed = match api.get_status(app_name).await {
             Ok(status) => {
-                let observation_is_fresh = observation_is_fresh_for_deployment(
+                observation_is_fresh = observation_is_fresh_for_deployment(
                     status.observation.as_ref(),
                     expected_deployment_id,
                 );
@@ -785,6 +898,18 @@ async fn wait_for_deploy_runtime(
                 false
             }
         };
+
+        // A terminal bootstrap diagnostic from the attested app TEE stops the
+        // wait, but only while CAP corroborates the current deployment, so a
+        // stale diagnostic from a replaced TEE cannot abort a replacement
+        // rollout. No automatic certificate or bootstrap retry happens here.
+        if observation_is_fresh
+            && tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
+            && let Some(diagnostic) = attested_terminal_bootstrap_error(api, app_name).await
+        {
+            pb.abandon_with_message("TEE bootstrap failed");
+            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+        }
 
         if direct_tee_allowed
             && let Ok(endpoint) = api.get_unlock_endpoint(app_name).await
@@ -1002,7 +1127,7 @@ async fn ensure_password_storage_unlocked_for_config(
             pb.set_message("Unlocking storage before config delivery...");
             let password = storage_password.unlock_password()?;
             tee.unlock(&password).await?;
-            wait_for_deploy_unlock_completion(&tee).await?;
+            wait_for_deploy_unlock_completion(&tee, app_name).await?;
             Ok(())
         }
         "unclaimed" => {
@@ -1044,10 +1169,20 @@ fn tee_supplemental_fields_are_consistent(status: &serde_json::Value) -> bool {
 
 async fn wait_for_deploy_unlock_completion(
     tee: &TeeClient,
+    app_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         let status = tee.status_json().await?;
+        // An already-satisfied unlock wins over a stale terminal diagnostic;
+        // otherwise a recognized terminal diagnostic (parsed from this same
+        // bounded-body status read over the attested channel) stops the wait
+        // with the stable code instead of spinning to the deadline.
+        if tee_unlock_state(&status) != "unlocked"
+            && let Some(diagnostic) = parse_terminal_bootstrap_error(&status)
+        {
+            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+        }
         match tee_unlock_state(&status) {
             "unlocked" => return Ok(()),
             "error" => {
@@ -1120,20 +1255,33 @@ pub(crate) async fn claim_initial_ownership(
         .await
     {
         Ok(result) => result,
-        Err(_) if tee.claim_state_is_successful().await.unwrap_or(false) => {
-            // Ownership committed server-side but the response (which carries the
-            // one-time mnemonic) was lost. Halt the deploy/template flow with the
-            // incomplete-backup error: never retry the claim, never imply
-            // rollback, never print secrets.
-            return Err(
-                crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
-                    "the claim response was lost after the TEE committed ownership, so the \
-                     one-time recovery mnemonic was never received"
-                        .to_string(),
-                ),
-            );
+        Err(error) => {
+            // One safe status read decides the indeterminate-claim fallback:
+            // an already-committed claim keeps the recovery-mnemonic halt (it
+            // outranks everything, including a terminal diagnostic), while a
+            // recognized terminal diagnostic replaces the raw transport
+            // error. Never retry the claim and never regenerate identity.
+            match tee.bootstrap_status().await {
+                Ok(status) if status.claimed => {
+                    return Err(
+                        crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
+                            "the claim response was lost after the TEE committed ownership, so the \
+                             one-time recovery mnemonic was never received"
+                                .to_string(),
+                        ),
+                    );
+                }
+                Ok(status) => {
+                    if let Some(diagnostic) = status.terminal_bootstrap_error {
+                        return Err(
+                            terminal_bootstrap_failure_message(app_name, &diagnostic).into()
+                        );
+                    }
+                    return Err(error.into());
+                }
+                Err(_) => return Err(error.into()),
+            }
         }
-        Err(err) => return Err(err.into()),
     };
 
     // Persist the one-time mnemonic to the prepared protected sink. The mnemonic

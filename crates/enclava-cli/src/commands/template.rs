@@ -29,9 +29,11 @@ use enclava_cli::{
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
-    SignedDeployBlobParams, StoragePasswordInput, build_signed_deploy_blobs,
-    claim_initial_ownership, ensure_manual_deploy_keyring, fetch_verified_platform_release,
-    generate_log_key_for_app,
+    BootstrapEndpointStatusDecision, SignedDeployBlobParams, StoragePasswordInput,
+    attested_terminal_bootstrap_error, bootstrap_endpoint_status_decision,
+    build_signed_deploy_blobs, claim_initial_ownership, ensure_manual_deploy_keyring,
+    fetch_verified_platform_release, generate_log_key_for_app, tee_terminal_diagnostic_probe_due,
+    terminal_bootstrap_failure_message,
 };
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
 use crate::commands::{counted_progress, format_duration, timed_progress};
@@ -1220,38 +1222,77 @@ async fn wait_for_template_bootstrap_endpoint(
             .run(DeployPhase::BootstrapAttestation, tee.attest_receipt_key())
             .await
         {
-            Ok((_attestation, attested_tee)) => match timings
-                .run(
-                    DeployPhase::BootstrapChallenge,
-                    attested_tee.bootstrap_challenge(),
-                )
-                .await
-            {
-                Ok(_) => {
-                    pb.set_message("Ownership claim endpoint ready");
-                    return Ok(true);
-                }
-                Err(err)
-                    if timings
-                        .run(
-                            DeployPhase::BootstrapStateFallback,
-                            attested_tee.claim_state_is_successful(),
-                        )
-                        .await
-                        .unwrap_or(false) =>
+            Ok((_attestation, attested_tee)) => {
+                match timings
+                    .run(
+                        DeployPhase::BootstrapChallenge,
+                        attested_tee.bootstrap_challenge(),
+                    )
+                    .await
                 {
-                    pb.set_message("Ownership already claimed");
-                    let _ = err;
-                    return Ok(false);
+                    Ok(_) => {
+                        // A terminal diagnostic read over this attested,
+                        // SPKI-pinned channel outranks a reachable challenge
+                        // endpoint: stop before attempting any claim.
+                        if let Ok(status) = timings
+                            .run(
+                                DeployPhase::BootstrapStateFallback,
+                                attested_tee.bootstrap_status(),
+                            )
+                            .await
+                            && let Some(diagnostic) = status.terminal_bootstrap_error
+                        {
+                            pb.abandon_with_message("TEE bootstrap failed");
+                            return Err(
+                                terminal_bootstrap_failure_message(app_name, &diagnostic).into()
+                            );
+                        }
+                        pb.set_message("Ownership claim endpoint ready");
+                        return Ok(true);
+                    }
+                    Err(_) => {
+                        // One safe status read decides the challenge-failure
+                        // fallback: a terminal diagnostic is never masked by a
+                        // claimed ownership state.
+                        match timings
+                            .run(
+                                DeployPhase::BootstrapStateFallback,
+                                attested_tee.bootstrap_status(),
+                            )
+                            .await
+                        {
+                            Ok(status) => match bootstrap_endpoint_status_decision(&status) {
+                                BootstrapEndpointStatusDecision::Terminal(diagnostic) => {
+                                    pb.abandon_with_message("TEE bootstrap failed");
+                                    return Err(terminal_bootstrap_failure_message(
+                                        app_name,
+                                        &diagnostic,
+                                    )
+                                    .into());
+                                }
+                                BootstrapEndpointStatusDecision::AlreadyClaimed => {
+                                    pb.set_message("Ownership already claimed");
+                                    return Ok(false);
+                                }
+                                BootstrapEndpointStatusDecision::Waiting => {
+                                    pb.set_message(timed_progress(
+                                        "TEE ownership: waiting for claim endpoint",
+                                        start.elapsed(),
+                                        max_wait,
+                                    ));
+                                }
+                            },
+                            Err(_) => {
+                                pb.set_message(timed_progress(
+                                    "TEE ownership: waiting for claim endpoint",
+                                    start.elapsed(),
+                                    max_wait,
+                                ));
+                            }
+                        }
+                    }
                 }
-                Err(_) => {
-                    pb.set_message(timed_progress(
-                        "TEE ownership: waiting for claim endpoint",
-                        start.elapsed(),
-                        max_wait,
-                    ));
-                }
-            },
+            }
             Err(_) => {
                 pb.set_message(timed_progress(
                     "TEE ownership: waiting for attested endpoint",
@@ -1435,6 +1476,7 @@ async fn wait_for_paas_managed_config_keys(
     }
     let start = Instant::now();
     let deadline = start + timeout;
+    let mut terminal_probe_at: Option<Instant> = None;
     progress.set_message(managed_config_progress_message(
         0,
         expected.len(),
@@ -1443,6 +1485,16 @@ async fn wait_for_paas_managed_config_keys(
     ));
     loop {
         fail_if_template_deployment_failed(api, instance_name, deployment_id).await?;
+        // TLS provisioning starts around the claim, so a terminal bootstrap
+        // diagnostic must stop this post-claim wait promptly. Only a verified
+        // attested read can authorize the stop; transport failures keep the
+        // existing deadline, and no automatic retry happens here.
+        if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
+            && let Some(diagnostic) = attested_terminal_bootstrap_error(api, instance_name).await
+        {
+            progress.abandon_with_message("TEE bootstrap failed");
+            return Err(terminal_bootstrap_failure_message(instance_name, &diagnostic).into());
+        }
         match api.list_config_keys(instance_name).await {
             Ok(response) => {
                 let present = response
@@ -2098,6 +2150,7 @@ async fn wait_for_paas_ssh_command(
     progress: &ProgressBar,
 ) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
     let start = Instant::now();
+    let mut terminal_probe_at: Option<Instant> = None;
     while start.elapsed() < timeout {
         progress.set_message(timed_progress(
             "Stable SSH endpoint: waiting for readiness",
@@ -2105,6 +2158,15 @@ async fn wait_for_paas_ssh_command(
             timeout,
         ));
         fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
+        // Post-claim wait: a terminal bootstrap diagnostic (e.g. ACME issuance
+        // failure) must stop this loop promptly with the stable code instead
+        // of waiting out the full SSH timeout.
+        if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
+            && let Some(diagnostic) = attested_terminal_bootstrap_error(api, app_name).await
+        {
+            progress.abandon_with_message("TEE bootstrap failed");
+            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+        }
         let response = match api.get_template_ssh_command(app_name).await {
             Ok(response) => response,
             Err(error) if should_retry_paas_ssh_command_error(&error) => {
@@ -5167,5 +5229,49 @@ mod tests {
         let err = validate_ssh_public_keys("ssh-ed25519 cmFuZG9tLWJhc2U2NA==", None).unwrap_err();
 
         assert!(err.to_string().contains("malformed SSH public key"));
+    }
+
+    #[test]
+    fn template_waits_stop_on_verified_terminal_bootstrap_diagnostics() {
+        // Wiring check for the shared guard (the guard's behavior itself is
+        // covered by the live tests in commands::app::tests): the bootstrap
+        // wait consults the safe status read for both its fallback outcomes,
+        // and the post-claim managed-config and SSH waits probe the attested
+        // TEE for terminal diagnostics.
+        let source = include_str!("template.rs");
+
+        let bootstrap_start = source
+            .find("async fn wait_for_template_bootstrap_endpoint")
+            .unwrap();
+        let bootstrap_end = source[bootstrap_start..]
+            .find("async fn deliver_template_config_with_retry")
+            .unwrap()
+            + bootstrap_start;
+        let bootstrap = &source[bootstrap_start..bootstrap_end];
+        let status_read = bootstrap.find("attested_tee.bootstrap_status()").unwrap();
+        let terminal = bootstrap
+            .find("BootstrapEndpointStatusDecision::Terminal")
+            .unwrap();
+        let already_claimed = bootstrap
+            .find("BootstrapEndpointStatusDecision::AlreadyClaimed")
+            .unwrap();
+        assert!(
+            status_read < terminal && terminal < already_claimed,
+            "the terminal decision must outrank the already-claimed fallback"
+        );
+
+        for marker in [
+            "async fn wait_for_paas_managed_config_keys",
+            "async fn wait_for_paas_ssh_command",
+        ] {
+            let start = source.find(marker).unwrap();
+            let end = source[start..].find("\nasync fn ").unwrap() + start;
+            let body = &source[start..end];
+            assert!(
+                body.contains("attested_terminal_bootstrap_error")
+                    && body.contains("terminal_bootstrap_failure_message"),
+                "{marker} must stop on verified terminal bootstrap diagnostics"
+            );
+        }
     }
 }

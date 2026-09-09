@@ -22,6 +22,8 @@ use x509_cert::der::{Decode, Encode};
 
 use enclava_common::canonical::ce_v1_hash;
 
+use chrono::{DateTime, Utc};
+
 use crate::api_types::{SignedReceiptResponse, TransitionReceiptAttestation};
 use crate::attestation::{tee_tls_transcript_hash, validate_snp_report_with_der_chain};
 
@@ -121,6 +123,116 @@ pub struct TeeStatusResponse {
     pub ownership_state: String,
     pub unlock_state: String,
     pub auto_unlock_enabled: bool,
+}
+
+/// Stable, recognized terminal bootstrap failure codes the attestation proxy
+/// may report under `/status`'s optional `bootstrap_error` field.
+pub const TERMINAL_BOOTSTRAP_ERROR_CODES: [&str; 3] = [
+    "acme_rate_limited",
+    "acme_certificate_issuance_failed",
+    "enclava_init_failed",
+];
+
+/// Upper bound on `/status` bodies accepted by the safe bootstrap-status read.
+const MAX_BOOTSTRAP_STATUS_BODY_BYTES: usize = 64 * 1024;
+
+/// Matches the attestation-proxy broker bound: a `retry_after` deadline more
+/// than 365 days past the observation is not a bounded deadline, and the
+/// whole diagnostic is treated as unrecognized.
+const TERMINAL_BOOTSTRAP_RETRY_AFTER_MAX_FUTURE_SECONDS: i64 = 365 * 24 * 60 * 60;
+
+/// A terminal bootstrap failure diagnostic recognized in the TEE's `/status`
+/// response.
+///
+/// Carries only the stable error code and an optional validated retry
+/// deadline -- never arbitrary provider detail. A `retry_after` that has
+/// already elapsed is preserved: it means a retry may now be attempted
+/// separately, not that the terminal failure is erased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalBootstrapError {
+    code: &'static str,
+    retry_after: Option<DateTime<Utc>>,
+}
+
+impl TerminalBootstrapError {
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn retry_after(&self) -> Option<DateTime<Utc>> {
+        self.retry_after
+    }
+
+    /// Stable, safe-to-print summary: the recognized code plus the validated
+    /// deadline, re-serialized as UTC RFC3339 seconds (`Z`) rather than echoed
+    /// from the response body.
+    pub fn stable_summary(&self) -> String {
+        match self.retry_after {
+            Some(deadline) => format!(
+                "{} (retry_after {})",
+                self.code,
+                deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            None => self.code.to_string(),
+        }
+    }
+}
+
+/// One safe, bounded `/status` read for bootstrap waits: whether ownership is
+/// already claimed, and whether the attestation proxy reported a recognized
+/// terminal bootstrap failure. Both signals come from the same body, so a
+/// claimed state can never mask a terminal diagnostic (and callers decide
+/// which signal outranks the other for their flow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeeBootstrapStatus {
+    pub claimed: bool,
+    pub terminal_bootstrap_error: Option<TerminalBootstrapError>,
+}
+
+/// The single parser for the optional `/status` `bootstrap_error` field.
+///
+/// Recognizes a diagnostic only when the `error` code is exactly one of
+/// [`TERMINAL_BOOTSTRAP_ERROR_CODES`], `terminal` is exactly `true`, and
+/// `retry_after` is absent, `null`, or a strictly valid UTC RFC3339 deadline
+/// within the broker's 365-day bound. Absent, unknown, or malformed fields
+/// yield no diagnostic, so pre-existing retry deadlines keep governing and no
+/// raw response text ever reaches the console.
+pub fn parse_terminal_bootstrap_error(body: &serde_json::Value) -> Option<TerminalBootstrapError> {
+    let field = body.get("bootstrap_error")?;
+    if !field.is_object() {
+        return None;
+    }
+    let code = field.get("error").and_then(|value| value.as_str())?;
+    let code = TERMINAL_BOOTSTRAP_ERROR_CODES
+        .iter()
+        .find(|known| **known == code)?;
+    match field.get("terminal") {
+        Some(serde_json::Value::Bool(true)) => {}
+        _ => return None,
+    }
+    let retry_after = match field.get("retry_after") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => {
+            let deadline = parse_utc_rfc3339_deadline(raw)?;
+            let horizon = Utc::now()
+                + chrono::Duration::seconds(TERMINAL_BOOTSTRAP_RETRY_AFTER_MAX_FUTURE_SECONDS);
+            if deadline > horizon {
+                return None;
+            }
+            Some(deadline)
+        }
+        _ => return None,
+    };
+    Some(TerminalBootstrapError { code, retry_after })
+}
+
+/// Strictly UTC RFC3339 (`Z` or zero offset); every other shape is rejected.
+fn parse_utc_rfc3339_deadline(raw: &str) -> Option<DateTime<Utc>> {
+    let deadline = DateTime::parse_from_rfc3339(raw).ok()?;
+    if deadline.offset().local_minus_utc() != 0 {
+        return None;
+    }
+    Some(deadline.with_timezone(&Utc))
 }
 
 fn deserialize_seconds_as_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -325,6 +437,39 @@ impl TeeClient {
         let resp = self.check_response(resp).await?;
         let body = resp.json::<serde_json::Value>().await?;
         Ok(claim_state_json_is_successful(&body))
+    }
+
+    /// One safe, bounded `/status` read combining the ownership-claim fallback
+    /// check with the terminal bootstrap diagnostic.
+    ///
+    /// Meaningful only on the SPKI-pinned client returned by
+    /// [`TeeClient::attest_receipt_key`]: a `/status` response received over
+    /// any unverified channel can never authorize a terminal decision. Reads
+    /// are bounded and transport failures surface as `Err`, which callers
+    /// treat as "no trusted diagnostic" so existing retry deadlines govern.
+    pub async fn bootstrap_status(&self) -> Result<TeeBootstrapStatus, TeeError> {
+        let body = self.bounded_status_json().await?;
+        Ok(bootstrap_status_from_json(&body))
+    }
+
+    async fn bounded_status_json(&self) -> Result<serde_json::Value, TeeError> {
+        let resp = self.http.get(self.url("/status")).send().await?;
+        let resp = self.check_response(resp).await?;
+        if resp
+            .content_length()
+            .is_some_and(|length| length as usize > MAX_BOOTSTRAP_STATUS_BODY_BYTES)
+        {
+            return Err(too_large_status_body_error());
+        }
+        let mut resp = resp;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_BOOTSTRAP_STATUS_BODY_BYTES {
+                return Err(too_large_status_body_error());
+            }
+        }
+        parse_status_body(&body)
     }
 
     // --- Ownership operations (direct to TEE, no API token) ---
@@ -571,6 +716,41 @@ fn build_tee_http_client(
         );
     }
     builder.build().map_err(TeeError::Http)
+}
+
+fn too_large_status_body_error() -> TeeError {
+    TeeError::Attestation(format!(
+        "TEE status body exceeds the {}-byte bounded read limit",
+        MAX_BOOTSTRAP_STATUS_BODY_BYTES
+    ))
+}
+
+/// Parse a bounded `/status` body. Bodies above the bounded read limit are
+/// rejected before parsing.
+fn parse_status_body(body: &[u8]) -> Result<serde_json::Value, TeeError> {
+    if body.len() > MAX_BOOTSTRAP_STATUS_BODY_BYTES {
+        return Err(too_large_status_body_error());
+    }
+    serde_json::from_slice(body)
+        .map_err(|err| TeeError::Attestation(format!("TEE status body is not valid JSON: {err}")))
+}
+
+/// Bounded-body variant of the safe terminal-diagnostic parser.
+#[cfg(test)]
+pub(crate) fn parse_terminal_bootstrap_error_body(body: &[u8]) -> Option<TerminalBootstrapError> {
+    parse_status_body(body)
+        .ok()
+        .and_then(|value| parse_terminal_bootstrap_error(&value))
+}
+
+/// Composition of one `/status` body into the safe bootstrap status: both the
+/// ownership-claim fallback and the terminal diagnostic come from the same
+/// body so neither can mask the other.
+fn bootstrap_status_from_json(body: &serde_json::Value) -> TeeBootstrapStatus {
+    TeeBootstrapStatus {
+        claimed: claim_state_json_is_successful(body),
+        terminal_bootstrap_error: parse_terminal_bootstrap_error(body),
+    }
 }
 
 fn claim_state_json_is_successful(body: &serde_json::Value) -> bool {
@@ -1137,4 +1317,4 @@ use tls::{EndpointParts, build_spki_pinned_client, fetch_tls_leaf_spki_der};
 
 #[cfg(test)]
 #[path = "tee_client/tests/mod.rs"]
-mod tests;
+pub(crate) mod tests;

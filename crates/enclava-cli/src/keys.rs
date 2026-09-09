@@ -1521,7 +1521,7 @@ mod tests {
         let canon = |p: &Path| fs::canonicalize(p).unwrap();
         assert!(flushed.contains(&canon(&paths.keys_dir.join("org-a"))));
         assert!(flushed.contains(&canon(&paths.keys_dir)));
-        assert!(flushed.contains(&canon(&tmp.path())));
+        assert!(flushed.contains(&canon(tmp.path())));
     }
 
     #[cfg(unix)]
