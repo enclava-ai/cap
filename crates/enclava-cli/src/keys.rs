@@ -678,6 +678,29 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     sync_parent_dir(path)?;
     Ok(())
 }
+/// The directory containing `path`'s entry, normalized for bare relative
+/// filenames (`""` from `Path::new("backup.json").parent()`, or `None` for a
+/// root path) to the current directory `"."` so the sync target can be opened.
+fn normalize_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => Path::new("."),
+    }
+}
+
+/// Flush one directory's entry table (unix: open read-only + `sync_all`).
+/// Exercised for every directory mutation whose durability matters.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    let dir = std::fs::OpenOptions::new().read(true).open(dir)?;
+    dir.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Flush the directory entry for a just-renamed secret so the rename itself
 /// survives a crash, not only the file contents (unix). `write_restricted`
@@ -688,19 +711,8 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
 /// durability. That is acceptable for legacy key/backup writes, but anything
 /// that must prove durable completion (the one-time recovery-mnemonic sink)
 /// rejects those platforms up front via [`secret_rename_durability_supported`].
-#[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> Result<(), KeysError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let dir = std::fs::OpenOptions::new().read(true).open(parent)?;
-    dir.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> Result<(), KeysError> {
-    Ok(())
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    sync_dir(normalize_parent(path))
 }
 
 /// Whether durable completion of a secret's atomic rename can be proven on this
@@ -803,15 +815,32 @@ pub fn store_app_mnemonic(
 /// fails afterwards loses the mnemonic permanently.
 ///
 /// Validates the two REAL paths the store uses — the destination
-/// `{app}.mnemonic` and the atomic-write temp `{app}.tmp` — and proves
-/// writability by writing a probe through the real temp path with the same
-/// owner-only primitive the store uses. An existing regular file at the
+/// `{app}.mnemonic` and the atomic-write temp `{app}.tmp` — and proves the sink
+/// by exercising every durability operation the post-claim store depends on:
+/// owner-only file creation + file fsync, directory fsync (the operation that
+/// makes the store's rename durable), and entry removal, all through the real
+/// temp path and its real parent directory. Any directory entries
+/// `create_dir_all` just created (a fresh org dir, or the keys dir/state root on
+/// a first run) are flushed up the ancestor chain, because a file fsync never
+/// makes directory creation durable. An existing regular file at the
 /// destination is a prior mnemonic backup and is left untouched (the post-claim
 /// store replaces it atomically); directories or symlinks at either real path
-/// are rejected fail-closed, because the post-claim rename/remove would be
-/// guaranteed to fail or write through a planted link. The probe contains no
-/// secret material and is removed again on both outcomes.
+/// are rejected fail-closed. The probe contains no secret material and is
+/// removed again on both outcomes.
 pub fn prepare_app_mnemonic_sink(paths: &CliPaths, org: &str, app: &str) -> Result<(), KeysError> {
+    prepare_app_mnemonic_sink_with_dir_sync(paths, org, app, &|dir: &Path| sync_dir(dir))
+}
+
+/// Testable core of [`prepare_app_mnemonic_sink`] with the directory-sync
+/// primitive injected, so a filesystem that rejects directory fsync (the review
+/// reproduction: an LD_PRELOAD shim failing `fsync` only on directory fds) can
+/// be simulated in-process and must abort preparation BEFORE the claim.
+fn prepare_app_mnemonic_sink_with_dir_sync(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    dir_sync: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), KeysError> {
     const PROBE_BYTES: &[u8] = b"claim sink writability probe (not a secret)";
 
     if !secret_rename_durability_supported() {
@@ -869,17 +898,33 @@ pub fn prepare_app_mnemonic_sink(paths: &CliPaths, org: &str, app: &str) -> Resu
         fs::remove_file(&tmp)?;
     }
 
-    // Prove writability through the REAL temp path with the same owner-only
-    // primitive the store uses (create-new 0600 + fsync). The destination has
-    // been type-checked above and the temp lives in the same directory, so no
-    // realistic rename failure remains that these checks did not exclude.
+    // Durability of any just-created directory entries: flush the sink
+    // directory and every ancestor up to the filesystem root. A filesystem that
+    // rejects directory fsync must fail HERE, before the claim is sent, instead
+    // of passing preparation and dooming the post-claim store (review P1).
+    let mut ancestor = Some(parent);
+    while let Some(dir) = ancestor {
+        dir_sync(dir)?;
+        ancestor = match dir.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => None,
+            Some(parent) => Some(parent),
+            None => None,
+        };
+    }
+
+    // Exercise the full durability pipeline through the REAL temp path: create
+    // owner-only + file fsync (`write_restricted`), directory fsync (the exact
+    // operation the store's rename durability relies on), entry removal, and a
+    // final directory fsync. Any failure aborts preparation; the probe is
+    // cleaned up best-effort and never touches the destination.
     write_restricted(&tmp, PROBE_BYTES)?;
-    fs::remove_file(&tmp).map_err(|err| {
-        KeysError::InvalidBackup(format!(
-            "claim sink probe {} could not be removed: {err}",
-            tmp.display()
-        ))
-    })?;
+    let flushed = dir_sync(parent)
+        .and_then(|()| fs::remove_file(&tmp))
+        .and_then(|()| dir_sync(parent));
+    if let Err(err) = flushed {
+        let _ = fs::remove_file(&tmp);
+        return Err(KeysError::Io(err));
+    }
     Ok(())
 }
 
@@ -1194,6 +1239,8 @@ mod tests {
 
     // Serialise tests that mutate $HOME (test impacts a shared global).
     static HOME_LOCK: Mutex<()> = Mutex::new(());
+    // Serialise tests that change the process working directory.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_isolated_home<F: FnOnce()>(f: F) {
         let _guard = HOME_LOCK.lock().unwrap();
@@ -1366,6 +1413,112 @@ mod tests {
             assert!(msg.contains("durable completion"));
             assert!(msg.contains("unix"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_app_mnemonic_sink_fails_closed_when_directory_sync_is_rejected() {
+        // Behavioral reversal of the review reproduction (LD_PRELOAD shim that
+        // fails fsync() only on directory fds): preparation must abort BEFORE
+        // the claim instead of passing and dooming the post-claim store.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        store_app_mnemonic(&paths, "org-a", "shell1", "prior backup mnemonic").unwrap();
+
+        let reject_dir_sync = |_: &Path| Err(std::io::Error::from_raw_os_error(22)); // EINVAL, like the shim
+        let err =
+            prepare_app_mnemonic_sink_with_dir_sync(&paths, "org-a", "shell1", &reject_dir_sync)
+                .expect_err("directory-sync rejection must abort preparation");
+        assert!(matches!(err, KeysError::Io(_)));
+
+        // The old backup is untouched and no probe leftover occupies the real
+        // temp path; nothing was exposed.
+        assert_eq!(
+            load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some("prior backup mnemonic".to_string())
+        );
+        assert!(!paths.keys_dir.join("org-a").join("shell1.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_app_mnemonic_sink_fails_closed_when_directory_sync_fails_late() {
+        // A filesystem that accepts the ancestor flushes but rejects the sync
+        // after the probe write must still abort preparation (never report the
+        // sink prepared on a directory-sync failure) and clean the probe up.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        let org_dir = paths.keys_dir.join("org-a");
+
+        let org_dir_syncs = std::cell::Cell::new(0u32);
+        let flaky = |dir: &Path| {
+            if dir == org_dir {
+                let seen = org_dir_syncs.get();
+                org_dir_syncs.set(seen + 1);
+                if seen >= 1 {
+                    return Err(std::io::Error::from_raw_os_error(5)); // EIO on 2nd org-dir sync
+                }
+            }
+            Ok(())
+        };
+        let err = prepare_app_mnemonic_sink_with_dir_sync(&paths, "org-a", "shell1", &flaky)
+            .expect_err("late directory-sync failure must abort preparation");
+        assert!(matches!(err, KeysError::Io(_)));
+
+        // First sync = ancestor walk, second = probe pipeline: the probe ran and
+        // its failure aborted preparation without leaving the temp occupied.
+        assert!(org_dir_syncs.get() >= 2);
+        assert!(!paths.keys_dir.join("org-a").join("shell1.tmp").exists());
+    }
+
+    #[test]
+    fn write_secret_file_relative_output_path_succeeds() {
+        // Behavioral reversal of the review reproduction: a bare relative
+        // output path (key backup's `--out backup.json`) used to write and
+        // rename the file and then report ENOENT, because sync_parent_dir
+        // opened the empty parent path "". cwd is process-global, so serialize
+        // like the HOME mutations above and restore before asserting.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = write_secret_file(Path::new("backup.json"), b"synthetic nonsecret");
+        let _ = std::env::set_current_dir(prev);
+
+        result.expect("relative backup output path must succeed end-to-end");
+        let written = tmp.path().join("backup.json");
+        assert_eq!(fs::read(&written).unwrap(), b"synthetic nonsecret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&written).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "relative output must stay owner-only");
+        }
+        assert!(!tmp.path().join("backup.tmp").exists(), "no stray temp");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_app_mnemonic_sink_flushes_newly_created_directory_ancestors() {
+        // Directory creation is only durable once the PARENT entry table is
+        // flushed; a file fsync never does that. Preparation of a fresh org dir
+        // must flush the sink dir, the keys dir holding its entry, and the
+        // state root holding the keys dir's entry, before reporting prepared.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+
+        let flushed = std::cell::RefCell::new(Vec::new());
+        let recorder = |dir: &Path| {
+            flushed.borrow_mut().push(dir.to_path_buf());
+            Ok(())
+        };
+        prepare_app_mnemonic_sink_with_dir_sync(&paths, "org-a", "shell1", &recorder)
+            .expect("recording syncs must succeed");
+
+        let flushed = flushed.into_inner();
+        assert!(flushed.contains(&paths.keys_dir.join("org-a")));
+        assert!(flushed.contains(&paths.keys_dir));
+        assert!(flushed.contains(&tmp.path().to_path_buf()));
     }
 
     #[test]
