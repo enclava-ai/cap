@@ -5581,7 +5581,7 @@ mod tests {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
             TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
-                .with_verified_host_data_for_tests([0x09; 32])
+                .with_verified_launch_identity_for_tests([0x09; 32], [0x11; 48])
         };
         let expectation = template_test_expectation("expected-1", [0x09; 32]);
         let mut config_token = "token".to_string();
@@ -5666,7 +5666,7 @@ mod tests {
             // The OLD deployment's TEE: its verified launch hash differs
             // from the wait's trusted expectation.
             TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
-                .with_verified_host_data_for_tests([0x07; 32])
+                .with_verified_launch_identity_for_tests([0x07; 32], [0x11; 48])
         };
         let expectation = template_test_expectation("expected-1", [0x09; 32]);
         let mut config_token = "token".to_string();

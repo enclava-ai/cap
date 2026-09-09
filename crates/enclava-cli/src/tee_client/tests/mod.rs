@@ -209,9 +209,14 @@ async fn verifies_attestation_evidence_report_data_binding() {
         })),
     };
 
-    super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
-        .await
-        .unwrap();
+    // The development JSON evidence path yields no trusted launch identity:
+    // callers fail closed on deployment binding.
+    assert!(
+        super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

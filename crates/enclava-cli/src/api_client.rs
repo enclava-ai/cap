@@ -846,10 +846,18 @@ impl ApiClient {
     }
 }
 
+/// Shared per-request timeout for CAP API calls. Generous by design -- it
+/// matches the CLI's maximum deploy health budget -- so legitimately slow
+/// deploy/setup calls are never cut, while a stalled response can no longer
+/// hold a wait loop open indefinitely (the terminal-diagnostic probes were
+/// already budgeted; this bounds the surrounding wait-loop API calls too).
+const API_REQUEST_TIMEOUT_SECONDS: u64 = 900;
+
 fn http_client_for(url: &str) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
         .https_only(!loopback_http_url(url))
+        .timeout(std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS))
         .build()
         .expect("failed to build HTTP client")
 }

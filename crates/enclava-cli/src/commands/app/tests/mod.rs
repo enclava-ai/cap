@@ -1762,6 +1762,9 @@ mod terminal_diagnostics {
 
     const OLD_TEE_LAUNCH_HASH: [u8; 32] = [0x07; 32];
     const NEW_EXPECTED_LAUNCH_HASH: [u8; 32] = [0x09; 32];
+    /// Measurement carried by test_expectation (FirmwareMeasurement::Full).
+    const EXPECTED_FIRMWARE_MEASUREMENT: [u8; 48] = [0x11; 48];
+    const WRONG_FIRMWARE_MEASUREMENT: [u8; 48] = [0x22; 48];
 
     fn deployment_entry_json(id: &str, status: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1900,7 +1903,10 @@ mod terminal_diagnostics {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
-            local_tee_client(address).with_verified_host_data_for_tests(NEW_EXPECTED_LAUNCH_HASH)
+            local_tee_client(address).with_verified_launch_identity_for_tests(
+                NEW_EXPECTED_LAUNCH_HASH,
+                EXPECTED_FIRMWARE_MEASUREMENT,
+            )
         };
         let started = std::time::Instant::now();
         let api_address = spawn_json_api_stub(|path| {
@@ -2163,7 +2169,10 @@ mod terminal_diagnostics {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
-            local_tee_client(address).with_verified_host_data_for_tests(NEW_EXPECTED_LAUNCH_HASH)
+            local_tee_client(address).with_verified_launch_identity_for_tests(
+                NEW_EXPECTED_LAUNCH_HASH,
+                EXPECTED_FIRMWARE_MEASUREMENT,
+            )
         };
         let started = std::time::Instant::now();
         let api_address = spawn_json_api_stub(|path| {
@@ -2294,7 +2303,10 @@ mod terminal_diagnostics {
             }
             local_tee_client(address)
                 // The old TEE's verified launch measurement.
-                .with_verified_host_data_for_tests(OLD_TEE_LAUNCH_HASH)
+                .with_verified_launch_identity_for_tests(
+                    OLD_TEE_LAUNCH_HASH,
+                    EXPECTED_FIRMWARE_MEASUREMENT,
+                )
         };
         let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
         let expectation = test_expectation("new-1", NEW_EXPECTED_LAUNCH_HASH);
@@ -2371,7 +2383,10 @@ mod terminal_diagnostics {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
-            local_tee_client(address).with_verified_host_data_for_tests(NEW_EXPECTED_LAUNCH_HASH)
+            local_tee_client(address).with_verified_launch_identity_for_tests(
+                NEW_EXPECTED_LAUNCH_HASH,
+                EXPECTED_FIRMWARE_MEASUREMENT,
+            )
         };
         let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
         let expectation = test_expectation("expected-1", NEW_EXPECTED_LAUNCH_HASH);
@@ -2427,22 +2442,151 @@ mod terminal_diagnostics {
     }
 
     #[test]
-    fn host_data_binding_fixtures() {
+    fn launch_identity_binding_fixtures() {
+        use enclava_cli::tee_client::{
+            VerifiedSnpLaunchIdentity, launch_identity_binds_deployment,
+        };
+        use enclava_common::descriptor::FirmwareMeasurement;
+
+        let expected_measurement = FirmwareMeasurement::Full(EXPECTED_FIRMWARE_MEASUREMENT);
+        let fully_verified = VerifiedSnpLaunchIdentity {
+            host_data: NEW_EXPECTED_LAUNCH_HASH,
+            firmware_measurement: EXPECTED_FIRMWARE_MEASUREMENT,
+        };
+
+        // Positive: same fully verified client (hash AND measurement match).
+        assert!(launch_identity_binds_deployment(
+            Some(&fully_verified),
+            &NEW_EXPECTED_LAUNCH_HASH,
+            &expected_measurement
+        ));
         // Old TEE launch hash vs the new deployment's expected hash: no bind.
-        assert!(!enclava_cli::tee_client::host_data_binds_deployment(
-            Some(&OLD_TEE_LAUNCH_HASH),
-            &NEW_EXPECTED_LAUNCH_HASH
+        assert!(!launch_identity_binds_deployment(
+            Some(&VerifiedSnpLaunchIdentity {
+                host_data: OLD_TEE_LAUNCH_HASH,
+                firmware_measurement: EXPECTED_FIRMWARE_MEASUREMENT,
+            }),
+            &NEW_EXPECTED_LAUNCH_HASH,
+            &expected_measurement
         ));
-        // New hash: bind.
-        assert!(enclava_cli::tee_client::host_data_binds_deployment(
-            Some(&NEW_EXPECTED_LAUNCH_HASH),
-            &NEW_EXPECTED_LAUNCH_HASH
+        // Matching HOST_DATA with a WRONG firmware measurement: HOST_DATA
+        // alone is hypervisor-supplied launch input and must never authorize.
+        assert!(!launch_identity_binds_deployment(
+            Some(&VerifiedSnpLaunchIdentity {
+                host_data: NEW_EXPECTED_LAUNCH_HASH,
+                firmware_measurement: WRONG_FIRMWARE_MEASUREMENT,
+            }),
+            &NEW_EXPECTED_LAUNCH_HASH,
+            &expected_measurement
         ));
-        // Missing verified HOST_DATA never binds.
-        assert!(!enclava_cli::tee_client::host_data_binds_deployment(
+        // Legacy 32-byte measurement expectation still matches its prefix.
+        assert!(launch_identity_binds_deployment(
+            Some(&VerifiedSnpLaunchIdentity {
+                host_data: NEW_EXPECTED_LAUNCH_HASH,
+                firmware_measurement: EXPECTED_FIRMWARE_MEASUREMENT,
+            }),
+            &NEW_EXPECTED_LAUNCH_HASH,
+            &FirmwareMeasurement::Legacy(EXPECTED_FIRMWARE_MEASUREMENT[..32].try_into().unwrap())
+        ));
+        // Missing verified identity (unattested client or development JSON
+        // evidence) never binds.
+        assert!(!launch_identity_binds_deployment(
             None,
-            &NEW_EXPECTED_LAUNCH_HASH
+            &NEW_EXPECTED_LAUNCH_HASH,
+            &expected_measurement
         ));
+    }
+
+    #[tokio::test]
+    async fn matching_host_data_with_wrong_measurement_cannot_authorize() {
+        // The endpoint reports the NEW deployment's launch hash but its
+        // authenticated firmware measurement differs: no stop, and no
+        // terminal diagnostic may be read through the unbound endpoint.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_server(requests.clone(), |path| {
+            let body = if path.ends_with("/status") {
+                serde_json::json!({
+                    "unlock_state": "locked",
+                    "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
+                })
+                .to_string()
+            } else {
+                "{}".to_string()
+            };
+            (200, body)
+        })
+        .await;
+        let tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            local_tee_client(address).with_verified_launch_identity_for_tests(
+                NEW_EXPECTED_LAUNCH_HASH,
+                WRONG_FIRMWARE_MEASUREMENT,
+            )
+        };
+        let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
+        let expectation = test_expectation("new-1", NEW_EXPECTED_LAUNCH_HASH);
+        let deployment = crate::commands::app::DeploymentWait::trusted("new-1", Some(&expectation));
+
+        assert!(
+            deployment_bound_terminal_bootstrap_error_on_channel(
+                &api,
+                "demo",
+                deployment,
+                &tee,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await
+            .is_none(),
+            "matching HOST_DATA with a mismatched firmware measurement must never authorize"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/status")),
+            "no terminal diagnostic may be read through an unbound endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_attestation_response_never_leaks_content() {
+        // A type-mismatched (malformed) attestation body must produce a fixed
+        // error message: serde type errors can interpolate the offending
+        // value, and this response is unauthenticated at that point.
+        // Answer every request with the malformed body (the TLS leaf fetch
+        // sends no HTTP request and simply disconnects; answering all paths
+        // keeps the sequential server loop accepting).
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_raw_server(requests, move |_path| {
+            let mut response =
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+                    .to_vec();
+            // A bare JSON string: valid JSON, wrong type for
+            // AttestationResponse, and carrying the secret marker.
+            response.extend_from_slice(format!("\"{SYNTHETIC_SECRET_MARKER}\"").as_bytes());
+            Some(response)
+        })
+        .await;
+        let tee = TeeClient::new_with_resolve_ip(
+            &format!("https://localhost:{}", address.port()),
+            Some(address.ip()),
+        );
+        let error = match tee.attest_receipt_key().await {
+            Ok(_) => panic!("malformed attestation body must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("attestation body is malformed"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains(SYNTHETIC_SECRET_MARKER),
+            "malformed-response errors must never carry response content"
+        );
     }
 
     #[tokio::test]
@@ -2540,7 +2684,10 @@ mod terminal_diagnostics {
             unsafe {
                 std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
             }
-            local_tee_client(address).with_verified_host_data_for_tests(NEW_EXPECTED_LAUNCH_HASH)
+            local_tee_client(address).with_verified_launch_identity_for_tests(
+                NEW_EXPECTED_LAUNCH_HASH,
+                EXPECTED_FIRMWARE_MEASUREMENT,
+            )
         };
         let started = std::time::Instant::now();
         assert!(

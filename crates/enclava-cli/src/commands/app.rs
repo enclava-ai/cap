@@ -830,9 +830,14 @@ async fn terminal_diagnostic_on_attested(
     attested: &TeeClient,
     expectation: &TrustedDeploymentExpectation,
 ) -> Option<TerminalBootstrapError> {
-    if !enclava_cli::tee_client::host_data_binds_deployment(
-        attested.verified_host_data().as_ref(),
+    // HOST_DATA alone is hypervisor-supplied launch input: the authenticated
+    // firmware measurement must match the existing expectation as well, or
+    // the endpoint is not proven to execute this deployment's expected
+    // firmware.
+    if !enclava_cli::tee_client::launch_identity_binds_deployment(
+        attested.verified_launch_identity().as_ref(),
         &expectation.expected_cc_init_data_hash,
+        &expectation.expected_firmware_measurement,
     ) {
         return None;
     }

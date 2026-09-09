@@ -40,12 +40,13 @@ pub struct TeeClient {
     http: reqwest::Client,
     timeout: std::time::Duration,
     resolve_ip: Option<IpAddr>,
-    /// SNP HOST_DATA (launch measurement) verified by this client's
-    /// attestation. Present only on the SPKI-pinned client returned by
-    /// `attest_receipt_key()` after the AMD chain, nonce, TLS leaf SPKI, and
-    /// report data all verified; it binds every later `/status` read on this
-    /// client to the TEE whose launch produced that HOST_DATA.
-    verified_host_data: Option<[u8; 32]>,
+    /// Launch identity (SNP HOST_DATA plus authenticated firmware
+    /// measurement) verified by this client's attestation. Present only on
+    /// the SPKI-pinned client returned by `attest_receipt_key()` after the
+    /// AMD chain, nonce, TLS leaf SPKI, and report data all verified; it
+    /// binds every later `/status` read on this client to the TEE whose
+    /// launch produced that identity.
+    verified_launch_identity: Option<VerifiedSnpLaunchIdentity>,
 }
 
 /// Whether TEE TLS verification is relaxed for staging-type environments.
@@ -237,20 +238,38 @@ pub fn parse_terminal_bootstrap_error(body: &serde_json::Value) -> Option<Termin
     Some(TerminalBootstrapError { code, retry_after })
 }
 
-/// Deployment binding for terminal diagnostics: the SNP HOST_DATA (launch
-/// measurement) verified over a client's attestation must equal the locally
-/// trusted expected cc-init-data hash of the deployment being waited on.
-/// CAP validates the signed descriptor's hash when rendering the deployment
-/// and revalidates it at apply, so a matching HOST_DATA proves the responding
-/// TEE executes this deployment's launch configuration; the SPKI-pinned
-/// channel then guarantees the `/status` read reaches that same TEE. Missing
-/// verified HOST_DATA (unattested client, or development JSON evidence)
-/// never binds.
-pub fn host_data_binds_deployment(
-    verified_host_data: Option<&[u8; 32]>,
+/// Launch identity verified during attestation: the SNP HOST_DATA (launch
+/// input measurement) together with the authenticated firmware measurement,
+/// both verified by the same AMD chain that authenticated report data.
+/// HOST_DATA alone is hypervisor-supplied launch input and does not
+/// authenticate the executed firmware, so the measurement is required
+/// alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedSnpLaunchIdentity {
+    pub host_data: [u8; 32],
+    pub firmware_measurement: [u8; 48],
+}
+
+/// Deployment binding for terminal diagnostics: the launch identity verified
+/// over a client's attestation must match BOTH the locally trusted expected
+/// cc-init-data hash of the deployment being waited on AND the existing
+/// expected firmware measurement. CAP validates the signed descriptor's hash
+/// when rendering the deployment and revalidates it at apply, and the
+/// firmware measurement authenticates which code the TEE actually executes;
+/// the SPKI-pinned channel then guarantees the `/status` read reaches that
+/// same TEE. Missing verified identity (unattested client, or development
+/// JSON evidence) never binds, and neither does a matching HOST_DATA with a
+/// mismatched measurement.
+pub fn launch_identity_binds_deployment(
+    verified: Option<&VerifiedSnpLaunchIdentity>,
     expected_cc_init_data_hash: &[u8; 32],
+    expected_firmware_measurement: &enclava_common::descriptor::FirmwareMeasurement,
 ) -> bool {
-    verified_host_data == Some(expected_cc_init_data_hash)
+    let Some(verified) = verified else {
+        return false;
+    };
+    verified.host_data == *expected_cc_init_data_hash
+        && expected_firmware_measurement.matches_report(&verified.firmware_measurement)
 }
 
 /// Strictly UTC RFC3339 (`Z` or zero offset); every other shape is rejected.
@@ -359,7 +378,7 @@ impl TeeClient {
             http,
             timeout,
             resolve_ip,
-            verified_host_data: None,
+            verified_launch_identity: None,
         }
     }
 
@@ -379,30 +398,44 @@ impl TeeClient {
             http,
             timeout: self.timeout,
             resolve_ip: self.resolve_ip,
-            verified_host_data: self.verified_host_data,
+            verified_launch_identity: self.verified_launch_identity,
         }
     }
 
-    /// The SNP HOST_DATA (launch measurement) verified by this client's
-    /// attestation, when this client came from `attest_receipt_key()`.
-    pub fn verified_host_data(&self) -> Option<[u8; 32]> {
-        self.verified_host_data
+    /// The launch identity (SNP HOST_DATA plus authenticated firmware
+    /// measurement) verified by this client's attestation, when this client
+    /// came from `attest_receipt_key()`.
+    pub fn verified_launch_identity(&self) -> Option<VerifiedSnpLaunchIdentity> {
+        self.verified_launch_identity
     }
 
-    /// Testing-only: pin a synthetic verified HOST_DATA onto a client,
+    /// Testing-only: pin a synthetic verified launch identity onto a client,
     /// standing in for a completed `attest_receipt_key()` verification.
-    /// Production code must never call this; only `attest_receipt_key()`
-    /// produces trustworthy HOST_DATA.
-    pub fn with_verified_host_data_for_tests(mut self, host_data: [u8; 32]) -> Self {
-        self.verified_host_data = Some(host_data);
+    /// Excluded from release builds, like every other debug-gated test
+    /// affordance in this client; only `attest_receipt_key()` produces a
+    /// trustworthy identity.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn with_verified_launch_identity_for_tests(
+        mut self,
+        host_data: [u8; 32],
+        firmware_measurement: [u8; 48],
+    ) -> Self {
+        self.verified_launch_identity = Some(VerifiedSnpLaunchIdentity {
+            host_data,
+            firmware_measurement,
+        });
         self
     }
 
-    /// Record the HOST_DATA verified during attestation. `None` (the
+    /// Record the launch identity verified during attestation. `None` (the
     /// development JSON evidence path) leaves the client without deployment
     /// binding evidence, so terminal diagnostics fail closed.
-    fn with_verified_host_data_checked(mut self, host_data: Option<[u8; 32]>) -> Self {
-        self.verified_host_data = host_data;
+    fn with_verified_launch_identity_checked(
+        mut self,
+        identity: Option<VerifiedSnpLaunchIdentity>,
+    ) -> Self {
+        self.verified_launch_identity = identity;
         self
     }
 
@@ -740,12 +773,12 @@ impl TeeClient {
             "TEE attestation body",
         )
         .await?;
-        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|err| {
-            TeeError::Attestation(format!("attestation body is not valid JSON: {err}"))
-        })?;
-        let attestation: AttestationResponse = serde_json::from_value(value).map_err(|err| {
-            TeeError::Attestation(format!("attestation body is malformed: {err}"))
-        })?;
+        // Fixed messages only: serde errors can interpolate response content,
+        // which must never leak before SNP authentication completes.
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| TeeError::Attestation("attestation body is not valid JSON".to_string()))?;
+        let attestation: AttestationResponse = serde_json::from_value(value)
+            .map_err(|_| TeeError::Attestation("attestation body is malformed".to_string()))?;
         if attestation.nonce != nonce_b64 {
             return Err(TeeError::Attestation("nonce mismatch".to_string()));
         }
@@ -769,7 +802,7 @@ impl TeeClient {
         let evidence = B64_STANDARD
             .decode(attestation.evidence.payload_b64.as_bytes())
             .map_err(|_| TeeError::Attestation("evidence payload is not base64".to_string()))?;
-        let verified_host_data =
+        let verified_launch_identity =
             verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)
                 .await?;
         let evidence_sha256 = hex::encode(Sha256::digest(evidence));
@@ -782,7 +815,7 @@ impl TeeClient {
         };
         let attested_client = self
             .with_http(pinned_http)
-            .with_verified_host_data_checked(verified_host_data);
+            .with_verified_launch_identity_checked(verified_launch_identity);
         Ok((transition_attestation, attested_client))
     }
 }
@@ -867,7 +900,7 @@ fn parse_status_body(body: &[u8]) -> Result<serde_json::Value, TeeError> {
         return Err(too_large_status_body_error());
     }
     serde_json::from_slice(body)
-        .map_err(|err| TeeError::Attestation(format!("TEE status body is not valid JSON: {err}")))
+        .map_err(|_| TeeError::Attestation("TEE status body is not valid JSON".to_string()))
 }
 
 /// Bounded-body variant of the safe terminal-diagnostic parser.
@@ -968,7 +1001,7 @@ async fn verify_evidence_report_data(
     evidence: &AttestationEvidence,
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
-) -> Result<Option<[u8; 32]>, TeeError> {
+) -> Result<Option<VerifiedSnpLaunchIdentity>, TeeError> {
     verify_evidence_report_data_with_json_fallback(
         evidence,
         evidence_bytes,
@@ -983,7 +1016,7 @@ async fn verify_evidence_report_data_with_json_fallback(
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
     allow_json_report_data_only: bool,
-) -> Result<Option<[u8; 32]>, TeeError> {
+) -> Result<Option<VerifiedSnpLaunchIdentity>, TeeError> {
     let evidence_json = evidence
         .json
         .as_ref()
@@ -1023,10 +1056,13 @@ async fn verify_evidence_report_data_with_json_fallback(
                 "SNP report_data does not bind nonce, TLS leaf SPKI, and receipt key".to_string(),
             ));
         }
-        // HOST_DATA was verified together with the same AMD chain that
-        // authenticated report_data: preserve it as the launch measurement of
-        // exactly this endpoint.
-        return Ok(Some(report.host_data));
+        // HOST_DATA and the firmware measurement were verified together with
+        // the same AMD chain that authenticated report_data: preserve both as
+        // the launch identity of exactly this endpoint.
+        return Ok(Some(VerifiedSnpLaunchIdentity {
+            host_data: report.host_data,
+            firmware_measurement: report.firmware_measurement,
+        }));
     }
 
     if !allow_json_report_data_only {
@@ -1044,7 +1080,7 @@ async fn verify_evidence_report_data_with_json_fallback(
         ));
     }
     // The development JSON path carries no raw SNP report, so no trusted
-    // HOST_DATA exists: callers fail closed on deployment binding.
+    // launch identity exists: callers fail closed on deployment binding.
     Ok(None)
 }
 
