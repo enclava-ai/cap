@@ -24,14 +24,14 @@ use enclava_cli::{
     },
     config::{self, CliPaths},
     keys,
-    tee_client::{TeeClient, TeeError},
+    tee_client::{TeeClient, TeeError, parse_terminal_bootstrap_error},
 };
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     BootstrapEndpointStatusDecision, SignedDeployBlobParams, StoragePasswordInput,
-    attested_terminal_bootstrap_error, bootstrap_endpoint_status_decision,
-    build_signed_deploy_blobs, claim_initial_ownership, ensure_manual_deploy_keyring,
+    bootstrap_endpoint_status_decision, build_signed_deploy_blobs, claim_initial_ownership,
+    deployment_bound_terminal_bootstrap_error, deployment_is_current, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, generate_log_key_for_app, tee_terminal_diagnostic_probe_due,
     terminal_bootstrap_failure_message,
 };
@@ -558,8 +558,11 @@ async fn deploy_with_timings(
             DeployPhase::CustomerConfigWrite,
             deliver_template_config_with_retry(
                 api,
+                DeliverTemplateConfigTarget {
+                    instance_name: &instance_name,
+                    deployment_id: &deployment_id,
+                },
                 &mut tee,
-                &instance_name,
                 &mut config_token,
                 &mut tee_url,
                 &mut tee_resolve_ip,
@@ -1330,10 +1333,16 @@ fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }
 
+/// Deployment identity for template config delivery.
+struct DeliverTemplateConfigTarget<'a> {
+    instance_name: &'a str,
+    deployment_id: &'a str,
+}
+
 async fn deliver_template_config_with_retry(
     api: &ApiClient,
+    target: DeliverTemplateConfigTarget<'_>,
     tee: &mut TeeClient,
-    instance_name: &str,
     config_token: &mut String,
     tee_url: &mut String,
     tee_resolve_ip: &mut Option<std::net::IpAddr>,
@@ -1342,14 +1351,16 @@ async fn deliver_template_config_with_retry(
     let mut delivery = TemplateConfigDeliveryState {
         api,
         tee,
-        instance_name,
+        instance_name: target.instance_name,
+        deployment_id: target.deployment_id,
         config_token,
         tee_url,
         tee_resolve_ip,
+        terminal_probe_at: None,
     };
     for (key, value) in pairs {
         delivery.set_key(key, value).await?;
-        sync_template_config_key_with_retry(api, instance_name, key).await?;
+        sync_template_config_key_with_retry(api, target.instance_name, key).await?;
     }
     Ok(())
 }
@@ -1358,12 +1369,39 @@ struct TemplateConfigDeliveryState<'a> {
     api: &'a ApiClient,
     tee: &'a mut TeeClient,
     instance_name: &'a str,
+    deployment_id: &'a str,
     config_token: &'a mut String,
     tee_url: &'a mut String,
     tee_resolve_ip: &'a mut Option<std::net::IpAddr>,
+    terminal_probe_at: Option<Instant>,
 }
 
 impl TemplateConfigDeliveryState<'_> {
+    /// Stop the config-delivery retry loop promptly when the TEE this state
+    /// is already attested to reports a terminal bootstrap failure. CAP must
+    /// corroborate the expected deployment as the app's current one before
+    /// and after the bounded status read, so a replaced TEE cannot abort a
+    /// newer deployment's delivery; a failed read authorizes nothing.
+    async fn terminal_bootstrap_stop(&mut self) -> Option<String> {
+        if !tee_terminal_diagnostic_probe_due(&mut self.terminal_probe_at) {
+            return None;
+        }
+        if !deployment_is_current(self.api, self.instance_name, self.deployment_id).await {
+            return None;
+        }
+        let Ok(status) = self.tee.bounded_status_json().await else {
+            return None;
+        };
+        let diagnostic = parse_terminal_bootstrap_error(&status)?;
+        if !deployment_is_current(self.api, self.instance_name, self.deployment_id).await {
+            return None;
+        }
+        Some(terminal_bootstrap_failure_message(
+            self.instance_name,
+            &diagnostic,
+        ))
+    }
+
     async fn set_key(&mut self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
         for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
             match self.tee.config_set(key, value, self.config_token).await {
@@ -1391,12 +1429,18 @@ impl TemplateConfigDeliveryState<'_> {
                         *self.tee_resolve_ip = refreshed_tee_resolve_ip;
                     }
                     *self.config_token = refreshed.token;
+                    if let Some(message) = self.terminal_bootstrap_stop().await {
+                        return Err(message.into());
+                    }
                     tokio::time::sleep(template_config_delivery_retry_delay()).await;
                 }
                 Err(error)
                     if should_retry_template_config_tee_error(&error)
                         && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
                 {
+                    if let Some(message) = self.terminal_bootstrap_stop().await {
+                        return Err(message.into());
+                    }
                     tokio::time::sleep(template_config_delivery_retry_delay()).await;
                 }
                 Err(error) => return Err(error.into()),
@@ -1486,11 +1530,14 @@ async fn wait_for_paas_managed_config_keys(
     loop {
         fail_if_template_deployment_failed(api, instance_name, deployment_id).await?;
         // TLS provisioning starts around the claim, so a terminal bootstrap
-        // diagnostic must stop this post-claim wait promptly. Only a verified
-        // attested read can authorize the stop; transport failures keep the
-        // existing deadline, and no automatic retry happens here.
+        // diagnostic must stop this post-claim wait promptly. The probe is
+        // bound to the expected deployment via CAP before and after the
+        // attested read (an old deployment's TEE cannot abort a replacement),
+        // only a verified attested read can authorize the stop, and no
+        // automatic retry happens here.
         if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
-            && let Some(diagnostic) = attested_terminal_bootstrap_error(api, instance_name).await
+            && let Some(diagnostic) =
+                deployment_bound_terminal_bootstrap_error(api, instance_name, deployment_id).await
         {
             progress.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(instance_name, &diagnostic).into());
@@ -2160,9 +2207,13 @@ async fn wait_for_paas_ssh_command(
         fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
         // Post-claim wait: a terminal bootstrap diagnostic (e.g. ACME issuance
         // failure) must stop this loop promptly with the stable code instead
-        // of waiting out the full SSH timeout.
+        // of waiting out the full SSH timeout. The probe is bound to the
+        // expected deployment via CAP before and after the attested read; a
+        // `pending`/unknown deployment id never binds, so the probe is
+        // skipped rather than guessing.
         if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
-            && let Some(diagnostic) = attested_terminal_bootstrap_error(api, app_name).await
+            && let Some(diagnostic) =
+                deployment_bound_terminal_bootstrap_error(api, app_name, deployment_id).await
         {
             progress.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
@@ -5268,10 +5319,318 @@ mod tests {
             let end = source[start..].find("\nasync fn ").unwrap() + start;
             let body = &source[start..end];
             assert!(
-                body.contains("attested_terminal_bootstrap_error")
+                body.contains("deployment_bound_terminal_bootstrap_error")
                     && body.contains("terminal_bootstrap_failure_message"),
-                "{marker} must stop on verified terminal bootstrap diagnostics"
+                "{marker} must stop on deployment-bound verified terminal bootstrap diagnostics"
             );
+        }
+    }
+
+    mod terminal_delivery_support {
+        use base64::Engine as _;
+        use std::net::SocketAddr;
+        use std::sync::{Mutex, OnceLock};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        pub(crate) use std::sync::Mutex as TestMutex;
+
+        pub(crate) const SYNTHETIC_SECRET_MARKER: &str = "SECRET-MARKER-3d61b8";
+
+        // Public synthetic localhost fixture (same key material as the
+        // transport test in tee_client/tls.rs); used only for local TLS test
+        // servers.
+        const SYNTHETIC_LOCALHOST_CERT_B64: &str = "MIIBfzCCASWgAwIBAgIUDvNchz/4kjYNIUZPbhErYcJcQEkwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkwNjE1NTgyM1oYDzIxMjYwODEzMTU1ODIzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrkuo1MwUTAdBgNVHQ4EFgQUW41obMczsiP/amwMRntTfO2u2g0wHwYDVR0jBBgwFoAUW41obMczsiP/amwMRntTfO2u2g0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiBFGRlU//+3JyhVqXNcpWw7QR9N9pEoiRVpgFc0Dxg+uwIhAIO8kzgeVzlTSTS7/2jE2EuVXtAxL3Mcbd62YjrqNtaG";
+        const SYNTHETIC_LOCALHOST_KEY_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg1eONjcC4FaH2HqTDcwYCUym2nm332NQ/GN4WxJafrU+hRANCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrku";
+
+        /// Serves one JSON body per request path over local TLS, recording
+        /// every received request path.
+        pub(crate) async fn spawn_local_tls_server(
+            requests: std::sync::Arc<TestMutex<Vec<String>>>,
+            respond: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+        ) -> SocketAddr {
+            let certificate = base64::engine::general_purpose::STANDARD
+                .decode(SYNTHETIC_LOCALHOST_CERT_B64)
+                .unwrap();
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(SYNTHETIC_LOCALHOST_KEY_B64)
+                .unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(certificate)],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        continue;
+                    };
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                request.extend_from_slice(&chunk[..read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&request)
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    requests.lock().unwrap().push(path.clone());
+                    let (status, reason, body) = match respond(&path) {
+                        (200, body) => (200, "OK", body),
+                        (404, body) => (404, "Not Found", body),
+                        (423, body) => (423, "Locked", body),
+                        _ => (404, "Not Found", "{}".to_string()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            address
+        }
+
+        /// Plain-HTTP JSON stub for `ApiClient` GET routes; unmatched paths
+        /// 404.
+        pub(crate) async fn spawn_json_api_stub(
+            respond: impl Fn(&str) -> Option<serde_json::Value> + Send + Sync + 'static,
+        ) -> SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                request.extend_from_slice(&chunk[..read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&request)
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    let (status, body) = match respond(&path) {
+                        Some(value) => ("200 OK", value.to_string()),
+                        None => ("404 Not Found", "{}".to_string()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            address
+        }
+
+        pub(crate) fn tls_env_lock() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        }
+
+        pub(crate) fn deployment_entry_json(id: &str, status: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "status": status,
+                "image_digest": null,
+                "created_at": "2026-09-09T00:00:00Z",
+                "completed_at": null,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn template_config_delivery_stops_promptly_on_terminal_diagnostic() {
+        use terminal_delivery_support::*;
+
+        // Real control flow of the 121-attempt config-delivery retry loop:
+        // the write stays locked (423) and the TEE this state is attested to
+        // reports a terminal diagnostic, so delivery must stop with the
+        // stable code instead of retrying for minutes.
+        let requests = std::sync::Arc::new(TestMutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(requests.clone(), |path| {
+            if path.ends_with("/status") {
+                (
+                    200,
+                    serde_json::json!({
+                        "unlock_state": "locked",
+                        "bootstrap_error": {
+                            "error": "acme_certificate_issuance_failed",
+                            "terminal": true,
+                            "retry_after": null,
+                            "detail": SYNTHETIC_SECRET_MARKER,
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (423, "{}".to_string())
+            }
+        })
+        .await;
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/deployments") {
+                Some(deployment_entry_json("expected-1", "watching"))
+                    .map(|entry| serde_json::json!([entry]))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+
+        let tee_url = format!(
+            "https://localhost:{}/.well-known/confidential/config",
+            tee_address.port()
+        );
+        let mut tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
+        };
+        let mut config_token = "token".to_string();
+        let mut tee_url = tee_url;
+        let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
+        let mut state = TemplateConfigDeliveryState {
+            api: &api,
+            tee: &mut tee,
+            instance_name: "shell",
+            deployment_id: "expected-1",
+            config_token: &mut config_token,
+            tee_url: &mut tee_url,
+            tee_resolve_ip: &mut tee_resolve_ip,
+            terminal_probe_at: None,
+        };
+        let started = Instant::now();
+        let error = state.set_key("SKEY", "value").await.unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "terminal bootstrap failure for app shell: acme_certificate_issuance_failed"
+            ),
+            "unexpected error: {message}"
+        );
+        assert!(!message.contains(SYNTHETIC_SECRET_MARKER));
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/status")),
+            "the terminal diagnostic must come from a bounded status read"
+        );
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+        }
+    }
+
+    #[tokio::test]
+    async fn template_config_delivery_probe_skips_replacement() {
+        use terminal_delivery_support::*;
+
+        // While a newer deployment is current, the delivery probe must not
+        // contact the previous TEE at all, even though it would report a
+        // terminal diagnostic.
+        let tee_requests = std::sync::Arc::new(TestMutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), |_path| {
+            (
+                200,
+                serde_json::json!({
+                    "unlock_state": "locked",
+                    "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
+                })
+                .to_string(),
+            )
+        })
+        .await;
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/deployments") {
+                Some(serde_json::json!([
+                    deployment_entry_json("replacement-7", "applying"),
+                    deployment_entry_json("expected-1", "watching"),
+                ]))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+
+        let tee_url = format!(
+            "https://localhost:{}/.well-known/confidential/config",
+            tee_address.port()
+        );
+        let mut tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
+        };
+        let mut config_token = "token".to_string();
+        let mut tee_url = tee_url;
+        let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
+        let mut state = TemplateConfigDeliveryState {
+            api: &api,
+            tee: &mut tee,
+            instance_name: "shell",
+            deployment_id: "expected-1",
+            config_token: &mut config_token,
+            tee_url: &mut tee_url,
+            tee_resolve_ip: &mut tee_resolve_ip,
+            terminal_probe_at: None,
+        };
+        assert!(
+            state.terminal_bootstrap_stop().await.is_none(),
+            "a probe for a superseded deployment must never authorize a stop"
+        );
+        assert!(
+            tee_requests.lock().unwrap().is_empty(),
+            "the replaced TEE must not be contacted before the binding check"
+        );
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
         }
     }
 }

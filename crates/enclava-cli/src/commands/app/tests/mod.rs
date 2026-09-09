@@ -557,15 +557,19 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
         .find("attest_receipt_key")
         .expect("runtime wait must attest the direct TEE status endpoint");
     let status = body
-        .find("status_json")
-        .expect("runtime wait must read direct TEE status");
+        .find("bounded_status_json")
+        .expect("runtime wait must read direct TEE status through the bounded safe path");
+    let classify = body
+        .find("direct_tee_runtime_outcome")
+        .expect("runtime wait must classify terminal diagnostics from the direct status");
     let poll_loop = body.find("loop {").expect("runtime wait must poll");
     assert!(
         poll_loop < endpoint
             && endpoint < tee
             && tee < attest
             && attest < status
-            && body.contains("tee_unlock_state"),
+            && status < classify
+            && body.contains("tee_supplemental_fields_are_consistent"),
         "deploy runtime wait must refresh and attest the direct TEE endpoint while polling"
     );
     assert!(
@@ -1518,8 +1522,10 @@ mod terminal_diagnostics {
     const SYNTHETIC_LOCALHOST_CERT_B64: &str = "MIIBfzCCASWgAwIBAgIUDvNchz/4kjYNIUZPbhErYcJcQEkwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkwNjE1NTgyM1oYDzIxMjYwODEzMTU1ODIzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrkuo1MwUTAdBgNVHQ4EFgQUW41obMczsiP/amwMRntTfO2u2g0wHwYDVR0jBBgwFoAUW41obMczsiP/amwMRntTfO2u2g0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiBFGRlU//+3JyhVqXNcpWw7QR9N9pEoiRVpgFc0Dxg+uwIhAIO8kzgeVzlTSTS7/2jE2EuVXtAxL3Mcbd62YjrqNtaG";
     const SYNTHETIC_LOCALHOST_KEY_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg1eONjcC4FaH2HqTDcwYCUym2nm332NQ/GN4WxJafrU+hRANCAASTrTE27CrHezsrQig5SJS3khO5zrEB7SYnpJj05SOwGHPQCBpYHg38VRS9fdnyKI2JdkuAePfnhVJULAcTmrku";
 
-    /// Serves one static JSON body for every request path over local TLS.
+    /// Serves one static JSON body per request path over local TLS, recording
+    /// every received request path.
     async fn spawn_local_tls_server(
+        requests: std::sync::Arc<Mutex<Vec<String>>>,
         respond: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
     ) -> SocketAddr {
         let certificate = base64::engine::general_purpose::STANDARD
@@ -1569,8 +1575,12 @@ mod terminal_diagnostics {
                     .nth(1)
                     .unwrap_or("/")
                     .to_string();
+                requests.lock().unwrap().push(path.clone());
                 let (status, reason, body) = match respond(&path) {
                     (200, body) => (200, "OK", body),
+                    (404, body) => (404, "Not Found", body),
+                    (423, body) => (423, "Locked", body),
+                    (500, body) => (500, "Internal Server Error", body),
                     _ => (404, "Not Found", "{}".to_string()),
                 };
                 let response = format!(
@@ -1623,6 +1633,61 @@ mod terminal_diagnostics {
             }
         });
         address
+    }
+
+    /// Plain-HTTP JSON stub for `ApiClient` GET routes; unmatched paths 404.
+    async fn spawn_json_api_stub(
+        respond: impl Fn(&str) -> Option<serde_json::Value> + Send + Sync + 'static,
+    ) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let path = String::from_utf8_lossy(&request)
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let (status, body) = match respond(&path) {
+                    Some(value) => ("200 OK", value.to_string()),
+                    None => ("404 Not Found", "{}".to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        address
+    }
+
+    fn deployment_entry_json(id: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "status": status,
+            "image_digest": null,
+            "created_at": "2026-09-09T00:00:00Z",
+            "completed_at": null,
+        })
     }
 
     /// Serializes staging-env mutation among these tests. The guard is only
@@ -1722,10 +1787,14 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
-    async fn unlock_wait_ends_promptly_on_verified_terminal_failure() {
-        // Storage stays mid-unlock, so without the terminal diagnostic this
-        // loop would spin toward its 300-second deadline.
-        let address = spawn_local_tls_server(|path| {
+    async fn unlock_wait_ends_promptly_on_terminal_diagnostic_from_attested_channel() {
+        // The loop's client parameter is the SPKI-pinned channel returned by
+        // attest_receipt_key() in production; this test drives that loop's
+        // control flow with a stand-in channel. Storage stays mid-unlock, so
+        // without the terminal diagnostic the loop would spin toward its
+        // 300-second deadline.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_server(requests, |path| {
             let body = if path.ends_with("/status") {
                 serde_json::json!({
                     "unlock_state": "unlocking",
@@ -1780,15 +1849,16 @@ mod terminal_diagnostics {
                 "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
             }),
         ] {
-            let address = spawn_local_tls_server(move |path| {
-                let body = if path.ends_with("/status") {
-                    body.to_string()
-                } else {
-                    "{}".to_string()
-                };
-                (200, body)
-            })
-            .await;
+            let address =
+                spawn_local_tls_server(std::sync::Arc::new(Mutex::new(Vec::new())), move |path| {
+                    let body = if path.ends_with("/status") {
+                        body.to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+                    (200, body)
+                })
+                .await;
             let tee = {
                 let _guard = tls_env_lock();
                 unsafe {
@@ -1814,15 +1884,16 @@ mod terminal_diagnostics {
             "padding": "x".repeat(80 * 1024),
         })
         .to_string();
-        let address = spawn_local_tls_server(move |path| {
-            let body = if path.ends_with("/status") {
-                oversized.clone()
-            } else {
-                "{}".to_string()
-            };
-            (200, body)
-        })
-        .await;
+        let address =
+            spawn_local_tls_server(std::sync::Arc::new(Mutex::new(Vec::new())), move |path| {
+                let body = if path.ends_with("/status") {
+                    oversized.clone()
+                } else {
+                    "{}".to_string()
+                };
+                (200, body)
+            })
+            .await;
         let client = {
             let _guard = tls_env_lock();
             unsafe {
@@ -1849,7 +1920,8 @@ mod terminal_diagnostics {
         // /status, but never answers /attestation: without a verified
         // attestation (SPKI-pinned client from attest_receipt_key), the
         // diagnostic probe must yield None and never stop a wait.
-        let tee_address = spawn_local_tls_server(|path| {
+        let tee_requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests, |path| {
             let body = if path.starts_with("/.well-known/confidential/attestation") {
                 "{}".to_string()
             } else {
@@ -1871,6 +1943,315 @@ mod terminal_diagnostics {
                 .await
                 .is_none(),
             "an unattested /status response must never authorize a terminal decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_status_rejects_error_responses_without_reading_bodies() {
+        // A non-success /status must be rejected by status code alone: the
+        // response body (arbitrary size, arbitrary content) is never read.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_server(requests, move |path| {
+            let body = if path.ends_with("/status") {
+                format!(
+                    "{{\"leak\": \"{SYNTHETIC_SECRET_MARKER}\", \"padding\": \"{}\"}}",
+                    "y".repeat(128 * 1024)
+                )
+            } else {
+                "{}".to_string()
+            };
+            (500, body)
+        })
+        .await;
+        let client = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            local_tee_client(address)
+        };
+        let error = client.bounded_status_json().await.unwrap_err();
+        {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+            }
+        }
+        let message = error.to_string();
+        assert!(message.contains("500"), "unexpected error: {message}");
+        assert!(!message.contains(SYNTHETIC_SECRET_MARKER));
+    }
+
+    #[test]
+    fn direct_runtime_outcome_prefers_terminal_over_ready_states() {
+        // A locked or unlocked TEE carrying a recognized terminal diagnostic
+        // must classify as Terminal, never as a direct-fallback success.
+        for unlock_state in ["locked", "unlocked", "unlocking"] {
+            let status = serde_json::json!({
+                "unlock_state": unlock_state,
+                "bootstrap_error": { "error": "acme_certificate_issuance_failed", "terminal": true, "retry_after": null }
+            });
+            assert_eq!(
+                direct_tee_runtime_outcome(&status),
+                DirectTeeRuntimeOutcome::Terminal(
+                    enclava_cli::tee_client::parse_terminal_bootstrap_error(&status).unwrap()
+                ),
+                "{unlock_state} must not mask a terminal diagnostic"
+            );
+        }
+        assert_eq!(
+            direct_tee_runtime_outcome(&serde_json::json!({ "unlock_state": "locked" })),
+            DirectTeeRuntimeOutcome::Locked
+        );
+        assert_eq!(
+            direct_tee_runtime_outcome(&serde_json::json!({ "unlock_state": "unlocked" })),
+            DirectTeeRuntimeOutcome::Unlocked
+        );
+        assert_eq!(
+            direct_tee_runtime_outcome(&serde_json::json!({ "unlock_state": "unlocking" })),
+            DirectTeeRuntimeOutcome::Waiting
+        );
+        // Unknown diagnostics never classify as terminal.
+        assert_eq!(
+            direct_tee_runtime_outcome(&serde_json::json!({
+                "unlock_state": "locked",
+                "bootstrap_error": { "error": "acme_dns_failed", "terminal": true, "retry_after": null }
+            })),
+            DirectTeeRuntimeOutcome::Locked
+        );
+    }
+
+    #[tokio::test]
+    async fn set_deploy_config_stops_promptly_on_terminal_diagnostic() {
+        // The client stands in for the attested channel deploy() passes in.
+        // The write stays locked (423) and /status carries a terminal
+        // diagnostic: the retry loop must stop with the stable code instead
+        // of spinning to its 60-second deadline.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_server(requests.clone(), |path| {
+            if path.ends_with("/status") {
+                (
+                    200,
+                    serde_json::json!({
+                        "unlock_state": "locked",
+                        "bootstrap_error": { "error": "enclava_init_failed", "terminal": true, "retry_after": null }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (423, "{}".to_string())
+            }
+        })
+        .await;
+        let tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            local_tee_client(address)
+        };
+        let started = std::time::Instant::now();
+        let error = set_deploy_config(&tee, "demo", "K", "V", "token")
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let message = error.to_string();
+        assert!(
+            message.contains("terminal bootstrap failure for app demo: enclava_init_failed"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/status")),
+            "the terminal diagnostic must come from a status read"
+        );
+        {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn set_deploy_config_succeeds_without_diagnostic_probe() {
+        // A successful write must not trigger any status probe.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_server(requests.clone(), |path| {
+            let (status, body) = if path.ends_with("/status") {
+                (
+                    200,
+                    serde_json::json!({ "unlock_state": "locked" }).to_string(),
+                )
+            } else {
+                (200, "{}".to_string())
+            };
+            (status, body)
+        })
+        .await;
+        let tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            local_tee_client(address)
+        };
+        set_deploy_config(&tee, "demo", "K", "V", "token")
+            .await
+            .expect("successful config write must not consult diagnostics");
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/status")),
+            "no /status probe may accompany a successful write"
+        );
+        {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_bound_probe_requires_current_deployment_before_tee_contact() {
+        // A previous deployment's TEE (which would happily attest and report a
+        // terminal diagnostic) must never be contacted while a newer
+        // deployment is the app's current one: the binding check happens
+        // before any TEE traffic.
+        let tee_requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), |_path| {
+            let body = serde_json::json!({
+                "unlock_state": "locked",
+                "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
+            })
+            .to_string();
+            (200, body)
+        })
+        .await;
+        let api_address = spawn_json_api_stub(move |path| {
+            if path.ends_with("/deployments") {
+                Some(serde_json::json!([
+                    deployment_entry_json("replacement-7", "applying"),
+                    deployment_entry_json("expected-1", "failed"),
+                ]))
+            } else {
+                Some(serde_json::json!({
+                    "tee_url": format!("https://localhost:{}", tee_address.port()),
+                    "tee_resolve_ip": "127.0.0.1",
+                    "unlock_endpoint": "https://ignored",
+                    "claim_endpoint": "https://ignored",
+                }))
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+
+        assert!(
+            deployment_bound_terminal_bootstrap_error(&api, "demo", "expected-1")
+                .await
+                .is_none(),
+            "a probe for a superseded deployment must never authorize a stop"
+        );
+        assert!(
+            tee_requests.lock().unwrap().is_empty(),
+            "the replaced TEE must not be contacted before the binding check"
+        );
+
+        // Binding positives and negatives.
+        assert!(deployment_is_current(&api, "demo", "replacement-7").await);
+        assert!(!deployment_is_current(&api, "demo", "expected-1").await);
+        assert!(!deployment_is_current(&api, "demo", "pending").await);
+        assert!(!deployment_is_current(&api, "demo", "").await);
+    }
+
+    #[tokio::test]
+    async fn health_wait_keeps_existing_deadline_when_probe_cannot_authenticate() {
+        // Real caller control flow: the health wait consults the
+        // deployment-bound probe, but without a verified attestation the
+        // probe authorizes nothing and the wait keeps its own deadline
+        // semantics (here: the timeout error).
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "expected-1",
+                    "watching"
+                )]))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let error = wait_for_deployment_completion(
+            &api,
+            "demo",
+            "expected-1",
+            std::time::Duration::from_millis(120),
+            std::time::Duration::from_millis(20),
+            &ProgressBar::hidden(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("did not become healthy"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn terminal_diagnostic_wiring_covers_every_post_claim_wait() {
+        // Fail-if-bypassed wiring check (behavior is covered by the live
+        // tests above): the runtime direct fallback classifies before
+        // returning Ok, config retries probe, and the health wait uses the
+        // deployment-bound probe.
+        let source = include_str!("../../app.rs").replace("\r\n", "\n");
+
+        let runtime_start = source.find("async fn wait_for_deploy_runtime").unwrap();
+        let runtime_end = source[runtime_start..]
+            .find("async fn find_deployment_entry")
+            .unwrap()
+            + runtime_start;
+        let runtime = &source[runtime_start..runtime_end];
+        let classify = runtime.find("direct_tee_runtime_outcome").unwrap();
+        let ready = runtime[classify..]
+            .find("return Ok(())")
+            .map(|offset| offset + classify)
+            .unwrap();
+        assert!(
+            classify < ready,
+            "the direct TEE fallback must classify terminal diagnostics before reporting readiness"
+        );
+        assert!(runtime.contains("bounded_status_json"));
+
+        let config_start = source.find("async fn set_deploy_config").unwrap();
+        let config_end = source[config_start..]
+            .find("fn should_retry_deploy_config")
+            .unwrap()
+            + config_start;
+        let config = &source[config_start..config_end];
+        assert!(
+            config.contains("bounded_status_json")
+                && config.contains("parse_terminal_bootstrap_error"),
+            "config write retries must stop on a terminal diagnostic from the attested channel"
+        );
+
+        let health_start = source
+            .find("async fn wait_for_deployment_completion")
+            .unwrap();
+        let health_end = source[health_start..]
+            .find("async fn ensure_password_storage_unlocked_for_config")
+            .unwrap()
+            + health_start;
+        let health = &source[health_start..health_end];
+        assert!(
+            health.contains("deployment_bound_terminal_bootstrap_error"),
+            "the health wait must use the deployment-bound terminal probe"
         );
     }
 }

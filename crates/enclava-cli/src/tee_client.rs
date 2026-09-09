@@ -452,9 +452,25 @@ impl TeeClient {
         Ok(bootstrap_status_from_json(&body))
     }
 
-    async fn bounded_status_json(&self) -> Result<serde_json::Value, TeeError> {
+    /// The one safe `/status` read shared by every bootstrap-diagnostics
+    /// caller. Successful bodies are capped at
+    /// `MAX_BOOTSTRAP_STATUS_BODY_BYTES` (checked against `content-length`
+    /// and again while chunking), and non-success responses are rejected by
+    /// status code alone without reading the body, so neither a success body
+    /// nor an error body can stream unbounded data or leak raw provider
+    /// detail. Transport failures surface as `Err`, which callers treat as
+    /// "no trusted diagnostic" so existing retry deadlines govern.
+    pub async fn bounded_status_json(&self) -> Result<serde_json::Value, TeeError> {
         let resp = self.http.get(self.url("/status")).send().await?;
-        let resp = self.check_response(resp).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Deliberately no body read on the safe status path: the fixed
+            // message never carries arbitrary response content.
+            return Err(TeeError::Tee {
+                status: status.as_u16(),
+                message: "TEE status request failed".to_string(),
+            });
+        }
         if resp
             .content_length()
             .is_some_and(|length| length as usize > MAX_BOOTSTRAP_STATUS_BODY_BYTES)

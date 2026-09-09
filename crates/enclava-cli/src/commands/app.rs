@@ -585,7 +585,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         let (_attestation, tee) = tee.attest_receipt_key().await?;
 
         for (index, (key, value)) in config_pairs.iter().enumerate() {
-            set_deploy_config(&tee, key, value, &token_resp.token).await?;
+            set_deploy_config(&tee, &app_name, key, value, &token_resp.token).await?;
             api.sync_config_key(&app_name, key, false).await?;
             pb.set_message(counted_progress(
                 "Customer config",
@@ -628,17 +628,26 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
 async fn set_deploy_config(
     tee: &TeeClient,
+    app_name: &str,
     key: &str,
     value: &str,
     token: &str,
-) -> Result<(), TeeError> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match tee.config_set(key, value, token).await {
             Err(error) if should_retry_deploy_config(&error) && Instant::now() < deadline => {
+                // The attested channel that just refused the write also
+                // carries any terminal bootstrap diagnostic: stop promptly
+                // instead of retrying into the deadline.
+                if let Ok(status) = tee.bounded_status_json().await
+                    && let Some(diagnostic) = parse_terminal_bootstrap_error(&status)
+                {
+                    return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            result => return result,
+            result => return result.map_err(|error| error.into()),
         }
     }
 }
@@ -699,6 +708,86 @@ pub(crate) async fn attested_terminal_bootstrap_error(
         .await
         .ok()?
         .terminal_bootstrap_error
+}
+
+/// Authoritative CAP deployment binding: the expected deployment must still
+/// be the app's latest deployment record. A replacement rollout creates a
+/// newer record, which unbinds terminal-diagnostic probes for the older
+/// wait. Unknown/`pending` ids never bind.
+pub(crate) async fn deployment_is_current(
+    api: &ApiClient,
+    app_name: &str,
+    expected_deployment_id: &str,
+) -> bool {
+    if expected_deployment_id.is_empty() || expected_deployment_id == "pending" {
+        return false;
+    }
+    match api.list_deployments(app_name).await {
+        Ok(deployments) => deployments
+            .into_iter()
+            .next()
+            .is_some_and(|deployment| deployment.id == expected_deployment_id),
+        Err(_) => false,
+    }
+}
+
+/// Deployment-bound terminal-diagnostic probe for post-claim waits: CAP must
+/// corroborate the expected deployment as the app's current one BEFORE and
+/// AFTER the attested TEE read, so a previous deployment's TEE -- whose valid
+/// SPKI attestation says nothing about deployment identity -- can never
+/// abort the wait for a newer deployment. Uses existing CAP and attestation
+/// surfaces only; no new protocol.
+pub(crate) async fn deployment_bound_terminal_bootstrap_error(
+    api: &ApiClient,
+    app_name: &str,
+    expected_deployment_id: &str,
+) -> Option<TerminalBootstrapError> {
+    if !deployment_is_current(api, app_name, expected_deployment_id).await {
+        return None;
+    }
+    let diagnostic = attested_terminal_bootstrap_error(api, app_name).await?;
+    if !deployment_is_current(api, app_name, expected_deployment_id).await {
+        return None;
+    }
+    Some(diagnostic)
+}
+
+/// Re-read CAP status and confirm the observation is still fresh and bound
+/// to the expected deployment (the "after" half of probe binding).
+async fn observation_still_fresh_for_deployment(
+    api: &ApiClient,
+    app_name: &str,
+    expected_deployment_id: &str,
+) -> bool {
+    match api.get_status(app_name).await {
+        Ok(status) => {
+            observation_is_fresh_for_deployment(status.observation.as_ref(), expected_deployment_id)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Classification of one attested direct-TEE `/status` body in the runtime
+/// wait. A recognized terminal diagnostic outranks the direct-fallback
+/// success states: a TEE whose storage is locked or unlocked but whose
+/// bootstrap failed terminally is never reported as ready.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirectTeeRuntimeOutcome {
+    Terminal(TerminalBootstrapError),
+    Locked,
+    Unlocked,
+    Waiting,
+}
+
+pub(crate) fn direct_tee_runtime_outcome(status: &serde_json::Value) -> DirectTeeRuntimeOutcome {
+    if let Some(diagnostic) = parse_terminal_bootstrap_error(status) {
+        return DirectTeeRuntimeOutcome::Terminal(diagnostic);
+    }
+    match tee_unlock_state(status) {
+        "locked" => DirectTeeRuntimeOutcome::Locked,
+        "unlocked" => DirectTeeRuntimeOutcome::Unlocked,
+        _ => DirectTeeRuntimeOutcome::Waiting,
+    }
 }
 
 /// Decision from one safe [`TeeBootstrapStatus`] read in the bootstrap
@@ -900,12 +989,14 @@ async fn wait_for_deploy_runtime(
         };
 
         // A terminal bootstrap diagnostic from the attested app TEE stops the
-        // wait, but only while CAP corroborates the current deployment, so a
-        // stale diagnostic from a replaced TEE cannot abort a replacement
-        // rollout. No automatic certificate or bootstrap retry happens here.
+        // wait, but only while CAP corroborates the current deployment both
+        // before and after the probe, so a stale diagnostic from a replaced
+        // TEE cannot abort a replacement rollout. No automatic certificate
+        // or bootstrap retry happens here.
         if observation_is_fresh
             && tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
             && let Some(diagnostic) = attested_terminal_bootstrap_error(api, app_name).await
+            && observation_still_fresh_for_deployment(api, app_name, expected_deployment_id).await
         {
             pb.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
@@ -918,28 +1009,35 @@ async fn wait_for_deploy_runtime(
                 endpoint.tee_resolve_ip,
             )
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
-            && let Ok(status) = attested_tee.status_json().await
+            && let Ok(status) = attested_tee.bounded_status_json().await
         {
+            // A terminal diagnostic in this attested status body outranks both
+            // direct-fallback success states.
+            let outcome = direct_tee_runtime_outcome(&status);
+            if let DirectTeeRuntimeOutcome::Terminal(diagnostic) = &outcome {
+                pb.abandon_with_message("TEE bootstrap failed");
+                return Err(terminal_bootstrap_failure_message(app_name, diagnostic).into());
+            }
             if tee_supplemental_fields_are_consistent(&status) {
-                match tee_unlock_state(&status) {
-                    "locked" => {
+                match outcome {
+                    DirectTeeRuntimeOutcome::Locked => {
                         pb.set_position(3);
                         pb.set_message("TEE running, storage locked");
                         return Ok(());
                     }
-                    "unlocked" if target.accepts_direct_unlocked() => {
+                    DirectTeeRuntimeOutcome::Unlocked if target.accepts_direct_unlocked() => {
                         pb.set_position(3);
                         pb.set_message("TEE running, attestation complete");
                         return Ok(());
                     }
-                    "unlocked" => {
+                    DirectTeeRuntimeOutcome::Unlocked => {
                         pb.set_message(timed_progress(
                             "TEE boot: waiting for replacement storage lock",
                             start.elapsed(),
                             max_wait,
                         ));
                     }
-                    _ => {}
+                    DirectTeeRuntimeOutcome::Waiting | DirectTeeRuntimeOutcome::Terminal(_) => {}
                 }
             } else {
                 pb.set_message(timed_progress(
@@ -1057,6 +1155,7 @@ async fn wait_for_deployment_completion(
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
+    let mut terminal_probe_at: Option<Instant> = None;
     loop {
         if start.elapsed() > max_wait {
             pb.abandon_with_message("Workload health timed out");
@@ -1065,6 +1164,17 @@ async fn wait_for_deployment_completion(
                 format_duration(max_wait)
             )
             .into());
+        }
+
+        // Post-claim health wait: a terminal bootstrap diagnostic, bound to
+        // this deployment via CAP before and after the attested probe, stops
+        // the wait instead of polling to the deadline.
+        if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
+            && let Some(diagnostic) =
+                deployment_bound_terminal_bootstrap_error(api, app_name, deployment_id).await
+        {
+            pb.abandon_with_message("TEE bootstrap failed");
+            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
         }
 
         match find_deployment_entry(api, app_name, deployment_id).await {
@@ -1173,11 +1283,11 @@ async fn wait_for_deploy_unlock_completion(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        let status = tee.status_json().await?;
+        let status = tee.bounded_status_json().await?;
         // An already-satisfied unlock wins over a stale terminal diagnostic;
-        // otherwise a recognized terminal diagnostic (parsed from this same
-        // bounded-body status read over the attested channel) stops the wait
-        // with the stable code instead of spinning to the deadline.
+        // otherwise a recognized terminal diagnostic parsed from this same
+        // bounded status read over the attested channel stops the wait with
+        // the stable code instead of spinning to the deadline.
         if tee_unlock_state(&status) != "unlocked"
             && let Some(diagnostic) = parse_terminal_bootstrap_error(&status)
         {
