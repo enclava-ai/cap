@@ -24,16 +24,18 @@ use enclava_cli::{
     },
     config::{self, CliPaths},
     keys,
-    tee_client::{TeeClient, TeeError, parse_terminal_bootstrap_error},
+    tee_client::{TeeClient, TeeError},
 };
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     BootstrapEndpointStatusDecision, SignedDeployBlobParams, StoragePasswordInput,
     bootstrap_endpoint_status_decision, build_signed_deploy_blobs, claim_initial_ownership,
-    deployment_bound_terminal_bootstrap_error, deployment_is_current, ensure_manual_deploy_keyring,
+    deployment_bound_terminal_bootstrap_error,
+    deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, generate_log_key_for_app, tee_terminal_diagnostic_probe_due,
-    terminal_bootstrap_failure_message,
+    terminal_bootstrap_failure_message, terminal_diagnostic_budget,
+    terminal_diagnostic_probe_with_budget,
 };
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
 use crate::commands::{counted_progress, format_duration, timed_progress};
@@ -489,6 +491,7 @@ async fn deploy_with_timings(
                         &ctx.paths,
                         &ctx.cli_config,
                         &instance_name,
+                        &deployment_id,
                         &storage_password,
                         capture,
                     ),
@@ -1236,14 +1239,18 @@ async fn wait_for_template_bootstrap_endpoint(
                     Ok(_) => {
                         // A terminal diagnostic read over this attested,
                         // SPKI-pinned channel outranks a reachable challenge
-                        // endpoint: stop before attempting any claim.
-                        if let Ok(status) = timings
-                            .run(
-                                DeployPhase::BootstrapStateFallback,
-                                attested_tee.bootstrap_status(),
+                        // endpoint: stop before attempting any claim, but only
+                        // when CAP's evidence connects this endpoint to the
+                        // expected deployment.
+                        if let Some(diagnostic) =
+                            deployment_bound_terminal_bootstrap_error_on_channel(
+                                api,
+                                app_name,
+                                deployment_id,
+                                &attested_tee,
+                                start + max_wait,
                             )
                             .await
-                            && let Some(diagnostic) = status.terminal_bootstrap_error
                         {
                             pb.abandon_with_message("TEE bootstrap failed");
                             return Err(
@@ -1265,13 +1272,31 @@ async fn wait_for_template_bootstrap_endpoint(
                             .await
                         {
                             Ok(status) => match bootstrap_endpoint_status_decision(&status) {
-                                BootstrapEndpointStatusDecision::Terminal(diagnostic) => {
-                                    pb.abandon_with_message("TEE bootstrap failed");
-                                    return Err(terminal_bootstrap_failure_message(
-                                        app_name,
-                                        &diagnostic,
-                                    )
-                                    .into());
+                                BootstrapEndpointStatusDecision::Terminal => {
+                                    if let Some(diagnostic) =
+                                        deployment_bound_terminal_bootstrap_error_on_channel(
+                                            api,
+                                            app_name,
+                                            deployment_id,
+                                            &attested_tee,
+                                            start + max_wait,
+                                        )
+                                        .await
+                                    {
+                                        pb.abandon_with_message("TEE bootstrap failed");
+                                        return Err(terminal_bootstrap_failure_message(
+                                            app_name,
+                                            &diagnostic,
+                                        )
+                                        .into());
+                                    }
+                                    // Binding unproven: never authorize the
+                                    // stop; the wait deadline governs.
+                                    pb.set_message(timed_progress(
+                                        "TEE ownership: waiting for claim endpoint",
+                                        start.elapsed(),
+                                        max_wait,
+                                    ));
                                 }
                                 BootstrapEndpointStatusDecision::AlreadyClaimed => {
                                     pb.set_message("Ownership already claimed");
@@ -1386,16 +1411,14 @@ impl TemplateConfigDeliveryState<'_> {
         if !tee_terminal_diagnostic_probe_due(&mut self.terminal_probe_at) {
             return None;
         }
-        if !deployment_is_current(self.api, self.instance_name, self.deployment_id).await {
-            return None;
-        }
-        let Ok(status) = self.tee.bounded_status_json().await else {
-            return None;
-        };
-        let diagnostic = parse_terminal_bootstrap_error(&status)?;
-        if !deployment_is_current(self.api, self.instance_name, self.deployment_id).await {
-            return None;
-        }
+        let diagnostic = terminal_diagnostic_probe_with_budget(
+            self.api,
+            self.instance_name,
+            self.deployment_id,
+            Some(self.tee),
+            terminal_diagnostic_budget(None),
+        )
+        .await?;
         Some(terminal_bootstrap_failure_message(
             self.instance_name,
             &diagnostic,
@@ -1536,8 +1559,13 @@ async fn wait_for_paas_managed_config_keys(
         // only a verified attested read can authorize the stop, and no
         // automatic retry happens here.
         if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
-            && let Some(diagnostic) =
-                deployment_bound_terminal_bootstrap_error(api, instance_name, deployment_id).await
+            && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
+                api,
+                instance_name,
+                deployment_id,
+                deadline,
+            )
+            .await
         {
             progress.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(instance_name, &diagnostic).into());
@@ -2212,8 +2240,13 @@ async fn wait_for_paas_ssh_command(
         // `pending`/unknown deployment id never binds, so the probe is
         // skipped rather than guessing.
         if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
-            && let Some(diagnostic) =
-                deployment_bound_terminal_bootstrap_error(api, app_name, deployment_id).await
+            && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
+                api,
+                app_name,
+                deployment_id,
+                start + timeout,
+            )
+            .await
         {
             progress.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());

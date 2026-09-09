@@ -1680,6 +1680,73 @@ mod terminal_diagnostics {
         address
     }
 
+    /// TLS server writing fully caller-controlled response bytes (no framing
+    /// assumptions), recording request paths. A `None` response accepts the
+    /// TLS handshake, reads the request, and then stalls forever.
+    async fn spawn_local_tls_raw_server(
+        requests: std::sync::Arc<Mutex<Vec<String>>>,
+        respond: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> SocketAddr {
+        let certificate = base64::engine::general_purpose::STANDARD
+            .decode(SYNTHETIC_LOCALHOST_CERT_B64)
+            .unwrap();
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(SYNTHETIC_LOCALHOST_KEY_B64)
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(certificate)],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let path = String::from_utf8_lossy(&request)
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                requests.lock().unwrap().push(path.clone());
+                match respond(&path) {
+                    Some(response) => {
+                        let _ = stream.write_all(&response).await;
+                        let _ = stream.shutdown().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }
+        });
+        address
+    }
+
     fn deployment_entry_json(id: &str, status: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
@@ -1751,7 +1818,7 @@ mod terminal_diagnostics {
         };
         assert!(matches!(
             bootstrap_endpoint_status_decision(&terminal),
-            BootstrapEndpointStatusDecision::Terminal(_)
+            BootstrapEndpointStatusDecision::Terminal
         ));
 
         let claimed = enclava_cli::tee_client::TeeBootstrapStatus {
@@ -1820,7 +1887,19 @@ mod terminal_diagnostics {
             local_tee_client(address)
         };
         let started = std::time::Instant::now();
-        let error = wait_for_deploy_unlock_completion(&tee, "demo")
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "expected-1",
+                    "applying"
+                )]))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let error = wait_for_deploy_unlock_completion(&api, &tee, "demo", "expected-1")
             .await
             .unwrap_err();
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -1866,7 +1945,8 @@ mod terminal_diagnostics {
                 }
                 local_tee_client(address)
             };
-            wait_for_deploy_unlock_completion(&tee, "demo")
+            let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
+            wait_for_deploy_unlock_completion(&api, &tee, "demo", "expected-1")
                 .await
                 .expect("satisfied unlock must permit normal progress");
             let _guard = tls_env_lock();
@@ -2051,7 +2131,19 @@ mod terminal_diagnostics {
             local_tee_client(address)
         };
         let started = std::time::Instant::now();
-        let error = set_deploy_config(&tee, "demo", "K", "V", "token")
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "expected-1",
+                    "applying"
+                )]))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let error = set_deploy_config(&api, &tee, "demo", "expected-1", "K", "V", "token")
             .await
             .unwrap_err();
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -2099,7 +2191,8 @@ mod terminal_diagnostics {
             }
             local_tee_client(address)
         };
-        set_deploy_config(&tee, "demo", "K", "V", "token")
+        let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
+        set_deploy_config(&api, &tee, "demo", "expected-1", "K", "V", "token")
             .await
             .expect("successful config write must not consult diagnostics");
         assert!(
@@ -2119,30 +2212,50 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
-    async fn deployment_bound_probe_requires_current_deployment_before_tee_contact() {
-        // A previous deployment's TEE (which would happily attest and report a
-        // terminal diagnostic) must never be contacted while a newer
-        // deployment is the app's current one: the binding check happens
-        // before any TEE traffic.
+    async fn replacement_endpoint_cannot_abort_new_deployment() {
+        // Reviewer scenario: deployment history is [new, old] while the
+        // app-bound endpoint still serves the old TEE, which reports a
+        // terminal diagnostic. Waiting for `new` must not be aborted: the
+        // latest-history entry is not endpoint identity, and the live
+        // observation (here: fresh, but bound to the old deployment) fails
+        // the strict binding, so the old TEE is never even contacted.
         let tee_requests = std::sync::Arc::new(Mutex::new(Vec::new()));
         let tee_address = spawn_local_tls_server(tee_requests.clone(), |_path| {
-            let body = serde_json::json!({
-                "unlock_state": "locked",
-                "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
-            })
-            .to_string();
-            (200, body)
+            (
+                200,
+                serde_json::json!({
+                    "unlock_state": "locked",
+                    "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
+                })
+                .to_string(),
+            )
         })
         .await;
+        let tee_port = tee_address.port();
         let api_address = spawn_json_api_stub(move |path| {
-            if path.ends_with("/deployments") {
+            if path.ends_with("/status") {
+                Some(serde_json::json!({
+                    "app_name": "demo",
+                    "status": "running",
+                    "pod_phase": "Running",
+                    "tee_status": "ready",
+                    "unlock_status": "locked",
+                    "domain": "demo.org.enclava.dev",
+                    "last_deployed": "2026-09-09T00:00:00Z",
+                    "observation": {
+                        "state": "fresh",
+                        "observed_at": "2026-09-09T00:00:00Z",
+                        "deployment_id": "old-1",
+                    },
+                }))
+            } else if path.ends_with("/deployments") {
                 Some(serde_json::json!([
-                    deployment_entry_json("replacement-7", "applying"),
-                    deployment_entry_json("expected-1", "failed"),
+                    deployment_entry_json("new-1", "applying"),
+                    deployment_entry_json("old-1", "failed"),
                 ]))
             } else {
                 Some(serde_json::json!({
-                    "tee_url": format!("https://localhost:{}", tee_address.port()),
+                    "tee_url": format!("https://localhost:{tee_port}"),
                     "tee_resolve_ip": "127.0.0.1",
                     "unlock_endpoint": "https://ignored",
                     "claim_endpoint": "https://ignored",
@@ -2152,22 +2265,265 @@ mod terminal_diagnostics {
         .await;
         let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         assert!(
-            deployment_bound_terminal_bootstrap_error(&api, "demo", "expected-1")
+            deployment_bound_terminal_bootstrap_error(&api, "demo", "new-1", deadline)
                 .await
                 .is_none(),
-            "a probe for a superseded deployment must never authorize a stop"
+            "an old deployment's terminal diagnostic must never abort the new deployment's wait"
         );
         assert!(
             tee_requests.lock().unwrap().is_empty(),
-            "the replaced TEE must not be contacted before the binding check"
+            "the old TEE must not be contacted when binding fails"
         );
 
-        // Binding positives and negatives.
-        assert!(deployment_is_current(&api, "demo", "replacement-7").await);
-        assert!(!deployment_is_current(&api, "demo", "expected-1").await);
-        assert!(!deployment_is_current(&api, "demo", "pending").await);
-        assert!(!deployment_is_current(&api, "demo", "").await);
+        // Unknown or pending ids never bind.
+        for deployment_id in ["pending", ""] {
+            assert!(
+                deployment_bound_terminal_bootstrap_error(&api, "demo", deployment_id, deadline)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(tee_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn binding_accepts_fresh_observation_and_sole_deployment_record() {
+        // Positive bindings: a fresh observation bound to the expected
+        // deployment, or the expected deployment being the app's only record
+        // (first deploy, no predecessor TEE). Both proceed to the attested
+        // read (which fails here without /attestation, yielding no
+        // diagnostic) -- proving the TEE was contacted under a valid binding.
+        let tee_requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), |path| {
+            let body = if path.starts_with("/.well-known/confidential/attestation") {
+                "{}".to_string()
+            } else {
+                serde_json::json!({
+                    "unlock_state": "locked",
+                    "bootstrap_error": { "error": "acme_rate_limited", "terminal": true, "retry_after": null }
+                })
+                .to_string()
+            };
+            (200, body)
+        })
+        .await;
+        let tee_port = tee_address.port();
+
+        // Fresh observation bound to expected-1.
+        let api_address = spawn_json_api_stub(move |path| {
+            if path.ends_with("/status") {
+                Some(serde_json::json!({
+                    "app_name": "demo",
+                    "status": "running",
+                    "pod_phase": "Running",
+                    "tee_status": "ready",
+                    "unlock_status": "locked",
+                    "domain": "demo.org.enclava.dev",
+                    "last_deployed": "2026-09-09T00:00:00Z",
+                    "observation": {
+                        "state": "fresh",
+                        "observed_at": "2026-09-09T00:00:00Z",
+                        "deployment_id": "expected-1",
+                    },
+                }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([
+                    deployment_entry_json("expected-1", "applying"),
+                    deployment_entry_json("old-1", "failed"),
+                ]))
+            } else {
+                Some(serde_json::json!({
+                    "tee_url": format!("https://localhost:{tee_port}"),
+                    "tee_resolve_ip": "127.0.0.1",
+                    "unlock_endpoint": "https://ignored",
+                    "claim_endpoint": "https://ignored",
+                }))
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(
+            deployment_bound_terminal_bootstrap_error(&api, "demo", "expected-1", deadline)
+                .await
+                .is_none(),
+            "no verified attestation means no diagnostic, but the TEE was contacted"
+        );
+        assert!(
+            tee_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.starts_with("/.well-known/confidential/attestation")),
+            "a valid binding must proceed to the attested read"
+        );
+
+        // Sole deployment record binds even without any live observation.
+        let tee_requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tee_address =
+            spawn_local_tls_server(tee_requests.clone(), |_path| (200, "{}".to_string())).await;
+        let tee_port = tee_address.port();
+        let api_address = spawn_json_api_stub(move |path| {
+            if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "expected-1",
+                    "applying"
+                )]))
+            } else {
+                Some(serde_json::json!({
+                    "tee_url": format!("https://localhost:{tee_port}"),
+                    "tee_resolve_ip": "127.0.0.1",
+                    "unlock_endpoint": "https://ignored",
+                    "claim_endpoint": "https://ignored",
+                }))
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        assert!(
+            deployment_bound_terminal_bootstrap_error(&api, "demo", "expected-1", deadline)
+                .await
+                .is_none()
+        );
+        assert!(
+            tee_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.starts_with("/.well-known/confidential/attestation")),
+            "the sole-record binding must proceed to the attested read"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_probe_budget_caps_stalled_cap_lookup() {
+        // A CAP lookup that accepts TCP but never responds must not stall the
+        // enclosing wait: the whole probe is cut at its budget.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                // Accept and stall: read nothing, write nothing.
+                let mut sink = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => std::future::pending::<()>().await,
+                    }
+                }
+            }
+        });
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+
+        let started = std::time::Instant::now();
+        assert!(
+            terminal_diagnostic_probe_with_budget(
+                &api,
+                "demo",
+                "expected-1",
+                None,
+                std::time::Duration::from_millis(250),
+            )
+            .await
+            .is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn terminal_probe_budget_caps_stalled_attested_read() {
+        // Binding passes (sole deployment record), but the attested /status
+        // read stalls: the budget cuts the whole probe.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_local_tls_raw_server(requests, |_path| None).await;
+        let api_address = spawn_json_api_stub(|path| {
+            if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "expected-1",
+                    "applying"
+                )]))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+        let tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            local_tee_client(address)
+        };
+        let started = std::time::Instant::now();
+        assert!(
+            terminal_diagnostic_probe_with_budget(
+                &api,
+                "demo",
+                "expected-1",
+                Some(&tee),
+                std::time::Duration::from_millis(250),
+            )
+            .await
+            .is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+        }
+    }
+
+    #[tokio::test]
+    async fn attestation_reads_are_bounded_before_authentication() {
+        // /attestation responses are read through the bounded safe path for
+        // both success and failure bodies, before SNP verification
+        // authenticates the peer.
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let oversized: Vec<u8> = {
+            let mut body =
+                br#"{"nonce":"a","runtime_data_binding":{},"evidence":{"payload_b64":""}}"#
+                    .to_vec();
+            body.extend_from_slice(&vec![b' '; 300 * 1024]);
+            body
+        };
+        let error_body: Vec<u8> = format!("leak {SYNTHETIC_SECRET_MARKER} ",).into_bytes();
+        let address = spawn_local_tls_raw_server(requests, move |path| {
+            if path.starts_with("/.well-known/confidential/attestation") {
+                // Streaming success body without a declared length: only the
+                // per-chunk cap can reject it.
+                let mut response = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_vec();
+                response.extend_from_slice(&oversized);
+                Some(response)
+            } else {
+                let mut response = b"HTTP/1.1 500 Internal Server Error\r\nconnection: close\r\n\r\n".to_vec();
+                response.extend_from_slice(&error_body);
+                Some(response)
+            }
+        })
+        .await;
+
+        // The SPKI-pinned attestation fetch needs no staging env: the TLS
+        // leaf fetch uses its own verifier and the pinned client pins the
+        // synthetic certificate.
+        let tee = TeeClient::new_with_resolve_ip(
+            &format!("https://localhost:{}", address.port()),
+            Some(address.ip()),
+        );
+        let error = match tee.attest_receipt_key().await {
+            Ok(_) => panic!("oversized attestation body must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("bounded read limit"),
+            "oversized streaming attestation body must be rejected: {error}"
+        );
+        assert!(!error.contains(SYNTHETIC_SECRET_MARKER));
     }
 
     #[tokio::test]
@@ -2236,9 +2592,8 @@ mod terminal_diagnostics {
             + config_start;
         let config = &source[config_start..config_end];
         assert!(
-            config.contains("bounded_status_json")
-                && config.contains("parse_terminal_bootstrap_error"),
-            "config write retries must stop on a terminal diagnostic from the attested channel"
+            config.contains("deployment_bound_terminal_bootstrap_error_on_channel"),
+            "config write retries must stop on a deployment-bound terminal diagnostic from the attested channel"
         );
 
         let health_start = source

@@ -136,6 +136,11 @@ pub const TERMINAL_BOOTSTRAP_ERROR_CODES: [&str; 3] = [
 /// Upper bound on `/status` bodies accepted by the safe bootstrap-status read.
 const MAX_BOOTSTRAP_STATUS_BODY_BYTES: usize = 64 * 1024;
 
+/// Upper bound on `/attestation` response bodies, read before SNP verification
+/// authenticates the peer (SPKI pinning only proves continuity with the
+/// contacted endpoint). Ample for an SNP report plus an embedded DER chain.
+const MAX_ATTESTATION_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+
 /// Matches the attestation-proxy broker bound: a `retry_after` deadline more
 /// than 365 days past the observation is not a bounded deadline, and the
 /// whole diagnostic is treated as unrecognized.
@@ -462,29 +467,10 @@ impl TeeClient {
     /// "no trusted diagnostic" so existing retry deadlines govern.
     pub async fn bounded_status_json(&self) -> Result<serde_json::Value, TeeError> {
         let resp = self.http.get(self.url("/status")).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Deliberately no body read on the safe status path: the fixed
-            // message never carries arbitrary response content.
-            return Err(TeeError::Tee {
-                status: status.as_u16(),
-                message: "TEE status request failed".to_string(),
-            });
-        }
-        if resp
-            .content_length()
-            .is_some_and(|length| length as usize > MAX_BOOTSTRAP_STATUS_BODY_BYTES)
-        {
-            return Err(too_large_status_body_error());
-        }
-        let mut resp = resp;
-        let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await? {
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_BOOTSTRAP_STATUS_BODY_BYTES {
-                return Err(too_large_status_body_error());
-            }
-        }
+        reject_error_status(resp.status(), "TEE status")?;
+        let body =
+            read_bounded_response_body(resp, MAX_BOOTSTRAP_STATUS_BODY_BYTES, "TEE status body")
+                .await?;
         parse_status_body(&body)
     }
 
@@ -670,8 +656,24 @@ impl TeeClient {
             .append_pair("domain", endpoint.host.as_str())
             .append_pair("leaf_spki_sha256", leaf_spki_hex.as_str());
         let resp = pinned_http.get(attestation_url).send().await?;
-        let resp = self.check_response(resp).await?;
-        let attestation: AttestationResponse = resp.json().await?;
+        // Read the attestation response through the bounded safe path for both
+        // success and failure responses: at this point SPKI pinning only
+        // proves continuity with the contacted peer, and SNP verification has
+        // not yet authenticated it, so an unbounded body (or error body) must
+        // not be consumed before authentication completes.
+        reject_error_status(resp.status(), "TEE attestation")?;
+        let body = read_bounded_response_body(
+            resp,
+            MAX_ATTESTATION_RESPONSE_BODY_BYTES,
+            "TEE attestation body",
+        )
+        .await?;
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|err| {
+            TeeError::Attestation(format!("attestation body is not valid JSON: {err}"))
+        })?;
+        let attestation: AttestationResponse = serde_json::from_value(value).map_err(|err| {
+            TeeError::Attestation(format!("attestation body is malformed: {err}"))
+        })?;
         if attestation.nonce != nonce_b64 {
             return Err(TeeError::Attestation("nonce mismatch".to_string()));
         }
@@ -732,6 +734,47 @@ fn build_tee_http_client(
         );
     }
     builder.build().map_err(TeeError::Http)
+}
+
+/// Reject a non-success response by status code alone. Deliberately no body
+/// read: the fixed message never carries arbitrary response content.
+fn reject_error_status(status: reqwest::StatusCode, subject: &str) -> Result<(), TeeError> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(TeeError::Tee {
+        status: status.as_u16(),
+        message: format!("{subject} request failed"),
+    })
+}
+
+/// Shared bounded streaming reader: caps the body against the declared
+/// `content-length` and again per chunk, so streaming bodies without a
+/// declared length cannot bypass the limit.
+async fn read_bounded_response_body(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    subject: &str,
+) -> Result<Vec<u8>, TeeError> {
+    let too_large = || {
+        TeeError::Attestation(format!(
+            "{subject} exceeds the {max_bytes}-byte bounded read limit"
+        ))
+    };
+    if resp
+        .content_length()
+        .is_some_and(|length| length as usize > max_bytes)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > max_bytes {
+            return Err(too_large());
+        }
+    }
+    Ok(body)
 }
 
 fn too_large_status_body_error() -> TeeError {
