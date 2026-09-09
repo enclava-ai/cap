@@ -29,12 +29,21 @@
 //! actually absent certificate (ENOENT) starts issuance; a certificate-less
 //! retained key is reused for the new CSR so an interrupted first issuance
 //! retries with the same key.
+//!
+//! Failure contract: broker responses are consumed with a bounded body
+//! read, and terminal issuance failures are reduced to the broker's safe
+//! bounded contract (`{"error","terminal","retry_after"}`) carried in the
+//! typed [`TlsBrokerFailure`] error. Raw response bytes, HTTP detail, and
+//! provider prose never enter any error, log, or file; unknown, malformed,
+//! or unbounded bodies degrade to the generic safe issuance failure.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair, SigningKey};
 use rustls_pki_types::{
     CertificateDer, ServerName, SignatureVerificationAlgorithm, TrustAnchor, UnixTime,
@@ -45,6 +54,7 @@ use webpki::{EndEntityCert, KeyUsage};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::config::Config;
+use crate::safe_diagnostics::{SafeBootstrapDiagnostic, SafeDiagnosticCode};
 use crate::{trustee_verify, writes};
 
 pub const CERT_RELATIVE_PATH: &str = "certificates/tls.crt";
@@ -74,6 +84,30 @@ const NOT_BEFORE_TOLERANCE_SECS: u64 = 300;
 /// the certificate leaf was issued for exactly that key.
 const TLS_KEY_BINDING_PROBE: &[u8] = b"enclava-init tls certificate key binding probe";
 
+/// Maximum TLS certificate broker response body bytes ever buffered, for
+/// failures and successes alike. Successful PEM chains are a few KiB and
+/// the terminal-failure contract is far smaller; anything larger is
+/// treated as an unbounded (malformed) body and never read into memory.
+const MAX_BROKER_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Typed terminal TLS broker failure carrying only the safe, bounded
+/// diagnostic — never raw response text, HTTP detail, or provider prose.
+///
+/// The type propagates unchanged through the contextual anyhow wrappers
+/// between here and the init binary's failure reporting, which recovers it
+/// by typed downcast (`anyhow::Error::downcast_ref`), not string scraping.
+/// Its `Display` text is itself safe: it renders only the diagnostic code
+/// and the validated deadline.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "TLS certificate broker issuance failed: code {}, retry_after {}",
+    diagnostic.code.as_str(),
+    diagnostic.retry_after_rfc3339().as_deref().unwrap_or("null")
+)]
+pub struct TlsBrokerFailure {
+    pub diagnostic: SafeBootstrapDiagnostic,
+}
+
 #[derive(Debug, Serialize)]
 struct CertificateRequest<'a> {
     hostnames: &'a [String],
@@ -84,6 +118,65 @@ struct CertificateRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct CertificateResponse {
     certificate_chain_pem: String,
+}
+
+/// Wire shape of the broker's bounded terminal-failure contract:
+/// `{"error":"acme_rate_limited"|"acme_certificate_issuance_failed",
+/// "terminal":true,"retry_after":null|RFC3339 UTC}`. Unknown fields are
+/// ignored and never echoed anywhere.
+#[derive(Debug, Deserialize)]
+struct BrokerFailureBody {
+    error: String,
+    terminal: bool,
+    retry_after: Option<String>,
+}
+
+/// Consume a broker failure body into the safe diagnostic.
+///
+/// Only the exact recognized contract is honored: a known code with
+/// `terminal: true` keeps its code and its validated UTC deadline. Unknown
+/// codes, malformed JSON, non-terminal bodies, and absent/malformed/
+/// out-of-bounds deadlines all degrade to the generic safe terminal
+/// `acme_certificate_issuance_failed` with a null deadline. The body bytes
+/// are never included in any error, log, or returned value.
+fn broker_failure_diagnostic(body: &[u8], now: DateTime<Utc>) -> SafeBootstrapDiagnostic {
+    let Ok(parsed) = serde_json::from_slice::<BrokerFailureBody>(body) else {
+        return SafeBootstrapDiagnostic::acme_failed();
+    };
+    if !parsed.terminal {
+        return SafeBootstrapDiagnostic::acme_failed();
+    }
+    let Some(code) = SafeDiagnosticCode::from_broker_code(&parsed.error) else {
+        return SafeBootstrapDiagnostic::acme_failed();
+    };
+    SafeBootstrapDiagnostic {
+        code,
+        retry_after: parsed
+            .retry_after
+            .as_deref()
+            .and_then(|value| SafeBootstrapDiagnostic::parse_retry_after(value, now)),
+    }
+}
+
+/// Read at most `limit` bytes of a blocking response body. Returns `None`
+/// when the body is larger than the limit or cannot be read, so unbounded
+/// bodies are never buffered.
+fn read_response_body_bounded(
+    response: &mut reqwest::blocking::Response,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = response.read(&mut chunk).ok()?;
+        if read == 0 {
+            return Some(body);
+        }
+        if body.len() + read > limit {
+            return None;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
 }
 
 pub fn provision_static_tls_certificate(cfg: &Config, persistent_root: &Path) -> Result<()> {
@@ -161,22 +254,42 @@ fn provision_with_trust_anchors(
         csr_der_base64: base64::engine::general_purpose::STANDARD.encode(csr_der),
         cc_init_data_hash: local_cc_init_data_hash(cfg)?,
     };
-    let response = client
+    let mut response = client
         .post(broker_url)
         .header("Authorization", format!("Attestation {token}"))
         .json(&request)
         .send()
-        .with_context(|| format!("requesting TLS certificate from {broker_url}"))?;
+        .context("requesting TLS certificate from broker")?;
     let status = response.status();
+    let body = read_response_body_bounded(&mut response, MAX_BROKER_RESPONSE_BYTES);
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
-        return Err(anyhow!(
-            "TLS certificate broker returned HTTP {status}: {body}"
-        ));
+        // Terminal broker failure: consume the bounded body as the safe
+        // contract and stop. Unknown, malformed, or unbounded bodies
+        // degrade to the generic safe issuance failure; the raw body, the
+        // HTTP status, and any provider detail never enter the error, the
+        // log, or the typed diagnostic.
+        let diagnostic = match body.as_deref() {
+            Some(bytes) => broker_failure_diagnostic(bytes, Utc::now()),
+            None => SafeBootstrapDiagnostic::acme_failed(),
+        };
+        tracing::warn!(
+            error = diagnostic.code.as_str(),
+            terminal = true,
+            retry_after = diagnostic.retry_after_rfc3339().as_deref(),
+            "static TLS certificate broker issuance attempt failed"
+        );
+        return Err(anyhow::Error::new(TlsBrokerFailure { diagnostic }));
     }
-    let body: CertificateResponse = response
-        .json()
-        .context("decoding TLS certificate broker response")?;
+    // A success status still has to decode as the bounded certificate
+    // response; an unbounded or malformed body is a failed issuance.
+    let body: CertificateResponse = body
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+        .ok_or_else(|| {
+            anyhow::Error::new(TlsBrokerFailure {
+                diagnostic: SafeBootstrapDiagnostic::acme_failed(),
+            })
+        })?;
     validate_certificate_chain(
         &body.certificate_chain_pem,
         &key_pair,
@@ -415,10 +528,17 @@ fn local_cc_init_data_hash(cfg: &Config) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeDelta;
     use rcgen::{BasicConstraints, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer};
+    use serde_json::json;
+    use std::io::Write as _;
+    use std::net::TcpListener;
     use tempfile::tempdir;
 
     const TEST_HOSTNAMES: &[&str] = &["app.example.test", "www.example.test"];
+    /// Synthetic provider secret planted in raw/malformed broker bodies; it
+    /// must never reach any error chain, log field, or written file.
+    const SYNTHETIC_PROVIDER_SENTINEL: &str = "SYNTHETIC-PROVIDER-SECRET";
 
     struct TestRoot {
         params: CertificateParams,
@@ -486,6 +606,23 @@ mod tests {
     }
 
     fn broker_config(dir: &Path, hostnames: &[&str]) -> Config {
+        broker_config_with_endpoints(
+            dir,
+            hostnames,
+            "http://127.0.0.1:9/",
+            "http://127.0.0.1:8006/aa/token?token_type=kbs",
+        )
+    }
+
+    /// Broker config whose attestation-token and broker endpoints both
+    /// point at a local test server, so provisioning reaches the real HTTP
+    /// response handling without any external service.
+    fn broker_config_with_endpoints(
+        dir: &Path,
+        hostnames: &[&str],
+        broker_url: &str,
+        token_url: &str,
+    ) -> Config {
         let cfg_path = dir.join("config.toml");
         let hostnames_list = hostnames
             .iter()
@@ -497,8 +634,9 @@ mod tests {
             format!(
                 r#"
 mode = "autounlock"
-tls-certificate-broker-url = "http://127.0.0.1:9/"
+tls-certificate-broker-url = "{broker_url}"
 tls-certificate-hostnames = [{hostnames_list}]
+kbs-attestation-token-url = "{token_url}"
 
 [state]
 device = "/dev/csi0"
@@ -516,6 +654,63 @@ hkdf-info = "tls-state-luks-key"
         )
         .unwrap();
         Config::load(&cfg_path).unwrap()
+    }
+
+    /// Minimal local HTTP server: `GET .../kbs-token` serves an attestation
+    /// token, every other request (the broker POST) gets the given status
+    /// line and body. Handles one connection at a time until the test
+    /// process drops it.
+    fn spawn_local_broker(
+        token_status_line: &str,
+        broker_status_line: &str,
+        broker_body: String,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let token_status_line = token_status_line.to_string();
+        let broker_status_line = broker_status_line.to_string();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => head.push(byte[0]),
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let content_length = head
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut request_body = vec![0u8; content_length];
+                if content_length > 0 {
+                    stream.read_exact(&mut request_body).ok();
+                }
+                let (status_line, body) = if head.starts_with("GET /kbs-token") {
+                    (
+                        token_status_line.clone(),
+                        "{\"token\":\"test-token\"}".to_string(),
+                    )
+                } else {
+                    (broker_status_line.clone(), broker_body.clone())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).ok();
+                stream.flush().ok();
+            }
+        });
+        (base, handle)
     }
 
     fn write_retained_state(dir: &Path, chain_pem: &str, key_pem: &str) -> PathBuf {
@@ -1154,5 +1349,306 @@ hkdf-info = "tls-state-luks-key"
             message.contains("symbolic link"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn broker_failure_contract_keeps_rate_limit_code_and_validated_deadline() {
+        let now = chrono::SubsecRound::trunc_subsecs(Utc::now(), 0);
+        let deadline = now + TimeDelta::hours(3);
+        let body = json!({
+            "error": "acme_rate_limited",
+            "terminal": true,
+            "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        })
+        .to_string();
+
+        let diagnostic = broker_failure_diagnostic(body.as_bytes(), now);
+
+        assert_eq!(diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(diagnostic.retry_after, Some(deadline));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&diagnostic.render_json()).unwrap(),
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            })
+        );
+    }
+
+    #[test]
+    fn elapsed_broker_deadline_keeps_terminal_rate_limit_failure() {
+        // Contract coordination: an elapsed (past) bounded deadline does not
+        // erase the terminal failure — the code and timestamp are preserved
+        // and rendered, and no automatic certificate retry happens here.
+        let now = chrono::SubsecRound::trunc_subsecs(Utc::now(), 0);
+        let elapsed = now - TimeDelta::hours(2);
+        let body = json!({
+            "error": "acme_rate_limited",
+            "terminal": true,
+            "retry_after": elapsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        })
+        .to_string();
+
+        let diagnostic = broker_failure_diagnostic(body.as_bytes(), now);
+
+        assert_eq!(diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(diagnostic.retry_after, Some(elapsed));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&diagnostic.render_json()).unwrap(),
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": elapsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            })
+        );
+    }
+
+    #[test]
+    fn broker_failure_contract_generic_code_has_null_deadline() {
+        let now = Utc::now();
+        for body in [
+            json!({
+                "error": "acme_certificate_issuance_failed",
+                "terminal": true,
+                "retry_after": null,
+            })
+            .to_string(),
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": null,
+            })
+            .to_string(),
+        ] {
+            let diagnostic = broker_failure_diagnostic(body.as_bytes(), now);
+            assert_eq!(diagnostic.retry_after, None);
+        }
+    }
+
+    #[test]
+    fn unknown_malformed_and_secret_bearing_broker_bodies_fail_safe() {
+        let now = Utc::now();
+        let valid_deadline =
+            (now + TimeDelta::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // Bodies that must degrade to the generic safe terminal failure.
+        for body in [
+            // Raw provider prose instead of the contract.
+            format!("provider said {SYNTHETIC_PROVIDER_SENTINEL}: quota exhausted"),
+            // Unknown error code carrying provider detail.
+            json!({
+                "error": "brand_new_provider_code",
+                "terminal": true,
+                "detail": SYNTHETIC_PROVIDER_SENTINEL,
+            })
+            .to_string(),
+            // Recognized code but non-terminal contract.
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": false,
+                "retry_after": valid_deadline,
+            })
+            .to_string(),
+            // Missing terminal field.
+            json!({
+                "error": "acme_rate_limited",
+                "retry_after": valid_deadline,
+            })
+            .to_string(),
+            // Wrong-typed fields.
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": 42,
+            })
+            .to_string(),
+            // Not JSON at all / empty.
+            String::new(),
+            "<<html>502</html>".to_string(),
+        ] {
+            let diagnostic = broker_failure_diagnostic(body.as_bytes(), now);
+            assert_eq!(
+                diagnostic.code,
+                SafeDiagnosticCode::AcmeCertificateIssuanceFailed,
+                "unknown/malformed body must degrade to the safe terminal issuance failure: {body}"
+            );
+            assert_eq!(diagnostic.retry_after, None, "no deadline from: {body}");
+            let rendered = diagnostic.render_json();
+            assert!(
+                !rendered.contains(SYNTHETIC_PROVIDER_SENTINEL),
+                "rendered diagnostic leaked provider text: {rendered}"
+            );
+        }
+
+        // Recognized codes with an absent, malformed, non-UTC, or
+        // out-of-bounds deadline keep their code and lose the deadline.
+        for body in [
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": SYNTHETIC_PROVIDER_SENTINEL,
+            })
+            .to_string(),
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": "2026-09-10T09:30:00+02:00",
+            })
+            .to_string(),
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": "9999-12-31T23:59:59Z",
+            })
+            .to_string(),
+            json!({
+                "error": "acme_certificate_issuance_failed",
+                "terminal": true,
+                "retry_after": "not-a-date",
+            })
+            .to_string(),
+        ] {
+            let diagnostic = broker_failure_diagnostic(body.as_bytes(), now);
+            assert_eq!(
+                diagnostic.retry_after, None,
+                "unusable deadline must be absent: {body}"
+            );
+            let rendered = diagnostic.render_json();
+            assert!(
+                !rendered.contains(SYNTHETIC_PROVIDER_SENTINEL),
+                "rendered diagnostic leaked provider text: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_terminal_failure_reaches_provisioning_error_as_typed_diagnostic() {
+        let dir = tempdir().unwrap();
+        let deadline = Utc::now() + TimeDelta::hours(2);
+        let deadline_rfc3339 = deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let body = json!({
+            "error": "acme_rate_limited",
+            "terminal": true,
+            "retry_after": deadline_rfc3339,
+            // Unknown contract fields must never surface anywhere.
+            "detail": SYNTHETIC_PROVIDER_SENTINEL,
+        })
+        .to_string();
+        let (base, _server) = spawn_local_broker("200 OK", "502 Bad Gateway", body);
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+
+        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+
+        let failure = error
+            .downcast_ref::<TlsBrokerFailure>()
+            .expect("terminal broker failure must be the typed error");
+        assert_eq!(failure.diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(
+            failure
+                .diagnostic
+                .retry_after
+                .map(|deadline| deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            Some(deadline_rfc3339)
+        );
+        // Even the full anyhow chain (what failure reporting used to print)
+        // carries no provider detail.
+        let chain = format!("{error:#}");
+        assert!(!chain.contains(SYNTHETIC_PROVIDER_SENTINEL));
+        assert!(!cert_path(&persistent).exists());
+    }
+
+    #[test]
+    fn broker_raw_failure_text_never_reaches_error_or_files() {
+        let dir = tempdir().unwrap();
+        let body = format!("upstream ACME problem: {SYNTHETIC_PROVIDER_SENTINEL}");
+        let (base, _server) = spawn_local_broker("200 OK", "502 Bad Gateway", body);
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+
+        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+
+        let failure = error
+            .downcast_ref::<TlsBrokerFailure>()
+            .expect("terminal broker failure must be the typed error");
+        assert_eq!(
+            failure.diagnostic.code,
+            SafeDiagnosticCode::AcmeCertificateIssuanceFailed
+        );
+        assert_eq!(failure.diagnostic.retry_after, None);
+        let chain = format!("{error:#}");
+        assert!(!chain.contains(SYNTHETIC_PROVIDER_SENTINEL));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&failure.diagnostic.render_json()).unwrap(),
+            json!({
+                "error": "acme_certificate_issuance_failed",
+                "terminal": true,
+                "retry_after": null,
+            })
+        );
+    }
+
+    #[test]
+    fn broker_success_status_with_malformed_body_is_safe_terminal_failure() {
+        let dir = tempdir().unwrap();
+        let body = format!("not json {SYNTHETIC_PROVIDER_SENTINEL}");
+        let (base, _server) = spawn_local_broker("200 OK", "200 OK", body);
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+
+        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+
+        let failure = error
+            .downcast_ref::<TlsBrokerFailure>()
+            .expect("malformed success body must be a typed broker failure");
+        assert_eq!(
+            failure.diagnostic.code,
+            SafeDiagnosticCode::AcmeCertificateIssuanceFailed
+        );
+        assert_eq!(failure.diagnostic.retry_after, None);
+        assert!(!format!("{error:#}").contains(SYNTHETIC_PROVIDER_SENTINEL));
+        assert!(!cert_path(&persistent).exists());
+    }
+
+    #[test]
+    fn oversized_broker_body_is_rejected_before_buffering_or_surfacing() {
+        let dir = tempdir().unwrap();
+        let mut body = format!("{{\"error\":\"{SYNTHETIC_PROVIDER_SENTINEL}\"");
+        body.push_str(&"x".repeat(MAX_BROKER_RESPONSE_BYTES));
+        let (base, _server) = spawn_local_broker("200 OK", "502 Bad Gateway", body);
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+
+        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+
+        let failure = error
+            .downcast_ref::<TlsBrokerFailure>()
+            .expect("unbounded body must be a typed broker failure");
+        assert_eq!(
+            failure.diagnostic.code,
+            SafeDiagnosticCode::AcmeCertificateIssuanceFailed
+        );
+        assert_eq!(failure.diagnostic.retry_after, None);
+        assert!(!format!("{error:#}").contains(SYNTHETIC_PROVIDER_SENTINEL));
     }
 }

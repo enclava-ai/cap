@@ -18,6 +18,7 @@ pub mod errors;
 pub mod kbs_fetch;
 pub mod log_relay;
 pub mod luks;
+pub mod safe_diagnostics;
 pub mod secrets;
 pub mod seeds;
 pub mod socket;

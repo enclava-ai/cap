@@ -1,6 +1,49 @@
 use super::*;
+use chrono::TimeDelta;
 use enclava_init::config::AppBindMountConfig;
+use enclava_init::safe_diagnostics::SafeDiagnosticCode;
+use enclava_init::tls_certificate::TlsBrokerFailure;
+use serde_json::json;
 use tempfile::tempdir;
+
+/// Serializes tests that mutate the failure-reporting environment
+/// variables, so parallel test threads cannot observe each other's paths.
+static FAILURE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct FailureEnvGuard {
+    _dir: tempfile::TempDir,
+    error: PathBuf,
+    termination: PathBuf,
+    stage: PathBuf,
+}
+
+impl FailureEnvGuard {
+    fn install() -> Self {
+        let dir = tempdir().unwrap();
+        let guard = Self {
+            error: dir.path().join("init-error"),
+            termination: dir.path().join("termination-log"),
+            stage: dir.path().join("init-stage"),
+            _dir: dir,
+        };
+        unsafe {
+            std::env::set_var("ENCLAVA_INIT_ERROR_FILE", &guard.error);
+            std::env::set_var("ENCLAVA_INIT_TERMINATION_LOG", &guard.termination);
+            std::env::set_var("ENCLAVA_INIT_STAGE_FILE", &guard.stage);
+        }
+        guard
+    }
+}
+
+impl Drop for FailureEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("ENCLAVA_INIT_ERROR_FILE");
+            std::env::remove_var("ENCLAVA_INIT_TERMINATION_LOG");
+            std::env::remove_var("ENCLAVA_INIT_STAGE_FILE");
+        }
+    }
+}
 
 #[test]
 fn public_tls_certificate_handoff_is_optional_and_public_only() {
@@ -48,30 +91,97 @@ fn ready_probe_reflects_ready_file_state() {
 }
 
 #[test]
-fn failure_file_includes_last_recorded_stage() {
-    let dir = tempdir().unwrap();
-    let error = dir.path().join("init-error");
-    let termination = dir.path().join("termination-log");
-    let stage = dir.path().join("init-stage");
-    unsafe {
-        std::env::set_var("ENCLAVA_INIT_ERROR_FILE", &error);
-        std::env::set_var("ENCLAVA_INIT_TERMINATION_LOG", &termination);
-        std::env::set_var("ENCLAVA_INIT_STAGE_FILE", &stage);
+fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    record_stage("provisioning static tls certificate").unwrap();
+
+    // A bootstrap failure whose anyhow chain carries broker provider text
+    // and supplied values, wrapped in the same contextual layers run()
+    // adds around TLS provisioning.
+    let deadline = chrono::Utc::now() + TimeDelta::hours(1);
+    let error = anyhow::Error::new(TlsBrokerFailure {
+        diagnostic: SafeBootstrapDiagnostic {
+            code: SafeDiagnosticCode::AcmeRateLimited,
+            retry_after: Some(deadline),
+        },
+    })
+    .context("provisioning static TLS certificate")
+    .context("chain detail SYNTHETIC-PROVIDER-SENTINEL at /supplied/raw-path");
+    report_failure(&error);
+
+    let expected = json!({
+        "error": "acme_rate_limited",
+        "terminal": true,
+        "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    let error_body = std::fs::read_to_string(&env.error).unwrap();
+    let termination_body = std::fs::read_to_string(&env.termination).unwrap();
+    assert_eq!(error_body, termination_body);
+    for body in [&error_body, &termination_body] {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body.trim()).unwrap(),
+            expected,
+            "failure surfaces must carry exactly the safe contract: {body}"
+        );
+        assert!(body.ends_with('\n'));
+        assert!(!body.contains("SYNTHETIC-PROVIDER-SENTINEL"));
+        assert!(!body.contains("/supplied/raw-path"));
+        assert!(!body.contains("provisioning static TLS certificate"));
     }
 
-    record_stage("opening luks volumes").unwrap();
-    record_failure_file("mount failed\n");
+    // Stage markers remain available in their own file for operators.
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "provisioning static tls certificate\n"
+    );
+}
 
-    let body = std::fs::read_to_string(&error).unwrap();
-    assert!(body.contains("last_stage=opening luks volumes"));
-    assert!(body.contains("mount failed"));
-    assert_eq!(std::fs::read_to_string(&termination).unwrap(), body);
+#[test]
+fn generic_bootstrap_failures_render_generic_safe_code() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
 
-    unsafe {
-        std::env::remove_var("ENCLAVA_INIT_ERROR_FILE");
-        std::env::remove_var("ENCLAVA_INIT_TERMINATION_LOG");
-        std::env::remove_var("ENCLAVA_INIT_STAGE_FILE");
-    }
+    let error =
+        anyhow!("opening supplied device /supplied/raw-device failed: SYNTHETIC-IO-SENTINEL")
+            .context("opening luks volumes");
+    report_failure(&error);
+
+    let error_body = std::fs::read_to_string(&env.error).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(error_body.trim()).unwrap(),
+        json!({
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+        }),
+        "unknown failures must degrade to the generic safe code: {error_body}"
+    );
+    assert!(!error_body.contains("SYNTHETIC-IO-SENTINEL"));
+    assert!(!error_body.contains("/supplied/raw-device"));
+    assert_eq!(
+        std::fs::read_to_string(&env.termination).unwrap(),
+        error_body
+    );
+}
+
+#[test]
+fn recovery_clears_stale_failure_file() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    report_failure(&anyhow!("bootstrap failed"));
+    assert!(env.error.exists());
+
+    // The existing clear/reset lifecycle (run after the owner seed is
+    // acquired and on unlock attempts) removes the stale failure file.
+    clear_error_file(&error_file_path());
+    assert!(!env.error.exists());
+
+    // Clearing again (no stale error) stays a no-op.
+    clear_error_file(&error_file_path());
+    assert!(!env.error.exists());
 }
 
 #[test]
