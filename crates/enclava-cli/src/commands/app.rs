@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::commands::ownership::MnemonicCapture;
+use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
 use crate::commands::{counted_progress, format_duration, timed_progress};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -391,10 +391,10 @@ pub struct DeployArgs {
     /// File containing the storage password for non-interactive password-mode deploys.
     #[arg(long = "storage-password-file", value_name = "PATH")]
     pub storage_password_file: Option<PathBuf>,
-    /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
+    /// Persist the recovery mnemonic to the protected local keystore so `enclava key backup` can back it up (default).
     #[arg(long, conflicts_with = "no_store_mnemonic")]
     pub store_mnemonic: bool,
-    /// Do NOT persist the recovery mnemonic (shown once only; opt out of backup coverage).
+    /// Unsupported for password-mode first deploys (which auto-claim): rejected before the deployment is submitted.
     #[arg(long, conflicts_with = "store_mnemonic")]
     pub no_store_mnemonic: bool,
 }
@@ -419,11 +419,16 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     if is_password_mode {
         storage_password.ensure_available_for_password_mode("password-mode deploy")?;
     }
-    let capture = if args.no_store_mnemonic {
-        MnemonicCapture::Skip
-    } else {
-        MnemonicCapture::Store
-    };
+    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
+    // A fresh password-mode deploy auto-claims ownership on first boot; refuse the
+    // no-store sink mode before submitting anything, while the run can still stop
+    // without side effects. (The authoritative pre-claim gate also re-checks this
+    // inside `claim_initial_ownership`.)
+    if capture == MnemonicCapture::Skip
+        && deploy_needs_initial_claim(is_password_mode, None, &app.status)
+    {
+        crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
+    }
     let pb = ProgressBar::new(5);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -1076,6 +1081,20 @@ pub(crate) async fn claim_initial_ownership(
     storage_password: &StoragePasswordInput,
     capture: MnemonicCapture,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let active = resolve_current_user_org(api).await?;
+
+    // Sink gate, before anything touches the TEE: the TEE returns the one-time
+    // recovery mnemonic exactly once and rejects a second claim, so an unsafe
+    // sink mode, an unattended session, or an unwritable keystore must abort
+    // here, while the claim can still be cancelled without side effects. This
+    // gates both `enclava deploy` and `enclava template deploy` auto-claims.
+    crate::commands::ownership::prepare_recovery_mnemonic_sink(
+        paths,
+        &active.org_name,
+        app_name,
+        capture,
+    )?;
+
     let endpoint = api.get_unlock_endpoint(app_name).await?;
     let tee =
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
@@ -1083,7 +1102,6 @@ pub(crate) async fn claim_initial_ownership(
 
     let challenge = tee.bootstrap_challenge().await?;
 
-    let active = resolve_current_user_org(api).await?;
     let private_key_bytes =
         load_or_derive_bootstrap_private_key(paths, &active.org_name, active.org_id, app_name)?
             .ok_or("bootstrap key is missing and no recovery seed is available; run `enclava key restore <backup>`")?;
@@ -1101,28 +1119,38 @@ pub(crate) async fn claim_initial_ownership(
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
         .await
     {
-        Ok(result) => Some(result),
-        Err(err) if tee.claim_state_is_successful().await.unwrap_or(false) => {
-            eprintln!(
-                "Claim response was interrupted after the TEE accepted ownership; continuing."
+        Ok(result) => result,
+        Err(_) if tee.claim_state_is_successful().await.unwrap_or(false) => {
+            // Ownership committed server-side but the response (which carries the
+            // one-time mnemonic) was lost. Halt the deploy/template flow with the
+            // incomplete-backup error: never retry the claim, never imply
+            // rollback, never print secrets.
+            return Err(
+                crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
+                    "the claim response was lost after the TEE committed ownership, so the \
+                     one-time recovery mnemonic was never received"
+                        .to_string(),
+                ),
             );
-            let _ = err;
-            None
         }
         Err(err) => return Err(err.into()),
     };
 
-    if let Some(mnemonic) = result.and_then(|result| result.mnemonic) {
-        crate::commands::ownership::present_and_capture_recovery_mnemonic_or_warn(
-            paths,
-            &active.org_name,
-            app_name,
-            &mnemonic,
-            capture,
-            crate::commands::ownership::RecoveryMnemonicOutput::Stderr,
-        );
-    }
-
+    // Persist the one-time mnemonic to the prepared protected sink. The mnemonic
+    // is never written to stdout/stderr; on failure this returns the
+    // ownership-committed/incomplete-backup error and the deploy/template flow
+    // halts rather than proceeding past a claim whose backup is incomplete.
+    let mnemonic = result.mnemonic.ok_or_else(|| {
+        crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
+            "the TEE's claim response contained no recovery mnemonic".to_string(),
+        )
+    })?;
+    crate::commands::ownership::store_recovery_mnemonic_after_claim(
+        paths,
+        &active.org_name,
+        app_name,
+        &mnemonic,
+    )?;
     Ok(())
 }
 

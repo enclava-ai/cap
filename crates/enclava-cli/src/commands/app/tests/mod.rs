@@ -1398,3 +1398,107 @@ async fn revoke_org_log_key_hits_org_endpoint() {
     assert_eq!(resp.status, "revoked");
     assert_eq!(resp.cleared_app_selections, Some(2));
 }
+
+mod claim_recovery_sink_tests {
+    /// Source-order and no-leak contracts for the auto-claim path shared by
+    /// `enclava deploy` and `enclava template deploy`. The TEE mints the
+    /// one-time recovery mnemonic exactly once and rejects a second claim, so
+    /// these tests pin the two invariants that cannot be exercised against a
+    /// real TEE in unit tests: the private sink is validated before any
+    /// challenge/claim request, and no stdout/stderr statement ever interpolates
+    /// the mnemonic.
+    fn fn_body(source: &'static str, start_marker: &str, end_marker: &str) -> &'static str {
+        let start = source.find(start_marker).expect("start marker exists");
+        let end = start + source[start..].find(end_marker).expect("end marker exists");
+        &source[start..end]
+    }
+
+    const APP_SOURCE: &str = include_str!("../../app.rs");
+
+    #[test]
+    fn claim_initial_ownership_gates_sink_before_any_network_claim() {
+        let body = fn_body(
+            APP_SOURCE,
+            "pub(crate) async fn claim_initial_ownership",
+            "#[derive(Args)]\npub struct StatusArgs",
+        );
+
+        let gate = body
+            .find("prepare_recovery_mnemonic_sink")
+            .expect("auto-claim runs the pre-claim sink gate");
+        let challenge = body
+            .find("bootstrap_challenge")
+            .expect("auto-claim requests a challenge");
+        let claim = body
+            .find("bootstrap_claim")
+            .expect("auto-claim sends the claim");
+        assert!(
+            gate < challenge && challenge < claim,
+            "sink gate must reject unsafe modes/sessions/destinations before any claim request"
+        );
+
+        let store = body
+            .find("store_recovery_mnemonic_after_claim")
+            .expect("auto-claim persists the mnemonic post-claim");
+        assert!(store > claim);
+        assert!(
+            !body.contains("present_and_capture_recovery_mnemonic"),
+            "auto-claim must not use the removed stdout/stderr presentation path"
+        );
+    }
+
+    #[test]
+    fn claim_initial_ownership_halts_on_committed_incomplete_backup() {
+        let body = fn_body(
+            APP_SOURCE,
+            "pub(crate) async fn claim_initial_ownership",
+            "#[derive(Args)]\npub struct StatusArgs",
+        );
+
+        // Response loss after the TEE committed ownership must return the
+        // stable incomplete-backup error (halting deploy/template), not warn and
+        // proceed, and must never retry the claim.
+        assert!(body.contains("ownership_committed_recovery_backup_incomplete"));
+        assert!(
+            !body.contains("accepted ownership; continuing"),
+            "response loss must halt, not warn-and-continue"
+        );
+        let single_claim = body.match_indices("bootstrap_claim").count();
+        assert_eq!(
+            single_claim, 1,
+            "auto-claim must never retry the claim after a committed ownership"
+        );
+    }
+
+    #[test]
+    fn deploy_rejects_no_store_mnemonic_before_submitting() {
+        let body = fn_body(
+            APP_SOURCE,
+            "pub async fn deploy",
+            "async fn set_deploy_config",
+        );
+
+        let guard = body
+            .find("validate_recovery_mnemonic_sink_mode")
+            .expect("deploy preflights the sink mode for predictable auto-claims");
+        let submit = body
+            .find("api.deploy(")
+            .expect("deploy submits the deployment");
+        assert!(
+            guard < submit,
+            "no-store rejection must run before the deployment is submitted"
+        );
+    }
+
+    #[test]
+    fn claim_paths_never_print_the_mnemonic_variable() {
+        for line in APP_SOURCE.lines() {
+            if line.contains("println!") || line.contains("eprintln!") {
+                assert!(
+                    !line.contains("{mnemonic"),
+                    "stdout/stderr statement must not interpolate the mnemonic: {line}"
+                );
+            }
+        }
+    }
+}

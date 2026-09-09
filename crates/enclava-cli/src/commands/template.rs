@@ -33,7 +33,7 @@ use crate::commands::app::{
     claim_initial_ownership, ensure_manual_deploy_keyring, fetch_verified_platform_release,
     generate_log_key_for_app,
 };
-use crate::commands::ownership::MnemonicCapture;
+use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
 use crate::commands::{counted_progress, format_duration, timed_progress};
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
@@ -110,10 +110,10 @@ pub struct TemplateDeployArgs {
     /// Best-effort: process signals (including Ctrl-C) may omit terminal records.
     #[arg(long)]
     pub timings: bool,
-    /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
+    /// Persist the recovery mnemonic to the protected local keystore so `enclava key backup` can back it up (default).
     #[arg(long, conflicts_with = "no_store_mnemonic")]
     pub store_mnemonic: bool,
-    /// Do NOT persist the recovery mnemonic (shown once only; opt out of backup coverage).
+    /// Unsupported for password-mode template deploys (which auto-claim): rejected before the instance is created.
     #[arg(long, conflicts_with = "store_mnemonic")]
     pub no_store_mnemonic: bool,
 }
@@ -368,11 +368,14 @@ async fn deploy_with_timings(
     }
     // Authenticate platform authority before keyring registration or app creation.
     fetch_verified_platform_release(api, &ctx.paths).await?;
-    let capture = if args.no_store_mnemonic {
-        MnemonicCapture::Skip
-    } else {
-        MnemonicCapture::Store
-    };
+    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
+    // Password-mode template deploys auto-claim on first boot; refuse the no-store
+    // sink mode before creating anything, while the run can still stop without
+    // side effects. (The authoritative pre-claim gate in the ownership module
+    // re-checks this before the auto-claim fires.)
+    if capture == MnemonicCapture::Skip && template.unlock_mode == "password" {
+        crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
+    }
     let pb = if args.json || args.timings {
         ProgressBar::hidden()
     } else {

@@ -623,7 +623,8 @@ pub fn store_seed_at(path: &Path, seed: &[u8; 32], force: bool) -> Result<(), Ke
 /// Write secret bytes to `path` in a file that is owner-only from birth:
 /// the empty file is restricted *before* the secret is written, so no other
 /// local account can observe the material at any instant. On ACL failure the
-/// still-empty file is removed again.
+/// still-empty file is removed again. The write is flushed to stable storage
+/// (`sync_all`) before the function returns, so a reported success is durable.
 fn write_restricted(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     #[cfg(unix)]
     let mut file = {
@@ -642,6 +643,7 @@ fn write_restricted(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     {
         use std::io::Write as _;
         file.write_all(bytes)?;
+        file.sync_all()?;
         Ok(())
     }
 }
@@ -670,6 +672,31 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     }
     write_restricted(&tmp, bytes)?;
     fs::rename(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Flush the directory entry for a just-renamed secret so the rename itself
+/// survives a crash, not only the file contents. `write_restricted` already
+/// `sync_all`s the data before the rename. Failures propagate: a secret whose
+/// durable completion cannot be confirmed must not be reported as stored.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), KeysError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .mode(0o700)
+        .open(parent)?;
+    dir.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), KeysError> {
     Ok(())
 }
 
@@ -745,8 +772,9 @@ fn validate_app_mnemonic_name(app: &str) -> Result<(), KeysError> {
     })
 }
 
-/// Persist a recovery mnemonic to local state (mode 0600, atomic). Overwrites any
-/// existing entry for the app — a fresh redeploy mints a new mnemonic and voids the old.
+/// Persist a recovery mnemonic to local state (mode 0600, atomic, durable).
+/// Overwrites any existing entry for the app — a fresh redeploy mints a new
+/// mnemonic and voids the old.
 pub fn store_app_mnemonic(
     paths: &CliPaths,
     org: &str,
@@ -755,6 +783,47 @@ pub fn store_app_mnemonic(
 ) -> Result<(), KeysError> {
     validate_app_mnemonic_name(app)?;
     write_secret_atomic(&app_mnemonic_path(paths, org, app), mnemonic.as_bytes())
+}
+
+/// Prepare and validate the local sink for the post-claim recovery-mnemonic
+/// write. Must run BEFORE the ownership claim is sent: the TEE returns the
+/// mnemonic exactly once and rejects a second claim, so a destination that only
+/// fails afterwards loses the mnemonic permanently.
+///
+/// Performs exactly the directory setup `store_app_mnemonic` would perform
+/// (org directory created with owner-only permissions), then proves the sink is
+/// writable by round-tripping a probe file through the same owner-only
+/// atomic-write primitives. The probe contains no secret material and is
+/// removed again on both outcomes.
+pub fn prepare_app_mnemonic_sink(paths: &CliPaths, org: &str, app: &str) -> Result<(), KeysError> {
+    const PROBE_BYTES: &[u8] = b"claim sink writability probe (not a secret)";
+
+    validate_app_mnemonic_name(app)?;
+    let path = app_mnemonic_path(paths, org, app);
+    let Some(parent) = path.parent() else {
+        return Err(KeysError::InvalidBackup(format!(
+            "recovery mnemonic path {} has no parent directory",
+            path.display()
+        )));
+    };
+    fs::create_dir_all(parent)?;
+    set_dir_perms_0700(parent)?;
+
+    // The `.bin` suffix keeps the probe's atomic-write temp name
+    // (`{app}.sink-probe.tmp`) distinct from the real mnemonic's (`{app}.tmp`).
+    let probe = parent.join(format!("{app}.sink-probe.bin"));
+    if let Err(err) = write_secret_file(&probe, PROBE_BYTES) {
+        // Best-effort cleanup of a partial probe; the write error is authoritative.
+        let _ = fs::remove_file(&probe);
+        return Err(err);
+    }
+    fs::remove_file(&probe).map_err(|err| {
+        KeysError::InvalidBackup(format!(
+            "claim sink probe {} could not be removed: {err}",
+            probe.display()
+        ))
+    })?;
+    Ok(())
 }
 
 /// Load a stored recovery mnemonic for an app, if present. Refuses world-readable files.
@@ -1111,6 +1180,61 @@ mod tests {
 
         assert_eq!(owner_a.public.to_bytes(), owner_b.public.to_bytes());
         assert_ne!(owner_a.public.to_bytes(), app_seed);
+    }
+
+    #[test]
+    fn prepare_app_mnemonic_sink_proves_writability_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+
+        prepare_app_mnemonic_sink(&paths, "org-a", "shell1").expect("sink must be ready");
+
+        let org_dir = paths.keys_dir.join("org-a");
+        assert!(org_dir.is_dir(), "org directory must be prepared");
+        let leftovers: Vec<_> = fs::read_dir(&org_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "probe must be removed, found {leftovers:?}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&org_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "prepared sink directory must be owner-only");
+        }
+
+        // The prepared sink accepts the real post-claim store.
+        store_app_mnemonic(&paths, "org-a", "shell1", "synthetic mnemonic").unwrap();
+        assert_eq!(
+            load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some("synthetic mnemonic".to_string())
+        );
+    }
+
+    #[test]
+    fn prepare_app_mnemonic_sink_rejects_blocked_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        let org_dir = paths.keys_dir.join("org-a");
+        fs::create_dir_all(&org_dir).unwrap();
+        // A directory squatting on the atomic-write temp name makes every store
+        // attempt fail, on any uid (root would bypass permission-based setups).
+        fs::create_dir_all(org_dir.join("shell1.sink-probe.tmp")).unwrap();
+
+        let err = prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
+            .expect_err("blocked sink must be rejected before the claim");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn prepare_app_mnemonic_sink_rejects_invalid_app_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        assert!(prepare_app_mnemonic_sink(&paths, "org-a", "../escape").is_err());
     }
 
     #[test]
