@@ -536,6 +536,17 @@ pub(crate) struct SignedDeployBlobs {
     pub org_keyring_blob: String,
     pub signed_policy_artifact: String,
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Locally trusted deployment identity captured from the signed
+    /// descriptor BEFORE the blobs are moved into the deploy request: the
+    /// deploy id, the final launch (cc init data) hash, and the existing
+    /// firmware measurement expectation. CAP takes `descriptor.deploy_id`,
+    /// renders the final candidate, and validates this hash (revalidated
+    /// again at apply), and the PaaS forwards the descriptor unchanged while
+    /// preserving the returned CAP deployment id -- so a TEE whose verified
+    /// SNP HOST_DATA equals this launch hash is exactly this deployment's
+    /// TEE. This is the only evidence that may authorize attributing a
+    /// terminal bootstrap diagnostic to the deployment.
+    pub deployment: TrustedDeploymentExpectation,
 }
 
 pub(crate) async fn build_signed_deploy_blobs(
@@ -746,6 +757,11 @@ pub(crate) async fn build_signed_deploy_blobs(
         Utc::now(),
     );
 
+    // Capture the trusted deployment identity before `descriptor` is moved
+    // into the signing envelope and the blobs are handed to the deploy
+    // request: the waits must compare against exactly what was signed.
+    let deployment =
+        enclava_cli::descriptor::trusted_deployment_expectation_from_descriptor(&descriptor);
     let descriptor_envelope =
         enclava_cli::descriptor::sign(&deployer_key, descriptor, signing_key_id);
 
@@ -754,6 +770,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         org_keyring_blob: serde_json::to_string(&keyring_envelope)?,
         signed_policy_artifact: serde_json::to_string(&signed_policy_artifact)?,
         log_encryption,
+        deployment,
     })
 }
 

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
 use enclava_init::config::{Config, Mode, VolumeConfig};
+use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     kbs_fetch, log_relay, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
@@ -61,10 +62,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let message = format!("{e:#}\n");
-            record_failure_file(&message);
-            tracing::error!(error = %e, "enclava-init failed");
-            eprintln!("enclava-init: {e:#}");
+            report_failure(&e);
             if stay_alive_enabled() {
                 tracing::error!(
                     "enclava-init failed; keeping sidecar alive so diagnostics remain readable"
@@ -74,6 +72,28 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Report a failed bootstrap on every ordinary failure surface with the
+/// same bounded safe fields: the init-error file, the termination log,
+/// tracing, and stderr.
+///
+/// The safe diagnostic recovers the TLS broker's typed terminal failure by
+/// downcast (preserving its code and validated deadline through the
+/// contextual anyhow wrappers); every other failure degrades to the generic
+/// `enclava_init_failed` code. The raw anyhow chain — which may carry
+/// paths, supplied values, or provider text — is never rendered here.
+fn report_failure(error: &anyhow::Error) {
+    let diagnostic = SafeBootstrapDiagnostic::diagnose(error);
+    let safe_json = diagnostic.render_json();
+    record_failure_file(&safe_json);
+    tracing::error!(
+        error = diagnostic.code.as_str(),
+        terminal = true,
+        retry_after = diagnostic.retry_after_rfc3339().as_deref(),
+        "enclava-init failed"
+    );
+    eprintln!("enclava-init: {safe_json}");
 }
 
 fn run() -> Result<()> {
@@ -209,41 +229,53 @@ fn clear_error_file(path: &Path) {
     }
 }
 
-fn record_failure_file(message: &str) {
-    let body = format_failure_message(message);
+/// Write the safe failure JSON to the init-error file and the termination
+/// log.
+///
+/// Both files carry exactly the bounded safe contract
+/// (`{"error","terminal","retry_after"}`) consumed by the attestation
+/// proxy worker and operators — never the anyhow chain, raw broker
+/// response text, or other supplied values. Stage markers stay in their
+/// own init-stage file.
+fn record_failure_file(safe_json: &str) {
+    let body = format!("{safe_json}\n");
     let path = error_file_path();
     if let Err(err) = writes::atomic_write(&path, body.as_bytes(), 0o644) {
-        eprintln!("enclava-init: failed to write {}: {err}", path.display());
+        eprintln!("enclava-init: failed to write init error file: {err}");
     }
     let termination_path = std::env::var("ENCLAVA_INIT_TERMINATION_LOG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/dev/termination-log"));
-    if let Err(err) = writes::atomic_write(&termination_path, body.as_bytes(), 0o644) {
-        eprintln!(
-            "enclava-init: failed to write {}: {err}",
-            termination_path.display()
-        );
+    if let Err(err) = write_termination_log_in_place(&termination_path, body.as_bytes()) {
+        eprintln!("enclava-init: failed to write termination log: {err}");
     }
+}
+
+/// Write the Kubernetes termination log in place.
+///
+/// The kubelet bind-mounts `/dev/termination-log` into the container, and
+/// renaming over a mounted file fails with `EBUSY` — the tmp+rename of
+/// [`writes::atomic_write`] can never replace it, so the safe JSON would
+/// never reach that surface. Write the existing file in place instead
+/// (open + truncate + write + fsync). This advisory surface does not need
+/// rename atomicity: a crash mid-write leaves at most a truncated log,
+/// never cross-file corruption. The private init-error file keeps the
+/// atomic tmp+rename write.
+fn write_termination_log_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn record_stage(stage: &str) -> Result<()> {
     tracing::info!(stage, "enclava-init stage");
     writes::atomic_write(&stage_file_path(), format!("{stage}\n").as_bytes(), 0o644)
         .map_err(Into::into)
-}
-
-fn format_failure_message(message: &str) -> String {
-    match std::fs::read_to_string(stage_file_path()) {
-        Ok(stage) => {
-            let stage = stage.trim();
-            if stage.is_empty() {
-                message.to_string()
-            } else {
-                format!("last_stage={stage}\n{message}")
-            }
-        }
-        Err(_) => message.to_string(),
-    }
 }
 
 fn mark_ready_file(path: &Path) -> Result<()> {
@@ -542,19 +574,18 @@ fn fetch_wrap_key_with_retries(
         match client.fetch_wrap_key() {
             Ok(wrap_key) => return Ok(wrap_key),
             Err(err) => {
-                let err_text = err.to_string();
                 if attempt == attempts {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "KBS fetch failed after {attempts} attempt(s); last error: {err_text}"
-                        )
-                    });
+                    return Err(err)
+                        .with_context(|| format!("KBS fetch failed after {attempts} attempt(s)"));
                 }
+                // Safe bounded retry metadata only: the raw KBS error text
+                // carries the complete request URL — its path/query may hold
+                // secret markers — so it must never reach ordinary logs.
                 tracing::warn!(
                     attempt,
                     attempts,
                     retry_sleep_seconds = sleep.as_secs(),
-                    error = %err_text,
+                    error = "kbs_fetch_failed",
                     "KBS autounlock fetch failed; retrying"
                 );
                 std::thread::sleep(sleep);
@@ -580,7 +611,6 @@ fn wait_for_kbs_proxy_health_if_needed(kbs_url: &str) -> Result<()> {
         .context("building KBS proxy health client")?;
 
     tracing::info!(
-        url = %health_url,
         wait_seconds = wait_timeout.as_secs(),
         poll_seconds = poll.as_secs(),
         "waiting for local KBS proxy before autounlock"
@@ -603,9 +633,12 @@ fn wait_for_kbs_proxy_health_if_needed(kbs_url: &str) -> Result<()> {
                     "local KBS proxy health not ready"
                 );
             }
-            Err(err) => {
+            Err(_) => {
+                // Bounded code only: reqwest error text embeds the full
+                // (supplied) health URL, whose query may carry secret
+                // markers.
                 tracing::debug!(
-                    error = %err,
+                    error = "health_request_failed",
                     "local KBS proxy health request failed"
                 );
             }

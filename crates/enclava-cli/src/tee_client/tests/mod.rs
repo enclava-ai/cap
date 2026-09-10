@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
@@ -209,9 +209,14 @@ async fn verifies_attestation_evidence_report_data_binding() {
         })),
     };
 
-    super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
-        .await
-        .unwrap();
+    // The development JSON evidence path yields no trusted launch identity:
+    // callers fail closed on deployment binding.
+    assert!(
+        super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -411,6 +416,38 @@ async fn evidence_chain_with_unpinned_ark_falls_back_to_kds_and_fails_closed() {
 }
 
 #[test]
+fn synthetic_launch_identity_is_test_support_only() {
+    // The only construction path for a verified launch identity outside
+    // attest_receipt_key() is this cfg(test)-gated setter: production builds
+    // (debug or release) compile without it, so no caller can forge trust.
+    let expected_measurement = enclava_common::descriptor::FirmwareMeasurement::Full([0x11; 48]);
+    let client = TeeClient::new("app.enclava.dev");
+    assert!(
+        client.verified_launch_identity().is_none(),
+        "ordinary clients must carry no verified launch identity"
+    );
+
+    let identity = super::VerifiedSnpLaunchIdentity {
+        host_data: [0x09; 32],
+        firmware_measurement: [0x11; 48],
+    };
+    let trusted = client.with_verified_launch_identity_for_tests([0x09; 32], [0x11; 48]);
+    assert_eq!(trusted.verified_launch_identity(), Some(identity));
+    assert!(super::launch_identity_binds_deployment(
+        trusted.verified_launch_identity().as_ref(),
+        &[0x09; 32],
+        &expected_measurement
+    ));
+    // Matching HOST_DATA with a mismatched measurement never binds.
+    let wrong_measurement = enclava_common::descriptor::FirmwareMeasurement::Full([0x22; 48]);
+    assert!(!super::launch_identity_binds_deployment(
+        trusted.verified_launch_identity().as_ref(),
+        &[0x09; 32],
+        &wrong_measurement
+    ));
+}
+
+#[test]
 fn snp_report_with_debug_policy_is_rejected() {
     let mut report = sev::firmware::guest::AttestationReport::default();
     assert!(crate::attestation::ensure_snp_report_production_policy(&report).is_ok());
@@ -420,4 +457,275 @@ fn snp_report_with_debug_policy_is_rejected() {
     report.policy = policy;
     let err = crate::attestation::ensure_snp_report_production_policy(&report).unwrap_err();
     assert!(err.to_string().contains("DEBUG"));
+}
+
+// --- terminal bootstrap diagnostics -----------------------------------------
+
+const SYNTHETIC_SECRET_MARKER: &str = "SECRET-MARKER-6f2d1c";
+
+fn terminal_error_body(
+    code: &str,
+    terminal: serde_json::Value,
+    retry_after: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ownership_state": "unclaimed",
+        "unlock_state": "locked",
+        "bootstrap_error": {
+            "error": code,
+            "terminal": terminal,
+            "retry_after": retry_after,
+        },
+    })
+}
+
+#[test]
+fn terminal_bootstrap_error_codes_are_the_stable_contract() {
+    assert_eq!(
+        super::TERMINAL_BOOTSTRAP_ERROR_CODES,
+        [
+            "acme_rate_limited",
+            "acme_certificate_issuance_failed",
+            "enclava_init_failed"
+        ]
+    );
+}
+
+#[test]
+fn parses_each_recognized_terminal_bootstrap_error() {
+    for code in super::TERMINAL_BOOTSTRAP_ERROR_CODES {
+        let diagnostic = super::parse_terminal_bootstrap_error(&terminal_error_body(
+            code,
+            serde_json::Value::Bool(true),
+            serde_json::Value::Null,
+        ))
+        .unwrap_or_else(|| panic!("{code} must be recognized"));
+        assert_eq!(diagnostic.code(), code);
+        assert_eq!(diagnostic.retry_after(), None);
+        assert_eq!(diagnostic.stable_summary(), code);
+    }
+}
+
+#[test]
+fn absent_or_malformed_bootstrap_error_field_is_not_a_diagnostic() {
+    // Absent field is the backward-compatible pre-proxy shape.
+    assert!(
+        super::parse_terminal_bootstrap_error(&serde_json::json!({
+            "ownership_state": "unclaimed",
+        }))
+        .is_none()
+    );
+    for field in [
+        serde_json::Value::Null,
+        serde_json::Value::String("acme_rate_limited".into()),
+        serde_json::Value::Bool(true),
+        serde_json::json!([{ "error": "acme_rate_limited" }]),
+    ] {
+        let body = serde_json::json!({ "bootstrap_error": field });
+        assert!(
+            super::parse_terminal_bootstrap_error(&body).is_none(),
+            "malformed bootstrap_error field must not authorize a decision"
+        );
+    }
+}
+
+#[test]
+fn unknown_error_codes_or_non_terminal_markers_are_not_a_diagnostic() {
+    // Unknown codes, arbitrary provider prose, and hostile text are ignored.
+    for code in [
+        "acme_dns_failed",
+        "",
+        "ACME_RATE_LIMITED",
+        "acme_rate_limited ",
+    ] {
+        assert!(
+            super::parse_terminal_bootstrap_error(&terminal_error_body(
+                code,
+                serde_json::Value::Bool(true),
+                serde_json::Value::Null,
+            ))
+            .is_none(),
+            "unknown code {code:?} must not authorize a stop"
+        );
+    }
+    // terminal must be exactly boolean true.
+    for terminal in [
+        serde_json::Value::Bool(false),
+        serde_json::Value::Null,
+        serde_json::json!("true"),
+        serde_json::json!(1),
+    ] {
+        assert!(
+            super::parse_terminal_bootstrap_error(&terminal_error_body(
+                "acme_rate_limited",
+                terminal,
+                serde_json::Value::Null,
+            ))
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn preserves_elapsed_and_future_utc_retry_after_deadlines() {
+    // An elapsed deadline does not erase the terminal failure: it is preserved
+    // because a retry may now be attempted separately.
+    let elapsed = super::parse_terminal_bootstrap_error(&terminal_error_body(
+        "acme_rate_limited",
+        serde_json::Value::Bool(true),
+        serde_json::json!("2020-01-01T00:00:00Z"),
+    ))
+    .expect("elapsed deadline stays parseable");
+    assert_eq!(
+        elapsed
+            .retry_after()
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "2020-01-01T00:00:00Z"
+    );
+
+    // A fixed near-term deadline: as real time passes it becomes elapsed,
+    // which the parser still preserves.
+    let future = super::parse_terminal_bootstrap_error(&terminal_error_body(
+        "enclava_init_failed",
+        serde_json::Value::Bool(true),
+        serde_json::json!("2027-01-01T12:00:00+00:00"),
+    ))
+    .expect("bounded future deadline is parseable");
+    assert_eq!(
+        future
+            .retry_after()
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "2027-01-01T12:00:00Z"
+    );
+}
+
+#[test]
+fn malformed_or_unbounded_retry_after_deadlines_reject_the_diagnostic() {
+    for retry_after in [
+        serde_json::json!("tomorrow"),
+        serde_json::json!("2030-01-01T00:00:00"), // no offset: not RFC3339
+        serde_json::json!("2030-01-01T02:00:00+02:00"), // not UTC
+        serde_json::json!(1757430400),            // unix time is not RFC3339
+        serde_json::Value::Bool(false),
+        serde_json::json!({ "seconds": 5 }),
+    ] {
+        assert!(
+            super::parse_terminal_bootstrap_error(&terminal_error_body(
+                "acme_certificate_issuance_failed",
+                serde_json::Value::Bool(true),
+                retry_after,
+            ))
+            .is_none(),
+            "malformed retry_after must not authorize a decision"
+        );
+    }
+
+    // Broker bound: at most 365 days past the observation.
+    let beyond = (chrono::Utc::now() + chrono::Duration::days(366))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(
+        super::parse_terminal_bootstrap_error(&terminal_error_body(
+            "acme_rate_limited",
+            serde_json::Value::Bool(true),
+            serde_json::json!(beyond),
+        ))
+        .is_none()
+    );
+
+    let within = (chrono::Utc::now() + chrono::Duration::days(364))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(
+        super::parse_terminal_bootstrap_error(&terminal_error_body(
+            "acme_rate_limited",
+            serde_json::Value::Bool(true),
+            serde_json::json!(within),
+        ))
+        .is_some()
+    );
+}
+
+#[test]
+fn stable_summary_prints_only_the_code_and_validated_deadline() {
+    // Hostile provider detail must never reach the console: only the code and
+    // the re-serialized UTC deadline are emitted.
+    let body = serde_json::json!({
+        "bootstrap_error": {
+            "error": "acme_certificate_issuance_failed",
+            "terminal": true,
+            "retry_after": "2027-01-01T12:00:00+00:00",
+            "detail": format!("\u{1b}[31m internal {SYNTHETIC_SECRET_MARKER} \u{1b}[0m"),
+            "provider_message": format!("leaking {SYNTHETIC_SECRET_MARKER}"),
+        }
+    });
+    let diagnostic = super::parse_terminal_bootstrap_error(&body).unwrap();
+    let summary = diagnostic.stable_summary();
+    assert_eq!(
+        summary,
+        "acme_certificate_issuance_failed (retry_after 2027-01-01T12:00:00Z)"
+    );
+    assert!(!summary.contains(SYNTHETIC_SECRET_MARKER));
+    assert!(!summary.contains('\u{1b}'));
+
+    // Unrecognized codes carrying hostile text produce no diagnostic at all.
+    let hostile = serde_json::json!({
+        "bootstrap_error": {
+            "error": format!("acme_rate_limited {SYNTHETIC_SECRET_MARKER}"),
+            "terminal": true,
+            "retry_after": null,
+        }
+    });
+    assert!(super::parse_terminal_bootstrap_error(&hostile).is_none());
+}
+
+#[test]
+fn bootstrap_status_combines_claim_and_terminal_without_masking() {
+    // Both signals come from the same body; callers decide precedence.
+    let terminal_and_claimed = serde_json::json!({
+        "ownership_state": "locked",
+        "bootstrap_error": {
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+        },
+    });
+    let status = super::bootstrap_status_from_json(&terminal_and_claimed);
+    assert!(status.claimed);
+    assert_eq!(
+        status.terminal_bootstrap_error.unwrap().code(),
+        "enclava_init_failed"
+    );
+
+    let claimed_only = serde_json::json!({ "ownership_state": "unlocked" });
+    let status = super::bootstrap_status_from_json(&claimed_only);
+    assert!(status.claimed);
+    assert!(status.terminal_bootstrap_error.is_none());
+
+    let neither = serde_json::json!({ "ownership_state": "unclaimed" });
+    let status = super::bootstrap_status_from_json(&neither);
+    assert!(!status.claimed);
+    assert!(status.terminal_bootstrap_error.is_none());
+}
+
+#[test]
+fn recognized_terminal_body_is_parsed_from_bounded_json_slice() {
+    // The bounded reader caps the accepted body size before parsing.
+    let small = serde_json::to_vec(&terminal_error_body(
+        "acme_rate_limited",
+        serde_json::Value::Bool(true),
+        serde_json::Value::Null,
+    ))
+    .unwrap();
+    assert!(super::parse_terminal_bootstrap_error_body(&small).is_some());
+
+    let mut oversized = small.clone();
+    oversized.extend(std::iter::repeat_n(
+        b' ',
+        super::MAX_BOOTSTRAP_STATUS_BODY_BYTES + 1,
+    ));
+    assert!(
+        super::parse_terminal_bootstrap_error_body(&oversized).is_none(),
+        "oversized status bodies must be rejected before parsing"
+    );
 }

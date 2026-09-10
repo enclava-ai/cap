@@ -252,6 +252,32 @@ mod hex_pubkey {
     }
 }
 
+/// Locally trusted deployment expectation captured from the final signed
+/// descriptor before its blobs are moved into a deploy request. CAP records
+/// `deploy_id`, renders the final candidate, and validates
+/// `expected_cc_init_data_hash` (revalidated again at apply), and the PaaS
+/// forwards the descriptor unchanged while preserving the returned CAP
+/// deployment id -- so a TEE whose verified SNP HOST_DATA equals the launch
+/// hash is exactly this deployment's TEE. This is the only evidence that may
+/// authorize attributing a terminal bootstrap diagnostic to the deployment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedDeploymentExpectation {
+    pub deploy_id: String,
+    pub expected_cc_init_data_hash: [u8; 32],
+    pub expected_firmware_measurement: FirmwareMeasurement,
+}
+
+/// Capture the trusted deployment identity from the final signed descriptor.
+pub fn trusted_deployment_expectation_from_descriptor(
+    descriptor: &DeploymentDescriptor,
+) -> TrustedDeploymentExpectation {
+    TrustedDeploymentExpectation {
+        deploy_id: descriptor.deploy_id.to_string(),
+        expected_cc_init_data_hash: descriptor.expected_cc_init_data_hash,
+        expected_firmware_measurement: descriptor.expected_firmware_measurement.clone(),
+    }
+}
+
 pub fn sign(
     deployer: &UserSigningKey,
     descriptor: DeploymentDescriptor,
@@ -388,6 +414,21 @@ mod tests {
             expected_cc_init_data_hash: [5; 32],
             expected_kbs_policy_hash: [6; 32],
         }
+    }
+
+    #[test]
+    fn trusted_expectation_mirrors_the_signed_descriptor() {
+        let descriptor = fixed_descriptor();
+        let expectation = trusted_deployment_expectation_from_descriptor(&descriptor);
+        assert_eq!(expectation.deploy_id, descriptor.deploy_id.to_string());
+        assert_eq!(
+            expectation.expected_cc_init_data_hash,
+            descriptor.expected_cc_init_data_hash
+        );
+        assert_eq!(
+            expectation.expected_firmware_measurement,
+            descriptor.expected_firmware_measurement
+        );
     }
 
     #[test]

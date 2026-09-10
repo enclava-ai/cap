@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use dialoguer::{Confirm, Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -20,10 +20,10 @@ pub struct ClaimArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
-    /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
+    /// Persist the recovery mnemonic to the protected local keystore so `enclava key backup` can back it up (default).
     #[arg(long, conflicts_with = "no_store_mnemonic")]
     pub store_mnemonic: bool,
-    /// Do NOT persist the recovery mnemonic (shown once only; opt out of backup coverage).
+    /// Unsupported for claims: rejected before the claim is sent (the mnemonic is never printed; use `enclava key backup` for deliberate export).
     #[arg(long, conflicts_with = "store_mnemonic")]
     pub no_store_mnemonic: bool,
 }
@@ -128,7 +128,16 @@ fn load_or_derive_bootstrap_private_key(
 
 pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
+    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
     let (api, paths) = build_api_client()?;
+    let me = api.get_current_user().await?;
+
+    // Sink gate, before anything touches the TEE: the TEE returns the one-time
+    // recovery mnemonic exactly once and rejects a second claim, so an unsafe
+    // sink mode, an unattended session, or an unwritable keystore must abort
+    // here, while the claim can still be cancelled without side effects.
+    prepare_recovery_mnemonic_sink(&paths, &me.active_org.name, &app_name, capture)?;
+
     let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
     let tee =
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
@@ -141,7 +150,6 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Challenge received (expires in {}s)", challenge.ttl_seconds);
 
     // Step 2: Load or re-derive the deterministic bootstrap keypair.
-    let me = api.get_current_user().await?;
     let org_id = Uuid::parse_str(&me.active_org.id)?;
     let private_key_bytes =
         load_or_derive_bootstrap_private_key(&paths, &me.active_org.name, org_id, &app_name)?;
@@ -171,257 +179,200 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
         .await
     {
-        Ok(result) => Some(result),
-        Err(err) if tee.claim_state_is_successful().await.unwrap_or(false) => {
-            eprintln!(
-                "Claim response was interrupted after the TEE accepted ownership; continuing."
-            );
-            let _ = err;
-            None
+        Ok(result) => result,
+        Err(_) if tee.claim_state_is_successful().await.unwrap_or(false) => {
+            // Ownership committed server-side but the response (which carries the
+            // one-time mnemonic) was lost. Halt with the incomplete-backup error:
+            // never retry the claim, never imply rollback, never print secrets.
+            return Err(ownership_committed_recovery_backup_incomplete(
+                "the claim response was lost after the TEE committed ownership, so the \
+                 one-time recovery mnemonic was never received"
+                    .to_string(),
+            ));
         }
         Err(err) => return Err(err.into()),
     };
 
     println!("Ownership claimed.");
 
-    let capture = if args.no_store_mnemonic {
-        MnemonicCapture::Skip
-    } else {
-        MnemonicCapture::Store
-    };
-    if let Some(mnemonic) = result.as_ref().and_then(|result| result.mnemonic.as_ref()) {
-        present_and_capture_recovery_mnemonic_or_warn(
-            &paths,
-            &me.active_org.name,
-            &app_name,
-            mnemonic,
-            capture,
-            RecoveryMnemonicOutput::Stdout,
-        );
-    }
-
+    // Step 6: Persist the one-time mnemonic to the prepared protected sink. The
+    // mnemonic is never written to stdout/stderr; on failure this returns the
+    // ownership-committed/incomplete-backup error and halts.
+    let mnemonic = result.mnemonic.ok_or_else(|| {
+        ownership_committed_recovery_backup_incomplete(
+            "the TEE's claim response contained no recovery mnemonic".to_string(),
+        )
+    })?;
+    store_recovery_mnemonic_after_claim(&paths, &me.active_org.name, &app_name, &mnemonic)?;
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecoveryMnemonicOutput {
-    Stdout,
-    Stderr,
 }
 
 /// Operator's choice on whether to persist a freshly-observed recovery mnemonic.
+/// `Skip` (`--no-store-mnemonic`) is rejected by
+/// [`validate_recovery_mnemonic_sink_mode`] before any claim is sent: the
+/// mnemonic is never printed to stdout/stderr, so an unpersisted mnemonic is
+/// permanently lost, and no tenant-authenticated re-export exists yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MnemonicCapture {
-    /// Persist to local state so `key backup` can include it (default).
+    /// Persist to the protected local keystore so `key backup` can back it up.
     Store,
-    /// Do not persist; the mnemonic is shown once only.
+    /// Do not persist. Rejected pre-claim; kept so the flag still parses and
+    /// fails with actionable guidance instead of a clap unknown-argument error.
     Skip,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryMnemonicCaptureAction {
-    PromptToStore,
-    Store,
-    Skip,
-}
-
-fn store_mnemonic_local(
-    paths: &CliPaths,
-    org: &str,
-    app: &str,
-    mnemonic: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    keys::store_app_mnemonic(paths, org, app, mnemonic)
-        .map_err(|e| format!("failed to store recovery mnemonic: {e}").into())
-}
-
-/// Present the one-time LUKS recovery mnemonic and, by default, persist it to local
-/// state so `enclava key backup` can bundle it with the deploy keys.
-///
-/// The `capture` flag is authoritative: `--no-store-mnemonic` never prompts to store,
-/// even on an interactive terminal. Otherwise, interactive terminals ask whether to store
-/// (default yes); declining runs the standard "I have recorded it" confirmation gate.
-/// Off-TTY the `capture` flag decides (`Store` by default), because no prompt is possible.
-///
-/// Returns an error only on write/prompt failure (e.g. EOF at the prompt); callers past
-/// an irreversible server-side action should use
-/// [`present_and_capture_recovery_mnemonic_or_warn`].
-pub(crate) fn present_and_capture_recovery_mnemonic(
-    paths: &CliPaths,
-    org: &str,
-    app: &str,
-    mnemonic: &str,
-    capture: MnemonicCapture,
-    output: RecoveryMnemonicOutput,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match output {
-        RecoveryMnemonicOutput::Stdout => {
-            let mut stdout = io::stdout().lock();
-            write_recovery_mnemonic(&mut stdout, mnemonic)?;
-            stdout.flush()?;
-        }
-        RecoveryMnemonicOutput::Stderr => {
-            let mut stderr = io::stderr().lock();
-            write_recovery_mnemonic(&mut stderr, mnemonic)?;
-            stderr.flush()?;
-        }
+/// Map the `--no-store-mnemonic` flag to the capture mode shared by every claim
+/// caller (explicit `enclava claim`, `enclava deploy`, `enclava template deploy`).
+pub(crate) fn mnemonic_capture_from_flags(no_store_mnemonic: bool) -> MnemonicCapture {
+    if no_store_mnemonic {
+        MnemonicCapture::Skip
+    } else {
+        MnemonicCapture::Store
     }
+}
 
+/// Stable, greppable error code for: the TEE already committed ownership, but
+/// the one-time recovery mnemonic is not safely persisted in the local keystore.
+pub(crate) const OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE: &str =
+    "ownership_committed_recovery_backup_incomplete";
+
+/// Bounded retry budget for persisting the same in-memory mnemonic to the
+/// prepared private sink after the claim committed ownership.
+const MNEMONIC_PERSIST_ATTEMPTS: u32 = 3;
+
+/// Reject unsafe sink modes before any claim is sent. `--no-store-mnemonic` used
+/// to display the mnemonic once on stdout/stderr; that display path is gone
+/// (transcripts and CI artifacts captured it, evidence E11), and until a
+/// tenant-authenticated export exists an unpersisted mnemonic is unrecoverable,
+/// so the mode is refused before the TEE mints anything.
+pub(crate) fn validate_recovery_mnemonic_sink_mode(
+    capture: MnemonicCapture,
+) -> Result<(), Box<dyn std::error::Error>> {
     if capture == MnemonicCapture::Skip {
-        debug_assert_eq!(
-            recovery_mnemonic_capture_action(capture, recovery_mnemonic_confirmation_available()),
-            RecoveryMnemonicCaptureAction::Skip
+        return Err(
+            "--no-store-mnemonic is not allowed for ownership claims: the recovery mnemonic is \
+             never printed to stdout/stderr, so an unpersisted mnemonic would be permanently \
+             lost. Omit the flag - the mnemonic is stored in the protected local keystore, and \
+             `enclava key backup` performs the deliberate encrypted export."
+                .into(),
         );
     }
+    Ok(())
+}
 
-    match recovery_mnemonic_capture_action(capture, recovery_mnemonic_confirmation_available()) {
-        RecoveryMnemonicCaptureAction::PromptToStore => {
-            let want_store = Confirm::new()
-                .with_prompt("Store this recovery mnemonic so `enclava key backup` can back it up?")
-                .default(true)
-                .interact()?;
-            if want_store {
-                store_mnemonic_local(paths, org, app, mnemonic)?;
+/// Unattended claims stay disabled until response-loss recovery exists: the TEE
+/// hands out recovery material exactly once and rejects a second claim, so a
+/// claim whose response is lost in an unattended run strands the mnemonic
+/// irrecoverably with nobody watching. Interactive claims at least fail loudly
+/// in front of the operator who just set the unlock password.
+pub(crate) fn claim_session_is_interactive(
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    stdin_is_terminal && stderr_is_terminal
+}
+
+fn ensure_claim_session_for(interactive: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if interactive {
+        return Ok(());
+    }
+    Err(
+        "ownership claims require an interactive terminal: unattended (CI/script) claims are \
+         disabled until response-loss recovery is supported. The TEE returns the one-time \
+         recovery mnemonic only once, so a lost response in an unattended run is unrecoverable. \
+         Run `enclava claim` (or a deploy that auto-claims) from an interactive shell."
+            .into(),
+    )
+}
+
+/// Prepare and validate the private recovery-mnemonic sink before the claim is
+/// sent: reject unsafe sink modes, require an interactive session (unattended
+/// claims are disabled), and prove the protected keystore destination is
+/// writable with the same owner-only atomic-write primitives the post-claim
+/// store uses. Called by the explicit `claim` flow and by
+/// `claim_initial_ownership` (deploy/template auto-claim) before any challenge
+/// or claim request.
+pub(crate) fn prepare_recovery_mnemonic_sink(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    capture: MnemonicCapture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    prepare_recovery_mnemonic_sink_for_session(
+        paths,
+        org,
+        app,
+        capture,
+        claim_session_is_interactive(io::stdin().is_terminal(), io::stderr().is_terminal()),
+    )
+}
+
+/// Testable core of [`prepare_recovery_mnemonic_sink`] with the session
+/// interactivity supplied by the caller.
+pub(crate) fn prepare_recovery_mnemonic_sink_for_session(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    capture: MnemonicCapture,
+    interactive_session: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_recovery_mnemonic_sink_mode(capture)?;
+    ensure_claim_session_for(interactive_session)?;
+    keys::prepare_app_mnemonic_sink(paths, org, app)
+        .map_err(|e| format!("recovery mnemonic sink is not ready for the claim: {e}").into())
+}
+
+/// Persist the one-time recovery mnemonic to the prepared protected sink after
+/// the TEE has committed ownership. The same in-memory result is retried a
+/// bounded number of times; on failure the error carries
+/// [`OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE`], never the mnemonic
+/// itself, and callers must propagate it so dependent actions halt (ownership
+/// is committed and is NOT rolled back).
+pub(crate) fn store_recovery_mnemonic_after_claim(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    mnemonic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_error = String::new();
+    for attempt in 1..=MNEMONIC_PERSIST_ATTEMPTS {
+        match keys::store_app_mnemonic(paths, org, app, mnemonic) {
+            Ok(()) => {
                 eprintln!(
-                    "Recovery mnemonic stored locally. Run `enclava key backup` and keep that file OFF this machine — the local copy is lost if this machine is lost."
+                    "Recovery mnemonic stored in the protected local keystore ({}). Run `enclava key backup` and keep that file off this machine - the local copy is lost if this machine is lost.",
+                    keys::app_mnemonic_path(paths, org, app).display()
                 );
                 return Ok(());
             }
-            // Declined: the operator keeps it offline, so require the standard acknowledgement.
-            confirm_recovery_mnemonic_recorded()?;
-            eprintln!("Recovery mnemonic not stored. It will not be shown again.");
-        }
-        RecoveryMnemonicCaptureAction::Store => {
-            store_mnemonic_local(paths, org, app, mnemonic)?;
-            eprintln!(
-                "Recovery mnemonic stored locally (non-interactive default). Run `enclava key backup` and keep that file OFF this machine — the local copy is lost if this machine is lost."
-            );
-        }
-        RecoveryMnemonicCaptureAction::Skip => {
-            confirm_recovery_mnemonic_recorded()?;
-            eprintln!(
-                "Recovery mnemonic not stored (--no-store-mnemonic). Record it now; it will not be shown again."
-            );
+            Err(err) => {
+                last_error = err.to_string();
+                if attempt < MNEMONIC_PERSIST_ATTEMPTS {
+                    eprintln!(
+                        "Storing the recovery mnemonic failed (attempt {attempt}/{MNEMONIC_PERSIST_ATTEMPTS}); retrying."
+                    );
+                    std::thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
+                }
+            }
         }
     }
-    Ok(())
+    Err(ownership_committed_recovery_backup_incomplete(format!(
+        "persisting the one-time recovery mnemonic to the protected keystore failed \
+         after {MNEMONIC_PERSIST_ATTEMPTS} attempts: {last_error}"
+    )))
 }
 
-/// Like [`present_and_capture_recovery_mnemonic`] but downgrades any presentation failure
-/// to a loud stderr warning instead of an error. Use this — not the fallible form — from
-/// flows that run *after* the TEE has accepted ownership (`claim`, `claim_initial_ownership`
-/// via `deploy`/template deploy): ownership is already recorded server-side, so mnemonic
-/// handling must never turn a successful claim into a reported failure. On failure the
-/// mnemonic is re-printed as a fallback.
-pub(crate) fn present_and_capture_recovery_mnemonic_or_warn(
-    paths: &CliPaths,
-    org: &str,
-    app: &str,
-    mnemonic: &str,
-    capture: MnemonicCapture,
-    output: RecoveryMnemonicOutput,
-) {
-    if let Err(err) =
-        present_and_capture_recovery_mnemonic(paths, org, app, mnemonic, capture, output)
-    {
-        let mut stderr = io::stderr().lock();
-        emit_recovery_mnemonic_interrupted_warning(&mut stderr, mnemonic, &*err);
-    }
-}
-
-/// Best-effort warning for when recovery-mnemonic presentation is interrupted. This is
-/// a last-resort fallback (the claim already succeeded), so further IO errors are ignored.
-fn emit_recovery_mnemonic_interrupted_warning(
-    output: &mut impl Write,
-    mnemonic: &str,
-    err: &dyn std::error::Error,
-) {
-    let _ = writeln!(
-        output,
-        "WARNING: ownership was claimed, but the one-time recovery mnemonic could not be fully presented ({err})."
-    );
-    let _ = writeln!(
-        output,
-        "It is NOT stored anywhere by the CLI; re-printing it here as a fallback - record it now:"
-    );
-    let _ = writeln!(output);
-    let _ = writeln!(output, "    {mnemonic}");
-    let _ = writeln!(output);
-}
-
-fn write_recovery_mnemonic(
-    output: &mut impl Write,
-    mnemonic: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    writeln!(output)?;
-    writeln!(
-        output,
-        "==================== RECOVERY MNEMONIC (shown ONCE) ===================="
-    )?;
-    writeln!(
-        output,
-        "This is the ONLY recovery for your encrypted storage."
-    )?;
-    writeln!(
-        output,
-        "Store it now (the default) and `enclava key backup` can bundle it with your deploy keys; if you skip, it is stored nowhere."
-    )?;
-    writeln!(
-        output,
-        "If you lose this AND your storage password, your data cannot be recovered."
-    )?;
-    writeln!(output)?;
-    writeln!(output, "    {mnemonic}")?;
-    writeln!(output)?;
-    Ok(())
-}
-
-fn confirm_recovery_mnemonic_recorded() -> Result<(), Box<dyn std::error::Error>> {
-    if !recovery_mnemonic_confirmation_available() {
-        return Ok(());
-    }
-
-    loop {
-        let confirmed = Confirm::new()
-            .with_prompt("I have recorded my recovery mnemonic")
-            .default(false)
-            .interact()?;
-        if confirmed {
-            return Ok(());
-        }
-        eprintln!("Please record it now; it will not be shown again after this command exits.");
-    }
-}
-
-fn recovery_mnemonic_confirmation_available() -> bool {
-    recovery_mnemonic_confirmation_required(io::stdin().is_terminal(), io::stderr().is_terminal())
-}
-
-fn recovery_mnemonic_confirmation_required(
-    stdin_is_terminal: bool,
-    prompt_is_terminal: bool,
-) -> bool {
-    stdin_is_terminal && prompt_is_terminal
-}
-
-fn recovery_mnemonic_storage_prompt_required(
-    capture: MnemonicCapture,
-    confirmation_available: bool,
-) -> bool {
-    capture == MnemonicCapture::Store && confirmation_available
-}
-
-fn recovery_mnemonic_capture_action(
-    capture: MnemonicCapture,
-    confirmation_available: bool,
-) -> RecoveryMnemonicCaptureAction {
-    if capture == MnemonicCapture::Skip {
-        RecoveryMnemonicCaptureAction::Skip
-    } else if recovery_mnemonic_storage_prompt_required(capture, confirmation_available) {
-        RecoveryMnemonicCaptureAction::PromptToStore
-    } else {
-        RecoveryMnemonicCaptureAction::Store
-    }
+/// Build the post-commit incomplete-backup error. `detail` must describe the
+/// failure without embedding the mnemonic or any other secret.
+pub(crate) fn ownership_committed_recovery_backup_incomplete(
+    detail: String,
+) -> Box<dyn std::error::Error> {
+    format!(
+        "{OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE}: the TEE accepted ownership and it is \
+         NOT rolled back, but {detail}. The mnemonic is never printed and cannot be requested \
+         again; keep the unlock password safe - without the mnemonic, lost-password recovery \
+         for this app's encrypted storage is impossible. Dependent actions were halted."
+    )
+    .into()
 }
 
 pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -774,79 +725,320 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    // Synthetic, publicly-documented BIP39 test vector; never a real secret.
+    const SYNTHETIC_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
     #[test]
-    fn recovery_mnemonic_writer_includes_scope_warning_and_secret() {
-        let mut output = Vec::new();
-        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
-
-        write_recovery_mnemonic(&mut output, mnemonic).expect("writer should succeed");
-        let output = String::from_utf8(output).expect("output should be utf-8");
-
-        assert!(output.contains("RECOVERY MNEMONIC (shown ONCE)"));
-        assert!(output.contains("enclava key backup"));
-        assert!(output.contains("stored nowhere"));
-        assert!(output.contains(mnemonic));
+    fn claim_session_interactivity_matrix() {
+        assert!(claim_session_is_interactive(true, true));
+        assert!(!claim_session_is_interactive(true, false));
+        assert!(!claim_session_is_interactive(false, true));
+        assert!(!claim_session_is_interactive(false, false));
     }
 
     #[test]
-    fn confirmation_gate_requires_visible_prompt_terminal() {
-        assert!(recovery_mnemonic_confirmation_required(true, true));
-        assert!(!recovery_mnemonic_confirmation_required(true, false));
-        assert!(!recovery_mnemonic_confirmation_required(false, true));
-        assert!(!recovery_mnemonic_confirmation_required(false, false));
+    fn sink_mode_rejects_no_store_before_claim_with_guidance() {
+        let err = validate_recovery_mnemonic_sink_mode(MnemonicCapture::Skip)
+            .expect_err("--no-store-mnemonic must be rejected before the claim");
+        let msg = err.to_string();
+        assert!(msg.contains("--no-store-mnemonic"));
+        assert!(msg.contains("never printed"));
+        assert!(msg.contains("enclava key backup"));
+
+        validate_recovery_mnemonic_sink_mode(MnemonicCapture::Store)
+            .expect("default store mode must be allowed");
     }
 
     #[test]
-    fn capture_action_honors_no_store_mnemonic() {
-        assert_eq!(
-            recovery_mnemonic_capture_action(MnemonicCapture::Store, true),
-            RecoveryMnemonicCaptureAction::PromptToStore
-        );
-        assert_eq!(
-            recovery_mnemonic_capture_action(MnemonicCapture::Store, false),
-            RecoveryMnemonicCaptureAction::Store
-        );
-        assert_eq!(
-            recovery_mnemonic_capture_action(MnemonicCapture::Skip, true),
-            RecoveryMnemonicCaptureAction::Skip
-        );
-        assert_eq!(
-            recovery_mnemonic_capture_action(MnemonicCapture::Skip, false),
-            RecoveryMnemonicCaptureAction::Skip
-        );
-    }
-
-    #[test]
-    fn interrupted_presentation_warning_reprints_mnemonic() {
-        let mut output = Vec::new();
-        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let err: Box<dyn std::error::Error> = "stdin closed".into();
-
-        emit_recovery_mnemonic_interrupted_warning(&mut output, mnemonic, &*err);
-
-        let output = String::from_utf8(output).expect("warning should be utf-8");
-        assert!(output.contains("WARNING"));
-        assert!(output.contains("ownership was claimed"));
-        assert!(output.contains("NOT stored"));
-        assert!(output.contains("record it now"));
-        assert!(output.contains(mnemonic));
-        assert!(output.contains("stdin closed"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn capture_storage_helper_persists_default() {
-        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-
+    fn preclaim_gate_rejects_unsafe_mode_before_touching_the_keystore() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
-        store_mnemonic_local(&paths, "org-a", "shell1", mnemonic)
-            .expect("default capture storage helper must persist");
+
+        let err = prepare_recovery_mnemonic_sink_for_session(
+            &paths,
+            "org-a",
+            "shell1",
+            MnemonicCapture::Skip,
+            true,
+        )
+        .expect_err("unsafe sink mode must be rejected pre-claim");
+
+        assert!(err.to_string().contains("--no-store-mnemonic"));
+        // Rejected before any sink preparation side effects.
+        assert!(!paths.keys_dir.join("org-a").exists());
+    }
+
+    #[test]
+    fn preclaim_gate_rejects_unattended_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+
+        let err = prepare_recovery_mnemonic_sink_for_session(
+            &paths,
+            "org-a",
+            "shell1",
+            MnemonicCapture::Store,
+            false,
+        )
+        .expect_err("unattended claims must be rejected pre-claim");
+
+        let msg = err.to_string();
+        assert!(msg.contains("interactive terminal"));
+        assert!(msg.contains("unattended"));
+        // No mnemonic exists yet at gate time; the message must stay secret-free.
+        assert!(!msg.contains(SYNTHETIC_MNEMONIC));
+        // Rejected before any sink preparation side effects.
+        assert!(!paths.keys_dir.join("org-a").exists());
+    }
+
+    #[test]
+    fn preclaim_gate_rejects_unwritable_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        // A directory squatting on the REAL atomic-write temp name makes the
+        // post-claim store fail on any uid (root would bypass permission-based
+        // setups); the gate must reject it before the claim is sent.
+        let org_dir = paths.keys_dir.join("org-a");
+        std::fs::create_dir_all(org_dir.join("shell1.tmp")).unwrap();
+
+        let err = prepare_recovery_mnemonic_sink_for_session(
+            &paths,
+            "org-a",
+            "shell1",
+            MnemonicCapture::Store,
+            true,
+        )
+        .expect_err("unwritable sink must be rejected before the claim");
+
+        let msg = err.to_string();
+        assert!(msg.contains("sink is not ready"));
+        assert!(!msg.contains(SYNTHETIC_MNEMONIC));
+    }
+
+    #[test]
+    fn preclaim_gate_rejects_directory_at_either_real_destination_path() {
+        // The store persists to `{app}.mnemonic` via an atomic rename from
+        // `{app}.tmp`; a directory at either REAL path guarantees the post-claim
+        // store fails, so the pre-claim gate must reject both — behavioral
+        // preflight failure, no mocks needed.
+        for blocked in ["shell1.mnemonic", "shell1.tmp"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+            std::fs::create_dir_all(paths.keys_dir.join("org-a").join(blocked)).unwrap();
+
+            let err = prepare_recovery_mnemonic_sink_for_session(
+                &paths,
+                "org-a",
+                "shell1",
+                MnemonicCapture::Store,
+                true,
+            )
+            .expect_err("blocked real destination must be rejected before the claim");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("sink is not ready"),
+                "gate must report the sink failure for {blocked}: {msg}"
+            );
+            assert!(
+                !msg.contains(SYNTHETIC_MNEMONIC),
+                "preflight failure must not leak the mnemonic for {blocked}"
+            );
+            // Rejected pre-claim: the blocking directory is untouched.
+            assert!(paths.keys_dir.join("org-a").join(blocked).is_dir());
+        }
+    }
+
+    #[test]
+    fn preclaim_gate_rejection_preserves_existing_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell1", "prior backup mnemonic").unwrap();
+        // Force preflight failure via the temp path while a valid backup exists.
+        std::fs::create_dir_all(paths.keys_dir.join("org-a").join("shell1.tmp")).unwrap();
+
+        prepare_recovery_mnemonic_sink_for_session(
+            &paths,
+            "org-a",
+            "shell1",
+            MnemonicCapture::Store,
+            true,
+        )
+        .expect_err("blocked temp path must fail preflight");
+
+        // The prior mnemonic backup survives the rejected preflight untouched.
         assert_eq!(
             keys::load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
-            Some(mnemonic.to_string())
+            Some("prior backup mnemonic".to_string())
         );
+    }
+
+    #[test]
+    fn preclaim_gate_prepares_sink_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+
+        if keys::secret_rename_durability_supported() {
+            prepare_recovery_mnemonic_sink_for_session(
+                &paths,
+                "org-a",
+                "shell1",
+                MnemonicCapture::Store,
+                true,
+            )
+            .expect("interactive store-mode sink must be prepared");
+
+            assert!(paths.keys_dir.join("org-a").is_dir());
+            assert!(!paths.keys_dir.join("org-a").join("shell1.tmp").exists());
+        } else {
+            // Deliberate fail-closed behavior: without proven secret-rename
+            // durability the pre-claim gate refuses instead of preparing a
+            // sink whose post-claim write cannot be proven durable -- and it
+            // refuses before any path work, so the claim is never sent with
+            // an unprovable sink (the before-any-network ordering itself is
+            // pinned by the claim_recovery_sink_tests source contracts).
+            let err = prepare_recovery_mnemonic_sink_for_session(
+                &paths,
+                "org-a",
+                "shell1",
+                MnemonicCapture::Store,
+                true,
+            )
+            .expect_err("non-Unix must refuse sink preparation before the claim");
+            assert!(
+                err.to_string()
+                    .contains("claim sink preparation is unsupported on this platform"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                !paths.keys_dir.join("org-a").exists(),
+                "the non-Unix refusal must precede any filesystem mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn store_after_claim_success_persists_to_protected_keystore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+
+        store_recovery_mnemonic_after_claim(&paths, "org-a", "shell1", SYNTHETIC_MNEMONIC)
+            .expect("post-claim persistence must succeed on a prepared sink");
+
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some(SYNTHETIC_MNEMONIC.to_string())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(keys::app_mnemonic_path(&paths, "org-a", "shell1"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "stored mnemonic must be owner-only");
+        }
+    }
+
+    #[test]
+    fn store_after_claim_forced_failure_is_incomplete_and_never_leaks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        // Block every store attempt on any uid: a directory squatting on the
+        // atomic-write temp name for the real mnemonic file.
+        let org_dir = paths.keys_dir.join("org-a");
+        std::fs::create_dir_all(org_dir.join("shell1.tmp")).unwrap();
+
+        let err =
+            store_recovery_mnemonic_after_claim(&paths, "org-a", "shell1", SYNTHETIC_MNEMONIC)
+                .expect_err("forced storage failure must surface after the claim committed");
+
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with(OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE),
+            "error must carry the stable incomplete-backup code: {msg}"
+        );
+        assert!(msg.contains("NOT rolled back"));
+        assert!(msg.contains("Dependent actions were halted"));
+        assert!(
+            !msg.contains(SYNTHETIC_MNEMONIC),
+            "incomplete-backup error must never embed the mnemonic"
+        );
+        // Nothing may have been persisted under the failure.
+        assert!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn response_loss_and_missing_mnemonic_errors_are_incomplete_and_secret_free() {
+        let response_lost = ownership_committed_recovery_backup_incomplete(
+            "the claim response was lost after the TEE committed ownership, so the one-time recovery mnemonic was never received".to_string(),
+        )
+        .to_string();
+        assert!(response_lost.starts_with(OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE));
+        assert!(response_lost.contains("never received"));
+        assert!(response_lost.contains("NOT rolled back"));
+        assert!(!response_lost.contains(SYNTHETIC_MNEMONIC));
+
+        let missing = ownership_committed_recovery_backup_incomplete(
+            "the TEE's claim response contained no recovery mnemonic".to_string(),
+        )
+        .to_string();
+        assert!(missing.starts_with(OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE));
+        assert!(!missing.contains(SYNTHETIC_MNEMONIC));
+    }
+
+    #[test]
+    fn claim_flow_gates_the_sink_before_any_network_claim() {
+        let source = include_str!("ownership.rs");
+        let start = source.find("pub async fn claim").expect("claim exists");
+        let end = start
+            + source[start..]
+                .find("fn mnemonic_capture_from_flags")
+                .expect("apparatus follows claim");
+        let body = &source[start..end];
+
+        let gate = body
+            .find("prepare_recovery_mnemonic_sink(")
+            .expect("claim runs the pre-claim sink gate");
+        let challenge = body
+            .find("bootstrap_challenge")
+            .expect("claim requests a challenge");
+        let claim = body.find("bootstrap_claim").expect("claim sends the claim");
+        assert!(
+            gate < challenge && challenge < claim,
+            "sink gate must reject before any challenge or claim request"
+        );
+
+        let store = body
+            .find("store_recovery_mnemonic_after_claim")
+            .expect("claim persists the mnemonic post-claim");
+        assert!(store > claim);
+        assert!(
+            !body.contains("present_and_capture_recovery_mnemonic"),
+            "claim must not use the removed stdout/stderr presentation path"
+        );
+    }
+
+    #[test]
+    fn ownership_module_never_prints_the_mnemonic_variable() {
+        let source = include_str!("ownership.rs");
+        for line in source.lines() {
+            if line.contains("println!")
+                || line.contains("eprintln!")
+                || line.contains("write!")
+                || line.contains("writeln!")
+            {
+                assert!(
+                    !line.contains("{mnemonic"),
+                    "stdout/stderr statement must not interpolate the mnemonic: {line}"
+                );
+            }
+        }
     }
 
     #[test]

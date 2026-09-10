@@ -1,7 +1,8 @@
 use base64::Engine as _;
 use enclava_common::canonical::ce_v1_decode;
 use enclava_verifier::{
-    CheckOutcome, Verdict, VerificationContext, canonical_result_sha256, verify,
+    CheckOutcome, TrustPolicy, Verdict, VerificationContext, canonical_result_sha256,
+    parse_proof_bundle, verify,
 };
 
 fn fixture() -> (Vec<u8>, Vec<u8>) {
@@ -112,6 +113,137 @@ fn rejected_measurement_policy() -> Vec<u8> {
         .unwrap()
         .replacen(measurement, &"00".repeat(48), 1)
         .into_bytes()
+}
+
+fn deployment_pinned_policy(deployment_ids: serde_json::Value) -> Vec<u8> {
+    let (_, policy) = fixture();
+    let mut policy: serde_json::Value = serde_json::from_slice(&policy).unwrap();
+    policy["target"]["deployment_ids"] = deployment_ids;
+    serde_json::to_vec(&policy).unwrap()
+}
+
+fn observed_deploy_id(bundle: &[u8]) -> String {
+    let proof = parse_proof_bundle(bundle).unwrap();
+    let artifacts: serde_json::Value =
+        serde_json::from_slice(proof.workload_artifacts_json).unwrap();
+    artifacts["descriptor_payload"]["deploy_id"]
+        .as_str()
+        .expect("fixture descriptor carries deploy_id")
+        .into()
+}
+
+fn deployment_identity_check(
+    result: &enclava_verifier::AppraisalResult,
+) -> &enclava_verifier::CheckResult {
+    result
+        .checks
+        .iter()
+        .find(|check| check.id == "deployment.identity")
+        .expect("deployment.identity check is always emitted for verified artifacts")
+}
+
+#[test]
+fn pinned_deployment_id_admits_only_the_exact_retained_deployment() {
+    let (bundle, _) = fixture();
+    let deploy_id = observed_deploy_id(&bundle);
+
+    let pinned = deployment_pinned_policy(serde_json::json!([deploy_id.clone()]));
+    let parsed = TrustPolicy::parse(&pinned).expect("policy with deployment_ids parses");
+    assert_eq!(parsed.target.deployment_ids, Some(vec![deploy_id.clone()]));
+    let result = verify(&bundle, &pinned, context());
+    assert_eq!(result.verdict, Verdict::Pass, "{:#?}", result.checks);
+    let identity = deployment_identity_check(&result);
+    assert_eq!(identity.outcome, CheckOutcome::Pass);
+    assert_eq!(identity.reason_code, "OK");
+
+    // Same organization, application, and image digest: only the pinned
+    // signed deployment differs, and the allowlist must reject it.
+    let other_deployment =
+        deployment_pinned_policy(serde_json::json!(["11111111-2222-4333-8444-555555555555"]));
+    let parsed = TrustPolicy::parse(&other_deployment).unwrap();
+    assert_eq!(
+        parsed.target.deployment_ids,
+        Some(vec!["11111111-2222-4333-8444-555555555555".to_string()])
+    );
+    let result = verify(&bundle, &other_deployment, context());
+    assert_eq!(result.verdict, Verdict::Fail, "{:#?}", result.checks);
+    let identity = deployment_identity_check(&result);
+    assert_eq!(identity.outcome, CheckOutcome::Fail);
+    assert_eq!(identity.reason_code, "DEPLOYMENT_IDENTITY_REJECTED");
+}
+
+#[test]
+fn empty_or_malformed_deployment_allowlists_reject_every_deployment() {
+    let (bundle, _) = fixture();
+    for ids in [
+        serde_json::json!([]),
+        serde_json::json!([""]),
+        serde_json::json!(["not-a-uuid"]),
+        serde_json::json!([observed_deploy_id(&bundle).to_uppercase()]),
+    ] {
+        let policy = deployment_pinned_policy(ids.clone());
+        let parsed = TrustPolicy::parse(&policy)
+            .unwrap_or_else(|| panic!("allowlist {ids} keeps the policy parseable"));
+        let expected: Vec<String> = ids
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(parsed.target.deployment_ids, Some(expected));
+        let result = verify(&bundle, &policy, context());
+        assert_eq!(result.verdict, Verdict::Fail, "allowlist {ids} passed");
+        let identity = deployment_identity_check(&result);
+        assert_eq!(identity.outcome, CheckOutcome::Fail);
+        assert_eq!(identity.reason_code, "DEPLOYMENT_IDENTITY_REJECTED");
+    }
+}
+
+#[test]
+fn explicit_null_or_non_array_deployment_ids_is_malformed_policy() {
+    let (bundle, _) = fixture();
+    for ids in [
+        serde_json::json!(null),
+        serde_json::json!("013c5158-971a-49f0-98b2-00ae125c7aa5"),
+        serde_json::json!(7),
+        serde_json::json!({}),
+        serde_json::json!([null]),
+        serde_json::json!([42]),
+    ] {
+        let policy = deployment_pinned_policy(ids.clone());
+        assert!(
+            TrustPolicy::parse(&policy).is_none(),
+            "deployment_ids {ids} must not parse"
+        );
+        let result = verify(&bundle, &policy, context());
+        assert_eq!(
+            result.verdict,
+            Verdict::Fail,
+            "deployment_ids {ids} accepted"
+        );
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|check| check.id == "policy.structure"
+                    && check.outcome == CheckOutcome::Fail
+                    && check.reason_code == "MALFORMED_POLICY"),
+            "deployment_ids {ids} must fail policy.structure with MALFORMED_POLICY"
+        );
+    }
+}
+
+#[test]
+fn absent_deployment_allowlist_preserves_the_broad_identity_contract() {
+    let (bundle, policy) = fixture();
+    let parsed = TrustPolicy::parse(&policy).expect("v1 policy without deployment_ids parses");
+    assert!(parsed.target.deployment_ids.is_none());
+    let result = verify(&bundle, &policy, context());
+    assert_eq!(result.verdict, Verdict::Pass, "{:#?}", result.checks);
+    assert_eq!(
+        deployment_identity_check(&result).outcome,
+        CheckOutcome::Pass
+    );
 }
 
 #[test]

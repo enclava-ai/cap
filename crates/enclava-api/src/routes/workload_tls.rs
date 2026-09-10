@@ -2,9 +2,11 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Json, response::IntoResponse};
 use base64::Engine;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::acme::IssuanceFailure;
 use crate::state::AppState;
 use crate::workload_tls_timing::{Phase, RequestTiming};
 
@@ -173,12 +175,39 @@ async fn dns01_certificate_inner(
             }),
         )
             .into_response(),
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "acme_certificate_issuance_failed", "detail": err.to_string()})),
-        )
-            .into_response(),
+        Err(failure) => issuance_failure_response(&failure).into_response(),
     }
+}
+
+/// Bounded, provider-text-free response for a terminal ACME issuance failure.
+///
+/// The `error` field keeps the value clients recognize for generic failures
+/// (`acme_certificate_issuance_failed`) and carries `acme_rate_limited` only
+/// when the terminal ACME problem type was exactly
+/// `urn:ietf:params:acme:error:rateLimited`. `terminal` marks that this
+/// issuance attempt ended. `retry_after` is a validated UTC timestamp from
+/// the failing response's `Retry-After` header, or null when the provider
+/// did not supply a usable one. Problem details, hostnames, request URLs and
+/// other provider text never appear here or in the log.
+fn issuance_failure_response(failure: &IssuanceFailure) -> (StatusCode, Json<Value>) {
+    let retry_after = failure.retry_after.map(format_retry_after);
+    tracing::warn!(
+        code = failure.code.as_str(),
+        retry_after = retry_after.as_deref(),
+        "ACME DNS-01 certificate issuance attempt failed"
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({
+            "error": failure.code.as_str(),
+            "terminal": true,
+            "retry_after": retry_after,
+        })),
+    )
+}
+
+fn format_retry_after(deadline: DateTime<Utc>) -> String {
+    deadline.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn attested_or_declared_init_data_hash(
@@ -287,6 +316,8 @@ fn allowed_certificate_hostnames(descriptor: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acme::IssuanceFailureCode;
+    use chrono::{DateTime, Utc};
 
     #[test]
     fn certificate_hostnames_are_limited_to_attested_descriptor_domains() {
@@ -316,5 +347,78 @@ mod tests {
             attested_or_declared_init_data_hash(&json!({}), &body),
             Some(vec![0xab; 32])
         );
+    }
+
+    #[test]
+    fn issuance_failure_response_contract_is_bounded_and_terminal() {
+        let deadline = DateTime::parse_from_rfc3339("2026-09-10T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cases = [
+            (
+                IssuanceFailure {
+                    code: IssuanceFailureCode::RateLimited,
+                    retry_after: Some(deadline),
+                },
+                json!({
+                    "error": "acme_rate_limited",
+                    "terminal": true,
+                    "retry_after": "2026-09-10T09:30:00Z",
+                }),
+            ),
+            (
+                IssuanceFailure {
+                    code: IssuanceFailureCode::Failed,
+                    retry_after: None,
+                },
+                // Generic failures keep the exact error value clients already
+                // recognize; the leaking detail field is gone.
+                json!({
+                    "error": "acme_certificate_issuance_failed",
+                    "terminal": true,
+                    "retry_after": null,
+                }),
+            ),
+        ];
+        for (failure, expected) in cases {
+            let (status, Json(body)) = issuance_failure_response(&failure);
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body, expected);
+            let serialized = serde_json::to_string(&body).unwrap();
+            assert!(!serialized.contains("detail"));
+        }
+    }
+
+    #[test]
+    fn provider_secrets_never_reach_the_issuance_failure_response() {
+        let secret = "SYNTHETIC-PROVIDER-SECRET-7f3a91c2";
+        let problem = instant_acme::Problem {
+            r#type: Some("urn:ietf:params:acme:error:rateLimited".into()),
+            detail: Some(format!("quota window exceeded for {secret}")),
+            status: Some(429),
+            subproblems: Vec::new(),
+        };
+        let error = crate::acme::AcmeError::Acme(instant_acme::Error::Api(problem));
+        // The legacy response leaked exactly this provider text.
+        assert!(error.to_string().contains(secret));
+
+        let failures = crate::acme::FailureHeaders::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Retry-After",
+            "120"
+                .parse::<axum::http::HeaderValue>()
+                .expect("header value"),
+        );
+        failures.observe_response(StatusCode::TOO_MANY_REQUESTS, &headers, Utc::now());
+
+        let failure = IssuanceFailure::diagnose(&error, &failures);
+        let (status, Json(body)) = issuance_failure_response(&failure);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "acme_rate_limited");
+        assert_eq!(body["terminal"], true);
+        assert!(body["retry_after"].is_string());
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains(secret));
     }
 }

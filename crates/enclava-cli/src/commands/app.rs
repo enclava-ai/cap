@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::commands::ownership::MnemonicCapture;
+use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
 use crate::commands::{counted_progress, format_duration, timed_progress};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -29,7 +29,9 @@ use enclava_cli::keyring::{
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
-use enclava_cli::tee_client::{TeeClient, TeeError};
+use enclava_cli::tee_client::{
+    TeeBootstrapStatus, TeeClient, TeeError, TerminalBootstrapError, parse_terminal_bootstrap_error,
+};
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
     log_keypair_from_private_key,
@@ -245,6 +247,7 @@ fn deploy_needs_initial_claim(
 }
 
 mod signing;
+pub(crate) use enclava_cli::descriptor::TrustedDeploymentExpectation;
 #[cfg(test)]
 pub(crate) use signing::{ConfidentialAppForCcHash, confidential_app_for_cc_hash};
 pub(crate) use signing::{
@@ -391,10 +394,10 @@ pub struct DeployArgs {
     /// File containing the storage password for non-interactive password-mode deploys.
     #[arg(long = "storage-password-file", value_name = "PATH")]
     pub storage_password_file: Option<PathBuf>,
-    /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
+    /// Persist the recovery mnemonic to the protected local keystore so `enclava key backup` can back it up (default).
     #[arg(long, conflicts_with = "no_store_mnemonic")]
     pub store_mnemonic: bool,
-    /// Do NOT persist the recovery mnemonic (shown once only; opt out of backup coverage).
+    /// Unsupported for password-mode first deploys (which auto-claim): rejected before the deployment is submitted.
     #[arg(long, conflicts_with = "store_mnemonic")]
     pub no_store_mnemonic: bool,
 }
@@ -419,11 +422,16 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     if is_password_mode {
         storage_password.ensure_available_for_password_mode("password-mode deploy")?;
     }
-    let capture = if args.no_store_mnemonic {
-        MnemonicCapture::Skip
-    } else {
-        MnemonicCapture::Store
-    };
+    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
+    // A fresh password-mode deploy auto-claims ownership on first boot; refuse the
+    // no-store sink mode before submitting anything, while the run can still stop
+    // without side effects. (The authoritative pre-claim gate also re-checks this
+    // inside `claim_initial_ownership`.)
+    if capture == MnemonicCapture::Skip
+        && deploy_needs_initial_claim(is_password_mode, None, &app.status)
+    {
+        crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
+    }
     let pb = ProgressBar::new(5);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -445,6 +453,9 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         workload_security_profile: WorkloadSecurityProfile::Restricted,
     })
     .await?;
+    // Locally trusted deployment identity, captured before the signed blobs
+    // are moved into the deploy request.
+    let trusted_deployment = signed_blobs.deployment;
 
     let req = DeployRequest {
         image: Some(args.image.clone()),
@@ -491,12 +502,22 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     if needs_initial_claim {
         pb.set_position(3);
         pb.set_message("Waiting for ownership claim endpoint...");
-        if wait_for_bootstrap_endpoint(&api, &app_name, max_wait, poll_interval, &pb).await? {
+        if wait_for_bootstrap_endpoint(
+            &api,
+            &app_name,
+            DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+            max_wait,
+            poll_interval,
+            &pb,
+        )
+        .await?
+        {
             claim_initial_ownership(
                 &api,
                 &paths,
                 &cli_config,
                 &app_name,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                 &storage_password,
                 capture,
             )
@@ -515,7 +536,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             wait_for_deploy_runtime(
                 &api,
                 &app_name,
-                &resp.deployment_id,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                 max_wait,
                 poll_interval,
                 &pb,
@@ -527,6 +548,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
                 ensure_password_storage_unlocked_for_config(
                     &api,
                     &app_name,
+                    DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
                     &pb,
                     &storage_password,
                 )
@@ -546,7 +568,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         wait_for_deploy_runtime(
             &api,
             &app_name,
-            &resp.deployment_id,
+            DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
             max_wait,
             poll_interval,
             &pb,
@@ -554,8 +576,14 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         )
         .await?;
         if deploy_should_unlock_before_config(is_password_mode, false, !config_pairs.is_empty()) {
-            ensure_password_storage_unlocked_for_config(&api, &app_name, &pb, &storage_password)
-                .await?;
+            ensure_password_storage_unlocked_for_config(
+                &api,
+                &app_name,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+                &pb,
+                &storage_password,
+            )
+            .await?;
         }
     }
 
@@ -578,7 +606,16 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         let (_attestation, tee) = tee.attest_receipt_key().await?;
 
         for (index, (key, value)) in config_pairs.iter().enumerate() {
-            set_deploy_config(&tee, key, value, &token_resp.token).await?;
+            set_deploy_config(
+                &api,
+                &tee,
+                &app_name,
+                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+                key,
+                value,
+                &token_resp.token,
+            )
+            .await?;
             api.sync_config_key(&app_name, key, false).await?;
             pb.set_message(counted_progress(
                 "Customer config",
@@ -596,7 +633,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     wait_for_deployment_completion(
         &api,
         &app_name,
-        &resp.deployment_id,
+        DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
         health_timeout,
         Duration::from_secs(2),
         &pb,
@@ -620,18 +657,33 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn set_deploy_config(
+    api: &ApiClient,
     tee: &TeeClient,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
     key: &str,
     value: &str,
     token: &str,
-) -> Result<(), TeeError> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match tee.config_set(key, value, token).await {
             Err(error) if should_retry_deploy_config(&error) && Instant::now() < deadline => {
+                // The attested channel that just refused the write also
+                // carries any terminal bootstrap diagnostic: stop promptly
+                // instead of retrying into the deadline, but only when CAP's
+                // evidence connects the endpoint to the expected deployment,
+                // and under a probe budget capped to the remaining deadline.
+                if let Some(diagnostic) = deployment_bound_terminal_bootstrap_error_on_channel(
+                    api, app_name, deployment, tee, deadline,
+                )
+                .await
+                {
+                    return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            result => return result,
+            result => return result.map_err(|error| error.into()),
         }
     }
 }
@@ -640,9 +692,263 @@ fn should_retry_deploy_config(error: &TeeError) -> bool {
     matches!(error, TeeError::Tee { status: 423, .. })
 }
 
+/// Stable, provider-detail-free message for an authenticated terminal
+/// bootstrap failure: the recognized error code plus the optional validated
+/// retry deadline, in a form a PaaS verifier can safely match later.
+pub(crate) fn terminal_bootstrap_failure_message(
+    app_name: &str,
+    diagnostic: &TerminalBootstrapError,
+) -> String {
+    format!(
+        "terminal bootstrap failure for app {app_name}: {}; run `enclava status --app {app_name}` for the latest state",
+        diagnostic.stable_summary()
+    )
+}
+
+/// Minimum spacing between terminal-diagnostic TEE probes inside long
+/// API-only wait loops: bounds attestation cost while keeping the stop
+/// prompt after a terminal failure.
+const TEE_TERMINAL_DIAGNOSTIC_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a terminal-diagnostic TEE probe is due in a long wait loop.
+pub(crate) fn tee_terminal_diagnostic_probe_due(last: &mut Option<Instant>) -> bool {
+    if last
+        .as_ref()
+        .is_some_and(|probed_at| probed_at.elapsed() < TEE_TERMINAL_DIAGNOSTIC_PROBE_INTERVAL)
+    {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+
+/// Deployment identity for a wait: the CAP record id the wait is bound to
+/// (deployment-failure checks, messages, deadlines) plus the locally trusted
+/// expectation captured at signing time. The expectation is present only for
+/// fresh signed deploys whose returned deployment id equals the signed
+/// descriptor's `deploy_id`; resumed or rollback paths carry `None` and keep
+/// existing timeout behavior -- they must never attribute exact execution
+/// terminal.
+#[derive(Clone, Copy)]
+pub(crate) struct DeploymentWait<'a> {
+    pub deployment_id: &'a str,
+    pub expectation: Option<&'a TrustedDeploymentExpectation>,
+}
+
+impl<'a> DeploymentWait<'a> {
+    pub(crate) fn new(deployment_id: &'a str) -> Self {
+        Self {
+            deployment_id,
+            expectation: None,
+        }
+    }
+
+    /// Bind a wait to a signed deployment, but only when CAP (or the PaaS
+    /// forwarding to CAP) returned exactly the deployment id the signed
+    /// descriptor carries. A mismatched returned id invalidates the trusted
+    /// expectation: the wait falls back to untrusted timeout behavior.
+    pub(crate) fn trusted(
+        deployment_id: &'a str,
+        expectation: Option<&'a TrustedDeploymentExpectation>,
+    ) -> Self {
+        Self {
+            deployment_id,
+            expectation: expectation.filter(|expectation| {
+                !deployment_id.is_empty()
+                    && deployment_id != "pending"
+                    && expectation.deploy_id == deployment_id
+            }),
+        }
+    }
+}
+
+/// Hard cap on one complete terminal-diagnostic probe (CAP endpoint lookup,
+/// attested read), so stalled CAP lookups, slow attestation, or KDS retry
+/// storms can never exceed the enclosing wait.
+const TERMINAL_DIAGNOSTIC_PROBE_BUDGET: Duration = Duration::from_secs(15);
+
+/// Budget for one terminal-diagnostic probe: the hard cap, never more than
+/// the enclosing wait's remaining time.
+pub(crate) fn terminal_diagnostic_budget(wait_deadline: Option<Instant>) -> Duration {
+    TERMINAL_DIAGNOSTIC_PROBE_BUDGET.min(match wait_deadline {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        None => TERMINAL_DIAGNOSTIC_PROBE_BUDGET,
+    })
+}
+
+/// One complete terminal-diagnostic probe under a hard budget.
+///
+/// Authorization requires the locally trusted deployment expectation and a
+/// verified endpoint-to-deployment binding: the SNP HOST_DATA (launch
+/// measurement) verified over the SAME SPKI-pinned client used for the
+/// `/status` read must equal the expectation's cc-init-data hash. The proxy
+/// `/attestation` binds nonce + TLS leaf SPKI pre-ACME, the AMD chain
+/// authenticates the report, and CAP validates the signed descriptor's hash
+/// when rendering the deployment (revalidated at apply), so matching
+/// HOST_DATA proves the responding TEE executes this deployment's launch
+/// configuration and the SPKI pin keeps the status read on that TEE.
+///
+/// Fresh-observation and deployment-history checks are deliberately NOT used
+/// as authorization: they cannot prove which TEE serves the endpoint. Any
+/// failure -- missing expectation, unattested client, HOST_DATA mismatch
+/// (e.g. an old deployment's TEE still serving), stalled lookup or read --
+/// yields no diagnostic, and the caller's existing deadline governs.
+pub(crate) async fn terminal_diagnostic_probe_with_budget(
+    api: &ApiClient,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
+    attested: Option<&TeeClient>,
+    budget: Duration,
+) -> Option<TerminalBootstrapError> {
+    if budget.is_zero() {
+        return None;
+    }
+    tokio::time::timeout(budget, async {
+        let expectation = deployment.expectation?;
+        match attested {
+            Some(attested) => terminal_diagnostic_on_attested(attested, expectation).await,
+            None => {
+                let endpoint = api.get_unlock_endpoint(app_name).await.ok()?;
+                let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
+                    &endpoint.tee_url,
+                    endpoint.tee_resolve_ip,
+                );
+                let (_attestation, attested_tee) = tee.attest_receipt_key().await.ok()?;
+                terminal_diagnostic_on_attested(&attested_tee, expectation).await
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Read a terminal diagnostic over an attested (SPKI-pinned) client, but only
+/// when the client's verified SNP HOST_DATA binds it to the expected
+/// deployment's launch hash.
+async fn terminal_diagnostic_on_attested(
+    attested: &TeeClient,
+    expectation: &TrustedDeploymentExpectation,
+) -> Option<TerminalBootstrapError> {
+    // HOST_DATA alone is hypervisor-supplied launch input: the authenticated
+    // firmware measurement must match the existing expectation as well, or
+    // the endpoint is not proven to execute this deployment's expected
+    // firmware.
+    if !enclava_cli::tee_client::launch_identity_binds_deployment(
+        attested.verified_launch_identity().as_ref(),
+        &expectation.expected_cc_init_data_hash,
+        &expectation.expected_firmware_measurement,
+    ) {
+        return None;
+    }
+    attested
+        .bounded_status_json()
+        .await
+        .ok()
+        .and_then(|body| parse_terminal_bootstrap_error(&body))
+}
+
+/// Deployment-bound terminal-diagnostic probe for waits that do not hold an
+/// attested client: the probe attests the app endpoint itself, entirely under
+/// the budget derived from the enclosing wait's deadline.
+pub(crate) async fn deployment_bound_terminal_bootstrap_error(
+    api: &ApiClient,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
+    wait_deadline: Instant,
+) -> Option<TerminalBootstrapError> {
+    terminal_diagnostic_probe_with_budget(
+        api,
+        app_name,
+        deployment,
+        None,
+        terminal_diagnostic_budget(Some(wait_deadline)),
+    )
+    .await
+}
+
+/// Deployment-bound terminal-diagnostic probe over an attested channel a
+/// caller already holds, entirely under the budget derived from the enclosing
+/// wait's deadline.
+pub(crate) async fn deployment_bound_terminal_bootstrap_error_on_channel(
+    api: &ApiClient,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
+    attested: &TeeClient,
+    wait_deadline: Instant,
+) -> Option<TerminalBootstrapError> {
+    terminal_diagnostic_probe_with_budget(
+        api,
+        app_name,
+        deployment,
+        Some(attested),
+        terminal_diagnostic_budget(Some(wait_deadline)),
+    )
+    .await
+}
+
+/// Classification of one attested direct-TEE `/status` body in the runtime
+/// wait. A recognized terminal diagnostic outranks the direct-fallback
+/// success states: a TEE whose storage is locked or unlocked but whose
+/// bootstrap failed terminally is never reported as ready.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirectTeeRuntimeOutcome {
+    Terminal(TerminalBootstrapError),
+    Locked,
+    Unlocked,
+    Waiting,
+}
+
+pub(crate) fn direct_tee_runtime_outcome(status: &serde_json::Value) -> DirectTeeRuntimeOutcome {
+    if let Some(diagnostic) = parse_terminal_bootstrap_error(status) {
+        return DirectTeeRuntimeOutcome::Terminal(diagnostic);
+    }
+    match tee_unlock_state(status) {
+        "locked" => DirectTeeRuntimeOutcome::Locked,
+        "unlocked" => DirectTeeRuntimeOutcome::Unlocked,
+        _ => DirectTeeRuntimeOutcome::Waiting,
+    }
+}
+
+impl DirectTeeRuntimeOutcome {
+    /// The recognized terminal diagnostic, when this outcome is terminal.
+    pub(crate) fn terminal_diagnostic(&self) -> Option<TerminalBootstrapError> {
+        match self {
+            DirectTeeRuntimeOutcome::Terminal(diagnostic) => Some(diagnostic.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Decision from one safe [`TeeBootstrapStatus`] read in the bootstrap
+/// endpoint waits. A terminal diagnostic outranks an already-claimed state so
+/// a claimed-but-not-ready failure is never reported as success.
+pub(crate) enum BootstrapEndpointStatusDecision {
+    /// A recognized terminal failure is present: the caller must confirm the
+    /// endpoint-to-deployment binding before stopping with the stable code.
+    Terminal,
+    /// Ownership already claimed; the initial-claim flow may be skipped.
+    AlreadyClaimed,
+    /// No terminal failure and not claimed: keep waiting.
+    Waiting,
+}
+
+pub(crate) fn bootstrap_endpoint_status_decision(
+    status: &TeeBootstrapStatus,
+) -> BootstrapEndpointStatusDecision {
+    if status.terminal_bootstrap_error.is_some() {
+        BootstrapEndpointStatusDecision::Terminal
+    } else if status.claimed {
+        BootstrapEndpointStatusDecision::AlreadyClaimed
+    } else {
+        BootstrapEndpointStatusDecision::Waiting
+    }
+}
+
 pub(crate) async fn wait_for_bootstrap_endpoint(
     api: &ApiClient,
     app_name: &str,
+    deployment: DeploymentWait<'_>,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
@@ -670,29 +976,93 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
             max_wait,
         ));
         match tee.attest_receipt_key().await {
-            Ok((_attestation, attested_tee)) => match attested_tee.bootstrap_challenge().await {
-                Ok(_) => {
-                    pb.set_message("Ownership claim endpoint ready");
-                    return Ok(true);
+            Ok((_attestation, attested_tee)) => {
+                match attested_tee.bootstrap_challenge().await {
+                    Ok(_) => {
+                        // A terminal diagnostic read over this attested,
+                        // SPKI-pinned channel outranks a reachable challenge
+                        // endpoint: stop before attempting any claim, but only
+                        // when CAP's evidence connects this endpoint to the
+                        // expected deployment.
+                        if let Some(diagnostic) =
+                            deployment_bound_terminal_bootstrap_error_on_channel(
+                                api,
+                                app_name,
+                                deployment,
+                                &attested_tee,
+                                start + max_wait,
+                            )
+                            .await
+                        {
+                            pb.abandon_with_message("TEE bootstrap failed");
+                            return Err(
+                                terminal_bootstrap_failure_message(app_name, &diagnostic).into()
+                            );
+                        }
+                        pb.set_message("Ownership claim endpoint ready");
+                        return Ok(true);
+                    }
+                    Err(_) => {
+                        // One safe status read decides the challenge-failure
+                        // fallback: a terminal diagnostic is never masked by a
+                        // claimed ownership state. The read runs under a
+                        // budget capped to the wait's remaining time.
+                        match attested_tee
+                            .bootstrap_status_within(terminal_diagnostic_budget(Some(
+                                start + max_wait,
+                            )))
+                            .await
+                        {
+                            Ok(status) => match bootstrap_endpoint_status_decision(&status) {
+                                BootstrapEndpointStatusDecision::Terminal => {
+                                    if let Some(diagnostic) =
+                                        deployment_bound_terminal_bootstrap_error_on_channel(
+                                            api,
+                                            app_name,
+                                            deployment,
+                                            &attested_tee,
+                                            start + max_wait,
+                                        )
+                                        .await
+                                    {
+                                        pb.abandon_with_message("TEE bootstrap failed");
+                                        return Err(terminal_bootstrap_failure_message(
+                                            app_name,
+                                            &diagnostic,
+                                        )
+                                        .into());
+                                    }
+                                    // Binding unproven: never authorize the
+                                    // stop; the wait deadline governs.
+                                    pb.set_message(timed_progress(
+                                        "TEE ownership: waiting for claim endpoint",
+                                        start.elapsed(),
+                                        max_wait,
+                                    ));
+                                }
+                                BootstrapEndpointStatusDecision::AlreadyClaimed => {
+                                    pb.set_message("Ownership already claimed");
+                                    return Ok(false);
+                                }
+                                BootstrapEndpointStatusDecision::Waiting => {
+                                    pb.set_message(timed_progress(
+                                        "TEE ownership: waiting for claim endpoint",
+                                        start.elapsed(),
+                                        max_wait,
+                                    ));
+                                }
+                            },
+                            Err(_) => {
+                                pb.set_message(timed_progress(
+                                    "TEE ownership: waiting for claim endpoint",
+                                    start.elapsed(),
+                                    max_wait,
+                                ));
+                            }
+                        }
+                    }
                 }
-                Err(err)
-                    if attested_tee
-                        .claim_state_is_successful()
-                        .await
-                        .unwrap_or(false) =>
-                {
-                    pb.set_message("Ownership already claimed");
-                    let _ = err;
-                    return Ok(false);
-                }
-                Err(_) => {
-                    pb.set_message(timed_progress(
-                        "TEE ownership: waiting for claim endpoint",
-                        start.elapsed(),
-                        max_wait,
-                    ));
-                }
-            },
+            }
             Err(_) => {
                 pb.set_message(timed_progress(
                     "TEE ownership: waiting for attested endpoint",
@@ -709,13 +1079,15 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
 async fn wait_for_deploy_runtime(
     api: &ApiClient,
     app_name: &str,
-    expected_deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
     target: DeployRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_deployment_id = deployment.deployment_id;
     let start = std::time::Instant::now();
+    let mut terminal_probe_at: Option<Instant> = None;
 
     loop {
         if start.elapsed() > max_wait {
@@ -732,9 +1104,10 @@ async fn wait_for_deploy_runtime(
             start.elapsed(),
             max_wait,
         ));
+        let observation_is_fresh;
         let direct_tee_allowed = match api.get_status(app_name).await {
             Ok(status) => {
-                let observation_is_fresh = observation_is_fresh_for_deployment(
+                observation_is_fresh = observation_is_fresh_for_deployment(
                     status.observation.as_ref(),
                     expected_deployment_id,
                 );
@@ -781,6 +1154,24 @@ async fn wait_for_deploy_runtime(
             }
         };
 
+        // A terminal bootstrap diagnostic from the attested app TEE stops the
+        // wait, but only when CAP's live observation proves the endpoint
+        // belongs to the expected deployment before and after the probe, so
+        // a stale diagnostic from a replaced TEE cannot abort a replacement
+        // rollout. No automatic certificate or bootstrap retry happens here.
+        if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
+            && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
+                api,
+                app_name,
+                deployment,
+                start + max_wait,
+            )
+            .await
+        {
+            pb.abandon_with_message("TEE bootstrap failed");
+            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+        }
+
         if direct_tee_allowed
             && let Ok(endpoint) = api.get_unlock_endpoint(app_name).await
             && let tee = TeeClient::new_for_ownership_with_resolve_ip(
@@ -788,28 +1179,49 @@ async fn wait_for_deploy_runtime(
                 endpoint.tee_resolve_ip,
             )
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
-            && let Ok(status) = attested_tee.status_json().await
+            && let Ok(status) = attested_tee
+                .bounded_status_json_within(terminal_diagnostic_budget(Some(start + max_wait)))
+                .await
         {
+            // A terminal diagnostic in this attested status body outranks both
+            // direct-fallback success states -- but it may only stop the wait
+            // once CAP's evidence connects this endpoint to the expected
+            // deployment, rechecked after the read.
+            let outcome = direct_tee_runtime_outcome(&status);
+            let terminal_diagnostic = outcome.terminal_diagnostic();
+            if terminal_diagnostic.is_some()
+                && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error_on_channel(
+                    api,
+                    app_name,
+                    deployment,
+                    &attested_tee,
+                    start + max_wait,
+                )
+                .await
+            {
+                pb.abandon_with_message("TEE bootstrap failed");
+                return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+            }
             if tee_supplemental_fields_are_consistent(&status) {
-                match tee_unlock_state(&status) {
-                    "locked" => {
+                match outcome {
+                    DirectTeeRuntimeOutcome::Locked => {
                         pb.set_position(3);
                         pb.set_message("TEE running, storage locked");
                         return Ok(());
                     }
-                    "unlocked" if target.accepts_direct_unlocked() => {
+                    DirectTeeRuntimeOutcome::Unlocked if target.accepts_direct_unlocked() => {
                         pb.set_position(3);
                         pb.set_message("TEE running, attestation complete");
                         return Ok(());
                     }
-                    "unlocked" => {
+                    DirectTeeRuntimeOutcome::Unlocked => {
                         pb.set_message(timed_progress(
                             "TEE boot: waiting for replacement storage lock",
                             start.elapsed(),
                             max_wait,
                         ));
                     }
-                    _ => {}
+                    DirectTeeRuntimeOutcome::Waiting | DirectTeeRuntimeOutcome::Terminal(_) => {}
                 }
             } else {
                 pb.set_message(timed_progress(
@@ -921,12 +1333,14 @@ async fn wait_for_deployment_apply_start(
 async fn wait_for_deployment_completion(
     api: &ApiClient,
     app_name: &str,
-    deployment_id: &str,
+    deployment: DeploymentWait<'_>,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let deployment_id = deployment.deployment_id;
     let start = Instant::now();
+    let mut terminal_probe_at: Option<Instant> = None;
     loop {
         if start.elapsed() > max_wait {
             pb.abandon_with_message("Workload health timed out");
@@ -935,6 +1349,22 @@ async fn wait_for_deployment_completion(
                 format_duration(max_wait)
             )
             .into());
+        }
+
+        // Post-claim health wait: a terminal bootstrap diagnostic, bound to
+        // this deployment via CAP before and after the attested probe, stops
+        // the wait instead of polling to the deadline.
+        if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
+            && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
+                api,
+                app_name,
+                deployment,
+                start + max_wait,
+            )
+            .await
+        {
+            pb.abandon_with_message("TEE bootstrap failed");
+            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
         }
 
         match find_deployment_entry(api, app_name, deployment_id).await {
@@ -981,6 +1411,7 @@ async fn wait_for_deployment_completion(
 async fn ensure_password_storage_unlocked_for_config(
     api: &ApiClient,
     app_name: &str,
+    deployment: DeploymentWait<'_>,
     pb: &ProgressBar,
     storage_password: &StoragePasswordInput,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -997,7 +1428,7 @@ async fn ensure_password_storage_unlocked_for_config(
             pb.set_message("Unlocking storage before config delivery...");
             let password = storage_password.unlock_password()?;
             tee.unlock(&password).await?;
-            wait_for_deploy_unlock_completion(&tee).await?;
+            wait_for_deploy_unlock_completion(api, &tee, app_name, deployment).await?;
             Ok(())
         }
         "unclaimed" => {
@@ -1038,11 +1469,42 @@ fn tee_supplemental_fields_are_consistent(status: &serde_json::Value) -> bool {
 }
 
 async fn wait_for_deploy_unlock_completion(
+    api: &ApiClient,
     tee: &TeeClient,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        let status = tee.status_json().await?;
+        // The read runs under a budget capped to the remaining deadline: the
+        // ownership client's own request timeout (900 s) must not be able to
+        // hold this 300 s wait open.
+        let status = match tee
+            .bounded_status_json_within(terminal_diagnostic_budget(Some(deadline)))
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err("timed out waiting for unlock completion".into());
+                }
+                return Err(error.into());
+            }
+        };
+        // An already-satisfied unlock wins over a stale terminal diagnostic;
+        // otherwise a recognized terminal diagnostic parsed from this same
+        // bounded status read over the attested channel stops the wait with
+        // the stable code instead of spinning to the deadline -- but only
+        // when CAP's evidence connects the endpoint to the expected
+        // deployment.
+        if tee_unlock_state(&status) != "unlocked"
+            && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error_on_channel(
+                api, app_name, deployment, tee, deadline,
+            )
+            .await
+        {
+            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+        }
         match tee_unlock_state(&status) {
             "unlocked" => return Ok(()),
             "error" => {
@@ -1073,9 +1535,24 @@ pub(crate) async fn claim_initial_ownership(
     paths: &CliPaths,
     _cli_config: &config::CliConfig,
     app_name: &str,
+    deployment: DeploymentWait<'_>,
     storage_password: &StoragePasswordInput,
     capture: MnemonicCapture,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let active = resolve_current_user_org(api).await?;
+
+    // Sink gate, before anything touches the TEE: the TEE returns the one-time
+    // recovery mnemonic exactly once and rejects a second claim, so an unsafe
+    // sink mode, an unattended session, or an unwritable keystore must abort
+    // here, while the claim can still be cancelled without side effects. This
+    // gates both `enclava deploy` and `enclava template deploy` auto-claims.
+    crate::commands::ownership::prepare_recovery_mnemonic_sink(
+        paths,
+        &active.org_name,
+        app_name,
+        capture,
+    )?;
+
     let endpoint = api.get_unlock_endpoint(app_name).await?;
     let tee =
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
@@ -1083,7 +1560,6 @@ pub(crate) async fn claim_initial_ownership(
 
     let challenge = tee.bootstrap_challenge().await?;
 
-    let active = resolve_current_user_org(api).await?;
     let private_key_bytes =
         load_or_derive_bootstrap_private_key(paths, &active.org_name, active.org_id, app_name)?
             .ok_or("bootstrap key is missing and no recovery seed is available; run `enclava key restore <backup>`")?;
@@ -1101,28 +1577,66 @@ pub(crate) async fn claim_initial_ownership(
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
         .await
     {
-        Ok(result) => Some(result),
-        Err(err) if tee.claim_state_is_successful().await.unwrap_or(false) => {
-            eprintln!(
-                "Claim response was interrupted after the TEE accepted ownership; continuing."
-            );
-            let _ = err;
-            None
+        Ok(result) => result,
+        Err(error) => {
+            // One safe status read decides the indeterminate-claim fallback:
+            // an already-committed claim keeps the recovery-mnemonic halt (it
+            // outranks everything, including a terminal diagnostic), while a
+            // recognized terminal diagnostic replaces the raw transport
+            // error. Never retry the claim and never regenerate identity.
+            match tee
+                .bootstrap_status_within(terminal_diagnostic_budget(None))
+                .await
+            {
+                Ok(status) if status.claimed => {
+                    return Err(
+                        crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
+                            "the claim response was lost after the TEE committed ownership, so the \
+                             one-time recovery mnemonic was never received"
+                                .to_string(),
+                        ),
+                    );
+                }
+                Ok(status) => {
+                    if status.terminal_bootstrap_error.is_some()
+                        && let Some(diagnostic) =
+                            deployment_bound_terminal_bootstrap_error_on_channel(
+                                api,
+                                app_name,
+                                deployment,
+                                &tee,
+                                Instant::now() + TERMINAL_DIAGNOSTIC_PROBE_BUDGET,
+                            )
+                            .await
+                    {
+                        return Err(
+                            terminal_bootstrap_failure_message(app_name, &diagnostic).into()
+                        );
+                    }
+                    // Binding unproven: surface the original claim error
+                    // rather than an unauthorized terminal decision.
+                    return Err(error.into());
+                }
+                Err(_) => return Err(error.into()),
+            }
         }
-        Err(err) => return Err(err.into()),
     };
 
-    if let Some(mnemonic) = result.and_then(|result| result.mnemonic) {
-        crate::commands::ownership::present_and_capture_recovery_mnemonic_or_warn(
-            paths,
-            &active.org_name,
-            app_name,
-            &mnemonic,
-            capture,
-            crate::commands::ownership::RecoveryMnemonicOutput::Stderr,
-        );
-    }
-
+    // Persist the one-time mnemonic to the prepared protected sink. The mnemonic
+    // is never written to stdout/stderr; on failure this returns the
+    // ownership-committed/incomplete-backup error and the deploy/template flow
+    // halts rather than proceeding past a claim whose backup is incomplete.
+    let mnemonic = result.mnemonic.ok_or_else(|| {
+        crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
+            "the TEE's claim response contained no recovery mnemonic".to_string(),
+        )
+    })?;
+    crate::commands::ownership::store_recovery_mnemonic_after_claim(
+        paths,
+        &active.org_name,
+        app_name,
+        &mnemonic,
+    )?;
     Ok(())
 }
 

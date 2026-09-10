@@ -22,6 +22,8 @@ use x509_cert::der::{Decode, Encode};
 
 use enclava_common::canonical::ce_v1_hash;
 
+use chrono::{DateTime, Utc};
+
 use crate::api_types::{SignedReceiptResponse, TransitionReceiptAttestation};
 use crate::attestation::{tee_tls_transcript_hash, validate_snp_report_with_der_chain};
 
@@ -38,6 +40,13 @@ pub struct TeeClient {
     http: reqwest::Client,
     timeout: std::time::Duration,
     resolve_ip: Option<IpAddr>,
+    /// Launch identity (SNP HOST_DATA plus authenticated firmware
+    /// measurement) verified by this client's attestation. Present only on
+    /// the SPKI-pinned client returned by `attest_receipt_key()` after the
+    /// AMD chain, nonce, TLS leaf SPKI, and report data all verified; it
+    /// binds every later `/status` read on this client to the TEE whose
+    /// launch produced that identity.
+    verified_launch_identity: Option<VerifiedSnpLaunchIdentity>,
 }
 
 /// Whether TEE TLS verification is relaxed for staging-type environments.
@@ -121,6 +130,155 @@ pub struct TeeStatusResponse {
     pub ownership_state: String,
     pub unlock_state: String,
     pub auto_unlock_enabled: bool,
+}
+
+/// Stable, recognized terminal bootstrap failure codes the attestation proxy
+/// may report under `/status`'s optional `bootstrap_error` field.
+pub const TERMINAL_BOOTSTRAP_ERROR_CODES: [&str; 3] = [
+    "acme_rate_limited",
+    "acme_certificate_issuance_failed",
+    "enclava_init_failed",
+];
+
+/// Upper bound on `/status` bodies accepted by the safe bootstrap-status read.
+const MAX_BOOTSTRAP_STATUS_BODY_BYTES: usize = 64 * 1024;
+
+/// Upper bound on `/attestation` response bodies, read before SNP verification
+/// authenticates the peer (SPKI pinning only proves continuity with the
+/// contacted endpoint). Ample for an SNP report plus an embedded DER chain.
+const MAX_ATTESTATION_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+
+/// Matches the attestation-proxy broker bound: a `retry_after` deadline more
+/// than 365 days past the observation is not a bounded deadline, and the
+/// whole diagnostic is treated as unrecognized.
+const TERMINAL_BOOTSTRAP_RETRY_AFTER_MAX_FUTURE_SECONDS: i64 = 365 * 24 * 60 * 60;
+
+/// A terminal bootstrap failure diagnostic recognized in the TEE's `/status`
+/// response.
+///
+/// Carries only the stable error code and an optional validated retry
+/// deadline -- never arbitrary provider detail. A `retry_after` that has
+/// already elapsed is preserved: it means a retry may now be attempted
+/// separately, not that the terminal failure is erased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalBootstrapError {
+    code: &'static str,
+    retry_after: Option<DateTime<Utc>>,
+}
+
+impl TerminalBootstrapError {
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn retry_after(&self) -> Option<DateTime<Utc>> {
+        self.retry_after
+    }
+
+    /// Stable, safe-to-print summary: the recognized code plus the validated
+    /// deadline, re-serialized as UTC RFC3339 seconds (`Z`) rather than echoed
+    /// from the response body.
+    pub fn stable_summary(&self) -> String {
+        match self.retry_after {
+            Some(deadline) => format!(
+                "{} (retry_after {})",
+                self.code,
+                deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            None => self.code.to_string(),
+        }
+    }
+}
+
+/// One safe, bounded `/status` read for bootstrap waits: whether ownership is
+/// already claimed, and whether the attestation proxy reported a recognized
+/// terminal bootstrap failure. Both signals come from the same body, so a
+/// claimed state can never mask a terminal diagnostic (and callers decide
+/// which signal outranks the other for their flow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeeBootstrapStatus {
+    pub claimed: bool,
+    pub terminal_bootstrap_error: Option<TerminalBootstrapError>,
+}
+
+/// The single parser for the optional `/status` `bootstrap_error` field.
+///
+/// Recognizes a diagnostic only when the `error` code is exactly one of
+/// [`TERMINAL_BOOTSTRAP_ERROR_CODES`], `terminal` is exactly `true`, and
+/// `retry_after` is absent, `null`, or a strictly valid UTC RFC3339 deadline
+/// within the broker's 365-day bound. Absent, unknown, or malformed fields
+/// yield no diagnostic, so pre-existing retry deadlines keep governing and no
+/// raw response text ever reaches the console.
+pub fn parse_terminal_bootstrap_error(body: &serde_json::Value) -> Option<TerminalBootstrapError> {
+    let field = body.get("bootstrap_error")?;
+    if !field.is_object() {
+        return None;
+    }
+    let code = field.get("error").and_then(|value| value.as_str())?;
+    let code = TERMINAL_BOOTSTRAP_ERROR_CODES
+        .iter()
+        .find(|known| **known == code)?;
+    match field.get("terminal") {
+        Some(serde_json::Value::Bool(true)) => {}
+        _ => return None,
+    }
+    let retry_after = match field.get("retry_after") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => {
+            let deadline = parse_utc_rfc3339_deadline(raw)?;
+            let horizon = Utc::now()
+                + chrono::Duration::seconds(TERMINAL_BOOTSTRAP_RETRY_AFTER_MAX_FUTURE_SECONDS);
+            if deadline > horizon {
+                return None;
+            }
+            Some(deadline)
+        }
+        _ => return None,
+    };
+    Some(TerminalBootstrapError { code, retry_after })
+}
+
+/// Launch identity verified during attestation: the SNP HOST_DATA (launch
+/// input measurement) together with the authenticated firmware measurement,
+/// both verified by the same AMD chain that authenticated report data.
+/// HOST_DATA alone is hypervisor-supplied launch input and does not
+/// authenticate the executed firmware, so the measurement is required
+/// alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedSnpLaunchIdentity {
+    pub host_data: [u8; 32],
+    pub firmware_measurement: [u8; 48],
+}
+
+/// Deployment binding for terminal diagnostics: the launch identity verified
+/// over a client's attestation must match BOTH the locally trusted expected
+/// cc-init-data hash of the deployment being waited on AND the existing
+/// expected firmware measurement. CAP validates the signed descriptor's hash
+/// when rendering the deployment and revalidates it at apply, and the
+/// firmware measurement authenticates which code the TEE actually executes;
+/// the SPKI-pinned channel then guarantees the `/status` read reaches that
+/// same TEE. Missing verified identity (unattested client, or development
+/// JSON evidence) never binds, and neither does a matching HOST_DATA with a
+/// mismatched measurement.
+pub fn launch_identity_binds_deployment(
+    verified: Option<&VerifiedSnpLaunchIdentity>,
+    expected_cc_init_data_hash: &[u8; 32],
+    expected_firmware_measurement: &enclava_common::descriptor::FirmwareMeasurement,
+) -> bool {
+    let Some(verified) = verified else {
+        return false;
+    };
+    verified.host_data == *expected_cc_init_data_hash
+        && expected_firmware_measurement.matches_report(&verified.firmware_measurement)
+}
+
+/// Strictly UTC RFC3339 (`Z` or zero offset); every other shape is rejected.
+fn parse_utc_rfc3339_deadline(raw: &str) -> Option<DateTime<Utc>> {
+    let deadline = DateTime::parse_from_rfc3339(raw).ok()?;
+    if deadline.offset().local_minus_utc() != 0 {
+        return None;
+    }
+    Some(deadline.with_timezone(&Utc))
 }
 
 fn deserialize_seconds_as_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -220,6 +378,7 @@ impl TeeClient {
             http,
             timeout,
             resolve_ip,
+            verified_launch_identity: None,
         }
     }
 
@@ -239,7 +398,44 @@ impl TeeClient {
             http,
             timeout: self.timeout,
             resolve_ip: self.resolve_ip,
+            verified_launch_identity: self.verified_launch_identity,
         }
+    }
+
+    /// The launch identity (SNP HOST_DATA plus authenticated firmware
+    /// measurement) verified by this client's attestation, when this client
+    /// came from `attest_receipt_key()`.
+    pub fn verified_launch_identity(&self) -> Option<VerifiedSnpLaunchIdentity> {
+        self.verified_launch_identity
+    }
+
+    /// Unit-test-only (lib tests): pin a synthetic verified launch identity
+    /// onto a client, standing in for a completed `attest_receipt_key()`
+    /// verification. Compiled only under `cfg(test)`, so no production build
+    /// -- debug or release -- can construct synthetic trust; only
+    /// `attest_receipt_key()` produces a trustworthy identity outside tests.
+    #[cfg(test)]
+    pub(crate) fn with_verified_launch_identity_for_tests(
+        mut self,
+        host_data: [u8; 32],
+        firmware_measurement: [u8; 48],
+    ) -> Self {
+        self.verified_launch_identity = Some(VerifiedSnpLaunchIdentity {
+            host_data,
+            firmware_measurement,
+        });
+        self
+    }
+
+    /// Record the launch identity verified during attestation. `None` (the
+    /// development JSON evidence path) leaves the client without deployment
+    /// binding evidence, so terminal diagnostics fail closed.
+    fn with_verified_launch_identity_checked(
+        mut self,
+        identity: Option<VerifiedSnpLaunchIdentity>,
+    ) -> Self {
+        self.verified_launch_identity = identity;
+        self
     }
 
     fn url(&self, path: &str) -> String {
@@ -325,6 +521,61 @@ impl TeeClient {
         let resp = self.check_response(resp).await?;
         let body = resp.json::<serde_json::Value>().await?;
         Ok(claim_state_json_is_successful(&body))
+    }
+
+    /// One safe, bounded `/status` read combining the ownership-claim fallback
+    /// check with the terminal bootstrap diagnostic.
+    ///
+    /// Meaningful only on the SPKI-pinned client returned by
+    /// [`TeeClient::attest_receipt_key`]: a `/status` response received over
+    /// any unverified channel can never authorize a terminal decision. Reads
+    /// are bounded and transport failures surface as `Err`, which callers
+    /// treat as "no trusted diagnostic" so existing retry deadlines govern.
+    pub async fn bootstrap_status(&self) -> Result<TeeBootstrapStatus, TeeError> {
+        let body = self.bounded_status_json().await?;
+        Ok(bootstrap_status_from_json(&body))
+    }
+
+    /// [`TeeClient::bootstrap_status`] under a hard budget, so a
+    /// terminal-classifying status read can never outlive the enclosing
+    /// wait. A budget expiry surfaces as `Err`, which callers treat as "no
+    /// status".
+    pub async fn bootstrap_status_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<TeeBootstrapStatus, TeeError> {
+        let body = self.bounded_status_json_within(budget).await?;
+        Ok(bootstrap_status_from_json(&body))
+    }
+
+    /// The one safe `/status` read shared by every bootstrap-diagnostics
+    /// caller. Successful bodies are capped at
+    /// `MAX_BOOTSTRAP_STATUS_BODY_BYTES` (checked against `content-length`
+    /// and again while chunking), and non-success responses are rejected by
+    /// status code alone without reading the body, so neither a success body
+    /// nor an error body can stream unbounded data or leak raw provider
+    /// detail. Transport failures surface as `Err`, which callers treat as
+    /// "no trusted diagnostic" so existing retry deadlines govern.
+    pub async fn bounded_status_json(&self) -> Result<serde_json::Value, TeeError> {
+        let resp = self.http.get(self.url("/status")).send().await?;
+        reject_error_status(resp.status(), "TEE status")?;
+        let body =
+            read_bounded_response_body(resp, MAX_BOOTSTRAP_STATUS_BODY_BYTES, "TEE status body")
+                .await?;
+        parse_status_body(&body)
+    }
+
+    /// [`TeeClient::bounded_status_json`] under a hard budget: the complete
+    /// read (connection, status code, bounded body) is cut when the budget
+    /// elapses, so a stalled endpoint cannot hold a wait past its deadline
+    /// via a status read.
+    pub async fn bounded_status_json_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<serde_json::Value, TeeError> {
+        tokio::time::timeout(budget, self.bounded_status_json())
+            .await
+            .map_err(|_| TeeError::Attestation("TEE status read exceeded its budget".to_string()))?
     }
 
     // --- Ownership operations (direct to TEE, no API token) ---
@@ -509,8 +760,24 @@ impl TeeClient {
             .append_pair("domain", endpoint.host.as_str())
             .append_pair("leaf_spki_sha256", leaf_spki_hex.as_str());
         let resp = pinned_http.get(attestation_url).send().await?;
-        let resp = self.check_response(resp).await?;
-        let attestation: AttestationResponse = resp.json().await?;
+        // Read the attestation response through the bounded safe path for both
+        // success and failure responses: at this point SPKI pinning only
+        // proves continuity with the contacted peer, and SNP verification has
+        // not yet authenticated it, so an unbounded body (or error body) must
+        // not be consumed before authentication completes.
+        reject_error_status(resp.status(), "TEE attestation")?;
+        let body = read_bounded_response_body(
+            resp,
+            MAX_ATTESTATION_RESPONSE_BODY_BYTES,
+            "TEE attestation body",
+        )
+        .await?;
+        // Fixed messages only: serde errors can interpolate response content,
+        // which must never leak before SNP authentication completes.
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| TeeError::Attestation("attestation body is not valid JSON".to_string()))?;
+        let attestation: AttestationResponse = serde_json::from_value(value)
+            .map_err(|_| TeeError::Attestation("attestation body is malformed".to_string()))?;
         if attestation.nonce != nonce_b64 {
             return Err(TeeError::Attestation("nonce mismatch".to_string()));
         }
@@ -534,8 +801,9 @@ impl TeeClient {
         let evidence = B64_STANDARD
             .decode(attestation.evidence.payload_b64.as_bytes())
             .map_err(|_| TeeError::Attestation("evidence payload is not base64".to_string()))?;
-        verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)
-            .await?;
+        let verified_launch_identity =
+            verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)
+                .await?;
         let evidence_sha256 = hex::encode(Sha256::digest(evidence));
         let transition_attestation = TransitionReceiptAttestation {
             tee_domain: endpoint.host,
@@ -544,7 +812,10 @@ impl TeeClient {
             receipt_pubkey_sha256: attestation.runtime_data_binding.receipt_pubkey_sha256,
             attestation_evidence_sha256: evidence_sha256,
         };
-        Ok((transition_attestation, self.with_http(pinned_http)))
+        let attested_client = self
+            .with_http(pinned_http)
+            .with_verified_launch_identity_checked(verified_launch_identity);
+        Ok((transition_attestation, attested_client))
     }
 }
 
@@ -571,6 +842,82 @@ fn build_tee_http_client(
         );
     }
     builder.build().map_err(TeeError::Http)
+}
+
+/// Reject a non-success response by status code alone. Deliberately no body
+/// read: the fixed message never carries arbitrary response content.
+fn reject_error_status(status: reqwest::StatusCode, subject: &str) -> Result<(), TeeError> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(TeeError::Tee {
+        status: status.as_u16(),
+        message: format!("{subject} request failed"),
+    })
+}
+
+/// Shared bounded streaming reader: caps the body against the declared
+/// `content-length` and again per chunk, so streaming bodies without a
+/// declared length cannot bypass the limit.
+async fn read_bounded_response_body(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    subject: &str,
+) -> Result<Vec<u8>, TeeError> {
+    let too_large = || {
+        TeeError::Attestation(format!(
+            "{subject} exceeds the {max_bytes}-byte bounded read limit"
+        ))
+    };
+    if resp
+        .content_length()
+        .is_some_and(|length| length as usize > max_bytes)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > max_bytes {
+            return Err(too_large());
+        }
+    }
+    Ok(body)
+}
+
+fn too_large_status_body_error() -> TeeError {
+    TeeError::Attestation(format!(
+        "TEE status body exceeds the {}-byte bounded read limit",
+        MAX_BOOTSTRAP_STATUS_BODY_BYTES
+    ))
+}
+
+/// Parse a bounded `/status` body. Bodies above the bounded read limit are
+/// rejected before parsing.
+fn parse_status_body(body: &[u8]) -> Result<serde_json::Value, TeeError> {
+    if body.len() > MAX_BOOTSTRAP_STATUS_BODY_BYTES {
+        return Err(too_large_status_body_error());
+    }
+    serde_json::from_slice(body)
+        .map_err(|_| TeeError::Attestation("TEE status body is not valid JSON".to_string()))
+}
+
+/// Bounded-body variant of the safe terminal-diagnostic parser.
+#[cfg(test)]
+pub(crate) fn parse_terminal_bootstrap_error_body(body: &[u8]) -> Option<TerminalBootstrapError> {
+    parse_status_body(body)
+        .ok()
+        .and_then(|value| parse_terminal_bootstrap_error(&value))
+}
+
+/// Composition of one `/status` body into the safe bootstrap status: both the
+/// ownership-claim fallback and the terminal diagnostic come from the same
+/// body so neither can mask the other.
+fn bootstrap_status_from_json(body: &serde_json::Value) -> TeeBootstrapStatus {
+    TeeBootstrapStatus {
+        claimed: claim_state_json_is_successful(body),
+        terminal_bootstrap_error: parse_terminal_bootstrap_error(body),
+    }
 }
 
 fn claim_state_json_is_successful(body: &serde_json::Value) -> bool {
@@ -653,7 +1000,7 @@ async fn verify_evidence_report_data(
     evidence: &AttestationEvidence,
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
-) -> Result<(), TeeError> {
+) -> Result<Option<VerifiedSnpLaunchIdentity>, TeeError> {
     verify_evidence_report_data_with_json_fallback(
         evidence,
         evidence_bytes,
@@ -668,7 +1015,7 @@ async fn verify_evidence_report_data_with_json_fallback(
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
     allow_json_report_data_only: bool,
-) -> Result<(), TeeError> {
+) -> Result<Option<VerifiedSnpLaunchIdentity>, TeeError> {
     let evidence_json = evidence
         .json
         .as_ref()
@@ -708,7 +1055,13 @@ async fn verify_evidence_report_data_with_json_fallback(
                 "SNP report_data does not bind nonce, TLS leaf SPKI, and receipt key".to_string(),
             ));
         }
-        return Ok(());
+        // HOST_DATA and the firmware measurement were verified together with
+        // the same AMD chain that authenticated report_data: preserve both as
+        // the launch identity of exactly this endpoint.
+        return Ok(Some(VerifiedSnpLaunchIdentity {
+            host_data: report.host_data,
+            firmware_measurement: report.firmware_measurement,
+        }));
     }
 
     if !allow_json_report_data_only {
@@ -725,7 +1078,9 @@ async fn verify_evidence_report_data_with_json_fallback(
             "SNP report_data does not bind nonce, TLS leaf SPKI, and receipt key".to_string(),
         ));
     }
-    Ok(())
+    // The development JSON path carries no raw SNP report, so no trusted
+    // launch identity exists: callers fail closed on deployment binding.
+    Ok(None)
 }
 
 #[derive(Debug)]
@@ -796,8 +1151,10 @@ fn extract_snp_der_chain(value: &serde_json::Value) -> Option<SnpDerChain> {
 }
 
 async fn fetch_snp_der_chain_from_kds(snp_report_bytes: &[u8]) -> Result<SnpDerChain, TeeError> {
-    let report = sev::firmware::guest::AttestationReport::from_bytes(snp_report_bytes)
-        .map_err(|err| TeeError::Attestation(format!("SNP report parse failed: {err}")))?;
+    let report =
+        sev::firmware::guest::AttestationReport::from_bytes(snp_report_bytes).map_err(|_| {
+            TeeError::Attestation("attestation evidence SNP report is malformed".to_string())
+        })?;
     let (ark_der, ask_der) = builtin_snp_ca_der_chain(&report)?;
     let vcek_url = amd_kds_vcek_url(&report, AMD_KDS_BASE_URL)?;
     let client = reqwest::Client::builder()
@@ -1124,12 +1481,14 @@ fn parse_bytes_string(raw: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-fn parse_hex32_field(field: &str, value: &str) -> Result<[u8; 32], TeeError> {
+fn parse_hex32_field(field: &'static str, value: &str) -> Result<[u8; 32], TeeError> {
+    // Fixed messages only: hex errors interpolate the offending response
+    // bytes, and this field is parsed before SNP authentication completes.
     let bytes = hex::decode(value.trim())
-        .map_err(|err| TeeError::Attestation(format!("{field} is not hex: {err}")))?;
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
-        TeeError::Attestation(format!("{field} must be 32 bytes, got {}", bytes.len()))
-    })
+        .map_err(|_| TeeError::Attestation(format!("{field} is not valid hex")))?;
+    bytes
+        .try_into()
+        .map_err(|_| TeeError::Attestation(format!("{field} must be 32 bytes")))
 }
 
 mod tls;
@@ -1137,4 +1496,4 @@ use tls::{EndpointParts, build_spki_pinned_client, fetch_tls_leaf_spki_der};
 
 #[cfg(test)]
 #[path = "tee_client/tests/mod.rs"]
-mod tests;
+pub(crate) mod tests;
