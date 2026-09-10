@@ -878,17 +878,43 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
 
-        prepare_recovery_mnemonic_sink_for_session(
-            &paths,
-            "org-a",
-            "shell1",
-            MnemonicCapture::Store,
-            true,
-        )
-        .expect("interactive store-mode sink must be prepared");
+        if keys::secret_rename_durability_supported() {
+            prepare_recovery_mnemonic_sink_for_session(
+                &paths,
+                "org-a",
+                "shell1",
+                MnemonicCapture::Store,
+                true,
+            )
+            .expect("interactive store-mode sink must be prepared");
 
-        assert!(paths.keys_dir.join("org-a").is_dir());
-        assert!(!paths.keys_dir.join("org-a").join("shell1.tmp").exists());
+            assert!(paths.keys_dir.join("org-a").is_dir());
+            assert!(!paths.keys_dir.join("org-a").join("shell1.tmp").exists());
+        } else {
+            // Deliberate fail-closed behavior: without proven secret-rename
+            // durability the pre-claim gate refuses instead of preparing a
+            // sink whose post-claim write cannot be proven durable -- and it
+            // refuses before any path work, so the claim is never sent with
+            // an unprovable sink (the before-any-network ordering itself is
+            // pinned by the claim_recovery_sink_tests source contracts).
+            let err = prepare_recovery_mnemonic_sink_for_session(
+                &paths,
+                "org-a",
+                "shell1",
+                MnemonicCapture::Store,
+                true,
+            )
+            .expect_err("non-Unix must refuse sink preparation before the claim");
+            assert!(
+                err.to_string()
+                    .contains("claim sink preparation is unsupported on this platform"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                !paths.keys_dir.join("org-a").exists(),
+                "the non-Unix refusal must precede any filesystem mutation"
+            );
+        }
     }
 
     #[test]

@@ -1411,13 +1411,32 @@ mod claim_recovery_sink_tests {
     /// real TEE in unit tests: the private sink is validated before any
     /// challenge/claim request, and no stdout/stderr statement ever interpolates
     /// the mnemonic.
-    fn fn_body(source: &'static str, start_marker: &str, end_marker: &str) -> &'static str {
+    fn fn_body(source: &'static str, start_marker: &str, end_marker: &str) -> String {
+        // CRLF checkouts (Windows autocrlf) must not break source matching:
+        // normalize once so the LF-only multi-line markers below hold on
+        // every checkout.
+        let source = source.replace("\r\n", "\n");
         let start = source.find(start_marker).expect("start marker exists");
         let end = start + source[start..].find(end_marker).expect("end marker exists");
-        &source[start..end]
+        source[start..end].to_string()
     }
 
     const APP_SOURCE: &str = include_str!("../../app.rs");
+
+    #[test]
+    fn fn_body_matches_markers_across_crlf_checkouts() {
+        // Regression for the Windows failure: a CRLF checkout must not break
+        // the LF-only multi-line end markers.
+        let source = "start marker\r\n#[derive(Args)]\r\npub struct StatusArgs\r\nlater";
+        let body = fn_body(
+            source,
+            "start marker",
+            "#[derive(Args)]\npub struct StatusArgs",
+        );
+        // The slice spans from the start marker up to (not including) the
+        // end marker, with normalized line endings.
+        assert_eq!(body, "start marker\n");
+    }
 
     #[test]
     fn claim_initial_ownership_gates_sink_before_any_network_claim() {
