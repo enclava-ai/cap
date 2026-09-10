@@ -1288,6 +1288,12 @@ mod tests {
         assert_ne!(owner_a.public.to_bytes(), app_seed);
     }
 
+    // Unix-only premise: preparation succeeds and the probe cleans up. On
+    // platforms without proven secret-rename durability, production fails
+    // closed before any path check (see
+    // prepare_app_mnemonic_sink_requires_proven_rename_durability), so this
+    // success-path contract is asserted only where durability is proven.
+    #[cfg(unix)]
     #[test]
     fn prepare_app_mnemonic_sink_proves_writability_and_cleans_up() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1321,6 +1327,10 @@ mod tests {
         );
     }
 
+    // Unix-only premise: the path-specific rejection. On non-Unix the
+    // platform refusal fires before path checks, so the directory-occupied
+    // contract is asserted only where preparation reaches the path checks.
+    #[cfg(unix)]
     #[test]
     fn prepare_app_mnemonic_sink_rejects_directory_at_real_destination() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1342,6 +1352,9 @@ mod tests {
         );
     }
 
+    // Unix-only premise: the path-specific rejection (see the destination
+    // variant above for the non-Unix ordering).
+    #[cfg(unix)]
     #[test]
     fn prepare_app_mnemonic_sink_rejects_directory_at_real_temp_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1354,6 +1367,9 @@ mod tests {
         assert!(paths.keys_dir.join("org-a").join("shell1.tmp").is_dir());
     }
 
+    // Unix-only premise: an existing backup is preserved and a stale temp is
+    // removed while preparation succeeds. Non-Unix never reaches these paths.
+    #[cfg(unix)]
     #[test]
     fn prepare_app_mnemonic_sink_preserves_existing_backup_and_removes_stale_temp() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1406,14 +1422,25 @@ mod tests {
                 .expect("unix provides proven rename durability");
         } else {
             // Platforms without a verified directory-flush primitive must fail
-            // closed with an actionable error, not pretend durability.
+            // closed with an actionable error, not pretend durability -- and
+            // the refusal must fire BEFORE any path work, so no directory is
+            // created and no probe touches the filesystem at all.
             let tmp = tempfile::tempdir().unwrap();
             let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
             let err = prepare_app_mnemonic_sink(&paths, "org-a", "shell1")
                 .expect_err("unsupported platforms must reject claim sink preparation");
+            assert!(matches!(err, KeysError::InvalidBackup(_)));
             let msg = err.to_string();
             assert!(msg.contains("durable completion"));
             assert!(msg.contains("unix"));
+            assert!(
+                !paths.keys_dir.exists(),
+                "the non-Unix refusal must precede any filesystem mutation"
+            );
+            assert!(
+                !paths.keys_dir.join("org-a").exists(),
+                "no sink directory may be created on refusal"
+            );
         }
     }
 
